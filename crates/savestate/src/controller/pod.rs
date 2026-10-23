@@ -141,10 +141,11 @@ pub(super) fn build(sandbox: &Sandbox, vm: &Vm, config: &Config) -> Result<Pod, 
     serde_json::from_value(pod).map_err(|error| Error::PodSpec(error.to_string()))
 }
 
-/// Node affinity for `placement`, within the installation's `vm.nodeAffinity`.
+/// Node affinity for `placement`, within the installation's `vm.nodeAffinity`, and the
+/// preference for nodes running VMs already.
 /// Configured terms are alternatives, so the placement's requirement is added to
 /// every term rather than as a term of its own.
-fn affinity(placement: &Placement, configured: Option<&NodeSelector>) -> Option<serde_json::Value> {
+fn affinity(placement: &Placement, configured: Option<&NodeSelector>) -> serde_json::Value {
     let requirement = |key: &str, values: &[String]| NodeSelectorRequirement {
         key: key.into(),
         operator: "In".into(),
@@ -177,19 +178,36 @@ fn affinity(placement: &Placement, configured: Option<&NodeSelector>) -> Option<
             }
         }
     }
-    let mut affinity = json!({});
+    let mut node = json!({});
     if let Some(required) = required {
-        affinity["requiredDuringSchedulingIgnoredDuringExecution"] = json!(required);
+        node["requiredDuringSchedulingIgnoredDuringExecution"] = json!(required);
     }
     if !prefer.is_empty() {
-        affinity["preferredDuringSchedulingIgnoredDuringExecution"] = json!([{
+        node["preferredDuringSchedulingIgnoredDuringExecution"] = json!([{
             "weight": 100,
             "preference": {"matchFields": [
                 {"key": "metadata.name", "operator": "In", "values": prefer}
             ]},
         }]);
     }
-    (affinity != json!({})).then(|| json!({"nodeAffinity": affinity}))
+    // Pack VMs onto nodes already running VMs (in any namespace), so the cluster
+    // autoscaler can empty and remove the others. A preference only: it never keeps
+    // a pod from a node with room, and the nodes holding the checkpoint come first.
+    let mut affinity = json!({"podAffinity": {"preferredDuringSchedulingIgnoredDuringExecution": [{
+        "weight": 50,
+        "podAffinityTerm": {
+            "labelSelector": {"matchLabels": {
+                "app.kubernetes.io/name": "savestate",
+                "app.kubernetes.io/component": "vm",
+            }},
+            "namespaceSelector": {},
+            "topologyKey": "kubernetes.io/hostname",
+        },
+    }]}});
+    if node != json!({}) {
+        affinity["nodeAffinity"] = node;
+    }
+    affinity
 }
 
 pub(super) fn parse(quantity: &Quantity, what: &str) -> Result<ParsedQuantity, Error> {
@@ -212,8 +230,7 @@ mod tests {
                 .unwrap();
         let pin = json!([{"key": "metadata.name", "operator": "In", "values": ["node-b"]}]);
 
-        let affinity =
-            affinity(&Placement::Nodes(vec!["node-b".into()]), Some(&configured)).unwrap();
+        let affinity = affinity(&Placement::Nodes(vec!["node-b".into()]), Some(&configured));
 
         let terms = &affinity["nodeAffinity"]["requiredDuringSchedulingIgnoredDuringExecution"]["nodeSelectorTerms"];
         let mut want_a = term("node-a");

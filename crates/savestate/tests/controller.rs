@@ -1,6 +1,7 @@
 //! The controller against a real cluster, with a dummy launcher image standing in
 //! for QEMU (`tests/launcher/Dockerfile`): it marks the VM ready, then runs until
-//! told to crash. The test plays the node agent by writing Checkpoint status.
+//! told to crash. The test plays the node agent by writing Checkpoint status, and
+//! the export of a checkpoint by adding a store to it.
 //!
 //! Needs a disposable cluster in `KUBECONFIG` (CI uses kind) and the dummy image,
 //! pinned by digest and present on the nodes, in `SAVESTATE_TEST_LAUNCHER_IMAGE`.
@@ -141,6 +142,83 @@ async fn controller_runs_pins_fails_expires_and_protects() {
             [0]["matchFields"],
         json!([{"key": "metadata.name", "operator": "In", "values": [node]}])
     );
+    // VM pods prefer nodes running VM pods, so nodes empty out for scale-down.
+    assert_eq!(
+        affinity["podAffinity"]["preferredDuringSchedulingIgnoredDuringExecution"][0]["podAffinityTerm"]
+            ["topologyKey"],
+        "kubernetes.io/hostname",
+        "{affinity}"
+    );
+
+    // A fork pinned to holders that cannot take it (here a node that is gone) moves
+    // once its checkpoint is in a store: its pod is replaced by one that may run on
+    // any node with the checkpoint's CPU, e.g. one the cluster autoscaler adds.
+    create(
+        &checkpoints,
+        json!({"metadata": {"name": "full"}, "spec": {"sandbox": "web-0"}}),
+    )
+    .await;
+    let ready = json!({
+        "phase": "Ready",
+        "nodes": ["node-gone"],
+        "vcpus": 1,
+        "memory": "64Mi",
+        "disk": "1Gi",
+        "fingerprint": {
+            "launcherImage": launcher,
+            "qemu": "11.1.2",
+            "machineType": "pc-q35-11.1",
+            "cpuModel": "EPYC-Rome-v4",
+            "devices": "sha256:0",
+        },
+    });
+    checkpoints
+        .patch_status(
+            "full",
+            &PatchParams::default(),
+            &Patch::Merge(json!({"status": ready})),
+        )
+        .await
+        .unwrap();
+    create(
+        &sandboxes,
+        json!({"metadata": {"name": "spill"}, "spec": {"from": {"checkpoint": "full"}}}),
+    )
+    .await;
+    let pinned =
+        wait_for("spill's pod to be unschedulable", || async {
+            let pod = pods.get_opt("spill").await.unwrap()?;
+            let unschedulable =
+                pod.status.as_ref()?.conditions.as_ref()?.iter().any(|c| {
+                    c.type_ == "PodScheduled" && c.reason.as_deref() == Some("Unschedulable")
+                });
+            unschedulable.then(|| pod.uid())
+        })
+        .await;
+    checkpoints
+        .patch_status(
+            "full",
+            &PatchParams::default(),
+            &Patch::Merge(json!({"status": {"stores": ["archive"]}})),
+        )
+        .await
+        .unwrap();
+    let affinity = wait_for("spill's pod to be replaced", || async {
+        let pod = pods.get_opt("spill").await.unwrap()?;
+        (pod.uid() != pinned).then(|| serde_json::to_value(pod.spec.unwrap().affinity).unwrap())
+    })
+    .await;
+    let required = &affinity["nodeAffinity"]["requiredDuringSchedulingIgnoredDuringExecution"]["nodeSelectorTerms"]
+        [0];
+    assert_eq!(required.get("matchFields"), None, "{affinity}");
+    assert_eq!(
+        required["matchExpressions"][0]["key"], "savestate.dev/cpu",
+        "{affinity}"
+    );
+    sandboxes
+        .delete("spill", &DeleteParams::default())
+        .await
+        .unwrap();
 
     // An in-use checkpoint, here the ancestor of web-1's, is not deleted.
     checkpoints

@@ -48,6 +48,20 @@ pub struct Config {
     #[serde(default)]
     pub images: Images,
 
+    /// S3-compatible object stores checkpoints can be exported to and restored
+    /// from, by name (lowercase letters, digits and `-`, at most 63). Default: none.
+    #[serde(default)]
+    pub stores: BTreeMap<String, Store>,
+
+    /// Store every checkpoint is exported to once `Ready`, unless its own
+    /// `spec.export` names another. Default: none; only checkpoints with
+    /// `spec.export` are exported.
+    #[serde(default)]
+    pub export: Option<String>,
+
+    #[serde(default)]
+    pub cache: Cache,
+
     #[serde(default)]
     pub transfers: Transfers,
 
@@ -55,14 +69,61 @@ pub struct Config {
     pub ttl: TtlLimits,
 }
 
+/// One S3-compatible object store. Requests are path-style
+/// (`<endpoint>/<bucket>/<key>`).
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Store {
+    /// Endpoint URL, e.g. `https://s3.example.com`; `http://` only inside a network
+    /// you trust. Required.
+    pub endpoint: String,
+
+    /// Bucket. Required.
+    pub bucket: String,
+
+    /// Region requests are signed for. Required (stores with no regions accept any
+    /// name).
+    pub region: String,
+
+    /// Key prefix within the bucket, without leading or trailing `/`. One prefix
+    /// belongs to one installation: its garbage collection deletes everything there
+    /// that names none of its checkpoints. Default: empty, the bucket's root.
+    #[serde(default)]
+    pub prefix: String,
+
+    /// Secret in the namespace the controller and node agents run in, holding
+    /// `accessKeyId` and `secretAccessKey` (and optionally `sessionToken`). It is
+    /// read on every use, so rotating it needs no restart. Required.
+    pub credentials_secret: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Cache {
+    /// Node-local copies of checkpoints that a store holds are a cache: while the
+    /// state directory's filesystem has less than this percentage free, the node
+    /// agent drops them, oldest first, except those a sandbox on the node was
+    /// restored from. Default: 10.
+    #[serde(default = "default_min_free_percent")]
+    pub min_free_percent: u8,
+}
+
+impl Default for Cache {
+    fn default() -> Self {
+        Self {
+            min_free_percent: default_min_free_percent(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Vm {
     /// Guest CPU model passed to QEMU's `-cpu`. Required. `host` gives guests the
-    /// node's own CPU: the simple choice when checkpoints stay on the node that took
-    /// them (a restore is refused on a node whose CPU differs). A named model that
-    /// every VM node can run, e.g. `EPYC-Rome-v4`, is run with `enforce` and is what
-    /// lets checkpoints move between nodes later. `max` is refused.
+    /// node's own CPU: the simple choice where all VM nodes are one machine type (a
+    /// checkpoint restores only on nodes with an identical CPU). A named model that
+    /// every VM node can run, e.g. `EPYC-Rome-v4`, is run with `enforce` and lets
+    /// checkpoints move between any VM nodes. `max` is refused.
     pub cpu_model: String,
 
     /// Added to a sandbox's memory for its VM pod's memory request and limit, to
@@ -207,6 +268,10 @@ fn default_transfers_per_node() -> u32 {
     1
 }
 
+fn default_min_free_percent() -> u8 {
+    10
+}
+
 #[derive(Debug, thiserror::Error)]
 #[error("installation config: {0}")]
 pub struct ConfigError(String);
@@ -271,6 +336,10 @@ impl Config {
         if self.transfers.per_node == 0 {
             return Err("transfers.perNode: must be at least 1".into());
         }
+        self.check_stores()?;
+        if self.cache.min_free_percent > 100 {
+            return Err("cache.minFreePercent: at most 100".into());
+        }
         for (kind, limit) in [
             ("sandbox", &self.ttl.sandbox),
             ("checkpoint", &self.ttl.checkpoint),
@@ -280,6 +349,50 @@ impl Config {
             {
                 return Err(format!("ttl.{kind}: default {default} exceeds max {max}"));
             }
+        }
+        Ok(())
+    }
+
+    fn check_stores(&self) -> Result<(), String> {
+        for (name, store) in &self.stores {
+            let label = !name.is_empty()
+                && name.len() <= 63
+                && name
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+                && !name.starts_with('-')
+                && !name.ends_with('-');
+            if !label {
+                return Err(format!(
+                    "stores: {name:?}: a store name is lowercase letters, digits and -, at most 63"
+                ));
+            }
+            if !(store.endpoint.starts_with("https://") || store.endpoint.starts_with("http://")) {
+                return Err(format!(
+                    "stores.{name}.endpoint: {:?} is not an http:// or https:// URL",
+                    store.endpoint
+                ));
+            }
+            for (field, value) in [
+                ("bucket", &store.bucket),
+                ("region", &store.region),
+                ("credentialsSecret", &store.credentials_secret),
+            ] {
+                if value.is_empty() {
+                    return Err(format!("stores.{name}.{field}: must not be empty"));
+                }
+            }
+            if store.prefix.starts_with('/') || store.prefix.ends_with('/') {
+                return Err(format!(
+                    "stores.{name}.prefix: {:?} must not start or end with /",
+                    store.prefix
+                ));
+            }
+        }
+        if let Some(export) = &self.export
+            && !self.stores.contains_key(export)
+        {
+            return Err(format!("export: {export:?} is not in stores"));
         }
         Ok(())
     }

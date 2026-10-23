@@ -21,8 +21,7 @@ use kube::{
 };
 use savestate_api::{
     Checkpoint, CheckpointPhase, CheckpointSpec, CheckpointStatus, Clock, Fingerprint, Sandbox,
-    SandboxPhase, SandboxSource, SandboxSpec, SandboxStatus, Transfer, TransferSpec,
-    TransferTarget,
+    SandboxPhase, SandboxSource, SandboxSpec, SandboxStatus, Transfer, TransferEnd, TransferSpec,
 };
 use serde_json::{Value, json};
 
@@ -80,15 +79,23 @@ async fn crds_accept_what_works_and_refuse_what_cannot() {
         CheckpointSpec {
             sandbox: "web-1".into(),
             ttl: Some("48h".parse().unwrap()),
+            export: Some("archive".into()),
         },
     );
-    let transfer = Transfer::new(
+    let export = Transfer::new(
+        "parked-to-archive",
+        TransferSpec {
+            checkpoint: "web-1-parked".into(),
+            from: TransferEnd::node("node-a"),
+            to: TransferEnd::store("archive"),
+        },
+    );
+    let import = Transfer::new(
         "parked-to-node-b",
         TransferSpec {
             checkpoint: "web-1-parked".into(),
-            to: TransferTarget {
-                node: "node-b".into(),
-            },
+            from: TransferEnd::store("archive"),
+            to: TransferEnd::node("node-b"),
         },
     );
     for sandbox in [&from_image, &from_checkpoint] {
@@ -99,15 +106,18 @@ async fn crds_accept_what_works_and_refuse_what_cannot() {
         create_when_served(&checkpoints, &checkpoint).await.spec,
         checkpoint.spec
     );
-    assert_eq!(
-        create_when_served(&transfers, &transfer).await.spec,
-        transfer.spec
-    );
+    for transfer in [&export, &import] {
+        assert_eq!(
+            create_when_served(&transfers, transfer).await.spec,
+            transfer.spec
+        );
+    }
 
     // Status the controller and node agents write survives the schema's pruning.
     let status = CheckpointStatus {
         phase: CheckpointPhase::Ready,
         nodes: vec!["node-a".into(), "node-b".into()],
+        stores: vec!["archive".into()],
         vcpus: Some(4),
         memory: Some(quantity("8Gi")),
         disk: Some(quantity("60Gi")),
@@ -241,9 +251,13 @@ async fn crds_accept_what_works_and_refuse_what_cannot() {
         let error = patch_spec(&sandboxes, "web-2", patch.clone()).await.err();
         assert_refused(error, reason, &patch);
     }
-    patch_spec(&checkpoints, "web-1-parked", json!({"ttl": "7d"}))
-        .await
-        .unwrap();
+    patch_spec(
+        &checkpoints,
+        "web-1-parked",
+        json!({"ttl": "7d", "export": "other"}),
+    )
+    .await
+    .unwrap();
     let error = patch_spec(&checkpoints, "web-1-parked", json!({"sandbox": "web-2"}))
         .await
         .err();
@@ -256,6 +270,38 @@ async fn crds_accept_what_works_and_refuse_what_cannot() {
     .await
     .err();
     assert_refused(error, "a transfer cannot change", &json!("transfer target"));
+
+    // Transfers go between a node and a store, nothing else.
+    let raw = Api::<DynamicObject>::namespaced_with(
+        client.clone(),
+        &ns,
+        &ApiResource::erase::<Transfer>(&()),
+    );
+    let refused = [
+        (
+            json!({"checkpoint": "c", "from": {"node": "node-a"}, "to": {"node": "node-b"}}),
+            "a transfer copies between a node and a store",
+        ),
+        (
+            json!({"checkpoint": "c", "from": {"store": "a"}, "to": {"store": "b"}}),
+            "a transfer copies between a node and a store",
+        ),
+        (
+            json!({"checkpoint": "c", "from": {"node": "node-a", "store": "a"}, "to": {"store": "a"}}),
+            "set exactly one of node and store",
+        ),
+        (
+            json!({"checkpoint": "c", "from": {}, "to": {"store": "a"}}),
+            "set exactly one of node and store",
+        ),
+    ];
+    for (i, (spec, reason)) in refused.into_iter().enumerate() {
+        let mut object =
+            DynamicObject::new(&format!("bad-{i}"), &ApiResource::erase::<Transfer>(&()));
+        object.data = json!({ "spec": spec });
+        let error = raw.create(&PostParams::default(), &object).await.err();
+        assert_refused(error, reason, &spec);
+    }
 
     namespaces
         .delete(&ns, &DeleteParams::default())

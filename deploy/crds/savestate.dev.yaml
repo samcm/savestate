@@ -221,6 +221,9 @@ spec:
     - jsonPath: .status.nodes
       name: Nodes
       type: string
+    - jsonPath: .status.stores
+      name: Stores
+      type: string
     - description: Bytes of the RAM file on disk
       jsonPath: .status.memoryBytes
       name: Memory
@@ -249,8 +252,17 @@ spec:
             description: |-
               A named, read-only, complete picture of a sandbox at one instant: RAM, CPU and
               device state, and disk. Taking one pauses the sandbox for a few seconds; it then
-              carries on. Only `ttl` can change after creation.
+              carries on. Only `ttl` and `export` can change after creation.
             properties:
+              export:
+                description: |-
+                  Object store (a name in the installation config's `stores`) to export the
+                  checkpoint to once it is `Ready`, which makes it independent of the node that
+                  took it. Default: the config's `export`, else none. Can be set later.
+                maxLength: 63
+                minLength: 1
+                nullable: true
+                type: string
               sandbox:
                 description: Sandbox to checkpoint, in the checkpoint's namespace. It must be `Running`.
                 maxLength: 253
@@ -354,6 +366,11 @@ spec:
                 - Ready
                 - Failed
                 type: string
+              stores:
+                description: Every object store holding a complete copy.
+                items:
+                  type: string
+                type: array
               vcpus:
                 description: Virtual CPUs of the checkpointed VM; sandboxes started from it get the same.
                 format: int32
@@ -392,11 +409,17 @@ spec:
     - jsonPath: .spec.checkpoint
       name: Checkpoint
       type: string
-    - jsonPath: .status.from
-      name: From
+    - jsonPath: .spec.from.node
+      name: From Node
+      type: string
+    - jsonPath: .spec.from.store
+      name: From Store
       type: string
     - jsonPath: .spec.to.node
-      name: To
+      name: To Node
+      type: string
+    - jsonPath: .spec.to.store
+      name: To Store
       type: string
     - jsonPath: .status.phase
       name: Phase
@@ -415,56 +438,89 @@ spec:
     name: v1alpha1
     schema:
       openAPIV3Schema:
-        description: A copy of a checkpoint to another node
+        description: A copy of a checkpoint between a node and an object store
         properties:
           spec:
             description: |-
-              An explicit copy of a checkpoint to another node. When it completes, the node is
-              added to the checkpoint's `status.nodes`; the copy belongs to the checkpoint, so
-              deleting the transfer afterwards only deletes this record. Deleting a transfer
-              that is still copying cancels it. The spec cannot change.
+              A copy of a checkpoint between a node and an object store: an export from a node
+              holding it to a store, or an import from a store holding it to a node. The node
+              agent of the transfer's node does the copy. When it completes, the store is added
+              to the checkpoint's `status.stores` (export) or the node to its `status.nodes`
+              (import); the copy belongs to the checkpoint, so deleting the transfer afterwards
+              only deletes this record. Deleting a transfer that is still copying cancels it.
+              The spec cannot change.
             properties:
               checkpoint:
                 description: Checkpoint to copy, in the transfer's namespace.
                 maxLength: 253
                 minLength: 1
                 type: string
-              to:
-                description: Where the copy goes.
+              from:
+                description: |-
+                  Where the copy comes from: a node holding the checkpoint (an export), or a
+                  store holding it (an import).
                 properties:
                   node:
-                    description: Node to copy the checkpoint to.
+                    description: A node.
                     maxLength: 253
                     minLength: 1
+                    nullable: true
                     type: string
-                required:
-                - node
+                  store:
+                    description: An object store, by its name in the installation config's `stores`.
+                    maxLength: 63
+                    minLength: 1
+                    nullable: true
+                    type: string
                 type: object
+                x-kubernetes-validations:
+                - message: set exactly one of node and store
+                  rule: has(self.node) != has(self.store)
+              to:
+                description: "Where the copy goes: a store (an export) or a node (an import)."
+                properties:
+                  node:
+                    description: A node.
+                    maxLength: 253
+                    minLength: 1
+                    nullable: true
+                    type: string
+                  store:
+                    description: An object store, by its name in the installation config's `stores`.
+                    maxLength: 63
+                    minLength: 1
+                    nullable: true
+                    type: string
+                type: object
+                x-kubernetes-validations:
+                - message: set exactly one of node and store
+                  rule: has(self.node) != has(self.store)
             required:
             - checkpoint
+            - from
             - to
             type: object
             x-kubernetes-validations:
+            - message: "a transfer copies between a node and a store: from a node to a store, or from a store to a node"
+              rule: has(self.from.store) != has(self.to.store)
             - message: a transfer cannot change; delete it and create another
               rule: self == oldSelf
           status:
-            description: Written by the node agent receiving the copy.
+            description: Written by the node agent doing the copy.
             nullable: true
             properties:
               bytesDone:
+                description: Bytes of the checkpoint's files copied, or found already at the destination.
                 format: int64
                 minimum: 0.0
                 nullable: true
                 type: integer
               bytesTotal:
+                description: Bytes of the checkpoint's files (their data, without holes).
                 format: int64
                 minimum: 0.0
                 nullable: true
                 type: integer
-              from:
-                description: Node the checkpoint is copied from, once chosen.
-                nullable: true
-                type: string
               message:
                 description: Why the transfer is in its phase, mainly for `Failed`.
                 nullable: true
@@ -484,8 +540,8 @@ spec:
         type: object
     selectableFields:
     - jsonPath: .spec.checkpoint
+    - jsonPath: .spec.from.node
     - jsonPath: .spec.to.node
-    - jsonPath: .status.from
     served: true
     storage: true
     subresources:

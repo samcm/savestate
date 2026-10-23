@@ -46,7 +46,8 @@ the same static `savestate` binary.
                                    unix socket│
 ┌─────────────────────────────────────────────▼──────────────┐
 │ VM pod (Guaranteed): savestate launcher → qemu (QMP)       │
-│ no service-account token · /dev/kvm, /dev/net/tun          │
+│ no service-account token · /dev/kvm, /dev/net/tun,         │
+│ /dev/vhost-vsock                                           │
 │ tap + nftables NAT inside the pod's network namespace      │
 │        └─ vsock ─▶ savestate-guest (exec, files, fixups)    │
 └────────────────────────────────────────────────────────────┘
@@ -80,6 +81,9 @@ savestate create web-1 --from web-1-parked
 ```sh
 cargo build --release -p savestate
 ```
+
+The guest kernel, the generic guest base image and how an installation builds its own
+image on top are in [guest/README.md](guest/README.md).
 
 The image `ghcr.io/samcm/savestate` (stock QEMU 11.1 on Debian 13) is published
 from `main`; static binaries for x86_64 and aarch64 are attached to each release.

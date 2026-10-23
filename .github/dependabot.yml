@@ -17,7 +17,8 @@ updates:
       actions:
         patterns: ["*"]
   - package-ecosystem: docker
-    directory: /
+    # The launcher image and the guest base image.
+    directories: ["/", "/guest/rootfs"]
     schedule:
       interval: weekly
     groups:

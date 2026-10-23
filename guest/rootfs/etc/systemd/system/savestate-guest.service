@@ -1,0 +1,21 @@
+[Unit]
+Description=savestate guest agent (exec, files, checkpoint and restore fixups)
+Documentation=https://github.com/samcm/savestate
+# Up early, so the host can reach the guest while the rest of boot carries on.
+DefaultDependencies=no
+After=local-fs.target
+Before=sysinit.target shutdown.target
+Conflicts=shutdown.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/savestate-guest serve
+Restart=always
+RestartSec=1
+# For the commands the host runs.
+Environment=HOME=/root
+StandardOutput=journal+console
+StandardError=journal+console
+
+[Install]
+WantedBy=sysinit.target

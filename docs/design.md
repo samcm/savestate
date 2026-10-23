@@ -143,7 +143,8 @@ NODE`, `delete`.
                                    unix socket│
 ┌─────────────────────────────────────────────▼──────────────┐
 │ VM pod (Guaranteed): savestate launcher → qemu (QMP)       │
-│ no service-account token · /dev/kvm, /dev/net/tun          │
+│ no service-account token · /dev/kvm, /dev/net/tun,         │
+│ /dev/vhost-vsock                                           │
 │ tap + nftables NAT inside the pod's network namespace      │
 │        └─ vsock ─▶ savestate-guest (exec, files, fixups)    │
 └────────────────────────────────────────────────────────────┘
@@ -164,9 +165,18 @@ and the CLI); `savestate-guest` runs inside the VM.
 - **Launcher** (one per VM pod): starts and supervises QEMU, talks QMP, relays exec and
   file traffic to the guest over vsock, streams the serial console to the pod log.
   It has no Kubernetes credentials; the node agent drives it over a unix socket.
-- **Guest agent** (inside the VM, from orbd): exec, file copy, and post-restore fixups
-  (clock, entropy, machine-id, hostname, SSH host keys, user hooks in
-  `/etc/savestate/after-restore.d/`).
+- **Guest agent** (`savestate-guest`, inside the VM, built on orbd's guest library):
+  exec, file copy, the pre-checkpoint hook, and post-restore fixups (clock, entropy,
+  machine-id, hostname, SSH host keys, user hooks in `/etc/savestate/after-restore.d/`).
+  It speaks savestate's own guest protocol (`proto/savestate/guest/v1/guest.proto`) on
+  vsock port 1024, one operation per connection; the launcher uses its host-side client
+  (`savestate-guest-proto`).
+
+The guest kernel is the latest stable Linux, configured from orbd's guest config plus a
+small fragment, and the base disk image is a generic
+Debian 13 with systemd and the agent that each installation builds its own image on
+(`guest/README.md`, which also states the devices and kernel command line a guest
+expects).
 
 savestate acts only in the sandbox namespaces the installation config lists; objects
 elsewhere are ignored. The controller and node agent get their permissions there
@@ -278,12 +288,15 @@ Restore (any number of times, concurrently):
 
 1. `qemu-img create -f qcow2 -b <checkpoint layer> -F qcow2 <new overlay>`.
 2. Start QEMU with the checkpoint's exact machine arguments, the new overlay,
-   `-device vmgenid,guid=auto` and `-incoming defer`.
+   `-device vmgenid,guid=auto`, a vsock context id of its own and `-incoming defer`.
 3. Set the same migration capabilities, then `migrate-incoming` from the RAM file
    (opened read-only, so concurrent restores share one file) with
    `exit-on-error: false`.
-4. On `completed`: `cont`, then guest-agent fixups (stepped clock if asked, entropy,
-   identity, hooks).
+4. On `completed`: `cont`, then guest-agent fixups, in this order: stepped clock if
+   asked, host entropy credited to the kernel, new machine-id, hostname, SSH host keys
+   (where present), hooks (with `SAVESTATE_SANDBOX`, `SAVESTATE_CHECKPOINT` and
+   `SAVESTATE_CLOCK`). Connections open at the checkpoint are reset by the restore; the
+   launcher reconnects.
 
 Clock: QEMU's kvmclock restores its saved value without adding elapsed host time, so
 `frozen` is QEMU's natural behaviour; `-rtc clock=vm` keeps the RTC consistent with it.

@@ -2,7 +2,8 @@
 # Pick the guest CPU model: the first named model in the list below that this host
 # runs with `enforce` (every feature of the model present, nothing silently dropped).
 # EPYC-Rome-v4 comes first because it is the baseline the design names for mixed Zen 2
-# and Zen 3 hosts; the Intel list runs from newer to older generations.
+# and Zen 3 hosts; the Intel list runs from newer to older generations. Each list ends
+# with v1 models, which lack the speculation-control flags nested hosts often hide.
 #
 # Usage: select-cpu.sh   (writes $WORK/cpu-model and $OUT/select-cpu.md)
 set -euo pipefail
@@ -12,7 +13,7 @@ mkdir -p "$WORK" "$OUT"
 vendor=$(awk -F': ' '/^vendor_id/ { print $2; exit }' /proc/cpuinfo)
 case "$vendor" in
   AuthenticAMD) candidates="EPYC-Rome-v4 EPYC-Rome-v3 EPYC-Rome EPYC-v4 EPYC" ;;
-  *) candidates="SapphireRapids-v3 Icelake-Server-v7 Cascadelake-Server-v5 Skylake-Server-v5 Broadwell-v4 Haswell-v4" ;;
+  *) candidates="SapphireRapids-v3 Icelake-Server-v7 Cascadelake-Server-v5 Skylake-Server-v5 Skylake-Server Broadwell-v4 Broadwell Haswell" ;;
 esac
 
 md=$OUT/select-cpu.md

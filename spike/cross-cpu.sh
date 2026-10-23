@@ -126,11 +126,12 @@ inner_restore() {
   work=$(gexec xc-r "$WORKLOAD")
   errs=$(gexec xc-r "$KERNEL_ERRORS")
   marker=$(gexec xc-r 'cat /root/marker')
+  local new_errors
+  new_errors=$(gexec xc-r "dmesg --level=emerg,alert,crit,err | tail -n +$((kernel_errors + 1))")
   # shellcheck disable=SC1091
   source "$(vmdir xc-r)/restore-info"
   vm_quit xc-r
-  local fail=0
-  row() { printf '| %s | %s | %s | %s |\n' "$1" "$2" "$3" "$4"; [ "$4" = PASS ] || fail=1; }
+  row() { printf '| %s | %s | %s | %s |\n' "$1" "$2" "$3" "$4"; }
   v() { if [ "$1" = "$2" ]; then echo PASS; else echo FAIL; fi; }
   {
     echo "| Check | Saved | Restored | Verdict |"
@@ -143,8 +144,11 @@ inner_restore() {
     row "file written before the checkpoint" "saved-on-the-first-host" "$marker" "$(v saved-on-the-first-host "$marker")"
     row "counter continues (10 s apart)" "$counter" "$count1 → $count2" "$([ "$count1" -ge "$counter" ] && [ "$count2" -gt $((count1 + 50)) ] && echo PASS || echo FAIL)"
     row "kernel error lines (dmesg)" "$kernel_errors" "$errs" "$(v "$kernel_errors" "$errs")"
-  } | tee "$OUT/cross-cpu.md"
-  if [ "$fail" = 0 ]; then echo "RESULT: PASS"; else echo "RESULT: FAIL"; exit 1; fi
+  } >"$OUT/cross-cpu.md"
+  cat "$OUT/cross-cpu.md"
+  [ -z "$new_errors" ] || printf 'Kernel errors logged since the checkpoint:\n%s\n' "$new_errors"
+  if grep -q '| FAIL |$' "$OUT/cross-cpu.md"; then echo "RESULT: FAIL"; exit 1; fi
+  echo "RESULT: PASS"
 }
 
 case "${1:-}" in

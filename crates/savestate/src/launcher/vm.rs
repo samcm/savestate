@@ -50,6 +50,13 @@ const POLL: Duration = Duration::from_millis(50);
 const BOOT_TIMEOUT: Duration = Duration::from_secs(300);
 const RESTORE_TIMEOUT: Duration = Duration::from_secs(120);
 const GUEST_CALL_TIMEOUT: Duration = Duration::from_secs(60);
+/// The guest kernel's free page reporting hands freed memory back every 2 s, a part
+/// of it each time: memory has settled once QEMU's resident set has not shrunk by
+/// `REPORTING_STEP` for `REPORTING_WINDOW`.
+const REPORTING_WINDOW: Duration = Duration::from_millis(2500);
+const REPORTING_STEP: u64 = 16 << 20;
+/// At most this long: a guest that frees memory continuously never settles.
+const REPORTING_MAX: Duration = Duration::from_secs(30);
 
 /// What every VM of this launcher shares.
 pub struct Context {
@@ -67,6 +74,7 @@ pub struct Context {
 
 pub struct Vm {
     qmp: Qmp,
+    qemu_pid: i32,
     guest: Client,
     store: Store,
     layer_prefix: String,
@@ -108,7 +116,10 @@ pub async fn start(ctx: &Context, request: StartRequest) -> anyhow::Result<Vm> {
     let store = Store::new(PathBuf::from(&request.state_dir));
     let qemu_version = probe::qemu_version(Path::new(QEMU)).context("qemu --version")?;
     let machine_type = probe::q35_machine(Path::new(QEMU)).map_err(anyhow::Error::msg)?;
+    // Disks bypass the page cache where the filesystem allows; memory files only if
+    // the installation asks.
     let direct_io = probe::direct_io(&store.layers());
+    let memory_direct_io = request.memory_file_direct_io && direct_io;
     let layer0 = store::layer_id(&request.layer_prefix, 0);
     let layer0_path = store.layer(&layer0);
 
@@ -133,7 +144,7 @@ pub async fn start(ctx: &Context, request: StartRequest) -> anyhow::Result<Vm> {
     if let Some((restore, dir, manifest)) = &restore {
         let migration = FileMigration {
             multifd_channels: manifest.migration.multifd_channels,
-            direct_io,
+            direct_io: memory_direct_io,
         };
         migration::load_from_file(&qmp, &dir.join(MEMORY), migration, POLL)
             .await
@@ -175,6 +186,7 @@ pub async fn start(ctx: &Context, request: StartRequest) -> anyhow::Result<Vm> {
     chain.push(store::layer_path(&layer0));
     Ok(Vm {
         qmp,
+        qemu_pid: ctx.qemu_pid.load(Ordering::SeqCst),
         guest,
         store,
         layer_prefix: request.layer_prefix,
@@ -184,7 +196,7 @@ pub async fn start(ctx: &Context, request: StartRequest) -> anyhow::Result<Vm> {
         machine_args: machine.machine_args,
         migration: FileMigration {
             multifd_channels: MULTIFD_CHANNELS,
-            direct_io,
+            direct_io: memory_direct_io,
         },
         direct_io,
         vcpus: machine.vcpus,
@@ -391,7 +403,7 @@ impl Vm {
         ensure!(dir.is_dir(), "{} does not exist", dir.display());
         // Less guest memory holding data means a smaller memory file and pause.
         match tokio::time::timeout(GUEST_CALL_TIMEOUT, self.guest.prepare_checkpoint()).await {
-            Ok(Ok(())) => {}
+            Ok(Ok(())) => settle_reporting(self.qemu_pid).await,
             Ok(Err(error)) => tracing::warn!(%error, "pre-checkpoint hook failed"),
             Err(_) => tracing::warn!("pre-checkpoint hook timed out"),
         }
@@ -505,6 +517,46 @@ impl Vm {
         fsutil::write_json_atomic(&dir.join(orbd_vm::checkpoint::MANIFEST), &manifest)?;
         Ok(save_ms)
     }
+}
+
+/// Waits until the memory the pre-checkpoint hook freed is back with the host (free
+/// page reporting), so the memory file leaves it out: until QEMU's resident set stops
+/// shrinking, at most `REPORTING_MAX`.
+async fn settle_reporting(qemu_pid: i32) {
+    let started = Instant::now();
+    let Some(before) = resident_bytes(qemu_pid) else {
+        return;
+    };
+    let (mut low, mut since) = (before, started);
+    while since.elapsed() < REPORTING_WINDOW && started.elapsed() < REPORTING_MAX {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let Some(now) = resident_bytes(qemu_pid) else {
+            return;
+        };
+        if now + REPORTING_STEP <= low {
+            (low, since) = (now, Instant::now());
+        }
+    }
+    tracing::info!(
+        waited_ms = millis(started.elapsed()),
+        resident_mib_before = before >> 20,
+        resident_mib = low >> 20,
+        "free page reporting settled"
+    );
+}
+
+/// QEMU's resident memory (`VmRSS`), in bytes.
+fn resident_bytes(pid: i32) -> Option<u64> {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    let kib = status
+        .lines()
+        .find_map(|line| line.strip_prefix("VmRSS:"))?
+        .trim()
+        .strip_suffix("kB")?
+        .trim()
+        .parse::<u64>()
+        .ok()?;
+    Some(kib << 10)
 }
 
 /// `sha256:<hex>` of the guest-visible machine arguments.

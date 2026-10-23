@@ -171,6 +171,13 @@ pub struct Vm {
     /// placement unless this is set lower.
     #[serde(default = "default_slots_per_node")]
     pub slots_per_node: u32,
+
+    /// Checkpoint memory files are written and read with `O_DIRECT`, bypassing the
+    /// node's page cache. Default: false. Through the page cache a save usually
+    /// pauses the VM for less time, and concurrent restores of one checkpoint share
+    /// the cached file; measure both on your nodes' disks before turning it on.
+    #[serde(default)]
+    pub memory_file_direct_io: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]

@@ -22,9 +22,11 @@ behaviour it describes.
 - A **checkpoint** is a named, read-only, complete picture of a sandbox at one
   instant: RAM, CPU and device state, and disk. Taking one pauses the sandbox while
   its RAM is written out, then it carries on. The pause grows with the RAM the guest
-  is using: 1–2 s for an idle 8 GiB guest; for a busy one, about its used RAM
-  divided by the node disk's write rate (18 s for 6.8 GiB at 400 MB/s, about 7 s at
-  1 GB/s). A checkpoint is the only kind of saved state.
+  is using, not counting its page cache, which is dropped first: 1–2 s for an idle
+  8 GiB guest; for a busy one, about its used RAM divided by the node disk's write
+  rate (18 s for 6.8 GiB at 400 MB/s, about 7 s at 1 GB/s). Before the pause the
+  guest keeps running for a few seconds (at most 30) while the memory it freed goes
+  back to the host. A checkpoint is the only kind of saved state.
 - **Starting a sandbox from a checkpoint** gives a VM that wakes exactly where the
   checkpoint was: same processes mid-flight, same files, same in-guest network
   address. Any number of sandboxes can start from one checkpoint; each is fully
@@ -573,14 +575,26 @@ and restores run that exact image. Measured numbers are in `spike/RESULTS.md`.
 
 Checkpoint (sandbox keeps running):
 
-1. Guest agent pre-checkpoint hook (drops the page cache so the RAM file is smaller).
+1. Guest agent pre-checkpoint hook: `sync`, drop the page cache, then compact memory
+   (`/proc/sys/vm/compact_memory`), so the freed memory forms the 2 MiB blocks the
+   balloon's free page reporting hands back to the host; without compaction most of
+   a dropped cache lies in smaller holes between used pages and is saved anyway.
+   The guest kernel reports in passes 2 s apart, each a part of what is free, so the
+   launcher then waits until QEMU's resident memory has not fallen by 16 MiB for
+   2.5 s, at most 30 s. The guest runs meanwhile; only the RAM file shrinks. In the
+   end-to-end test (1 GiB guest using 179 MiB plus 256 MiB of page cache) the RAM
+   file went from 439 MiB to 186 MiB and the pause from 1.78 s to 0.70 s; the wait
+   was 6.8 s.
 2. `stop`.
 3. `blockdev-snapshot`: a new overlay becomes the sandbox's active disk; the previous
    top layer is now immutable and belongs to the checkpoint. The overlay is created
    with `qemu-img create -f qcow2 -u -b <top layer> -F qcow2 <new> <size>` (`-u` and
    an explicit size, so `qemu-img` does not open the layer the running QEMU has open)
    and added with `blockdev-add` (`"backing": null`) before `blockdev-snapshot`.
-4. Migrate to a file with `multifd` + `mapped-ram` (and `direct-io`), with
+4. Migrate to a file with `multifd` + `mapped-ram` (with `direct-io` only if
+   `vm.memoryFileDirectIo`: through the page cache a save usually pauses for less,
+   about half as long in one measurement on a cloud disk, and concurrent restores of
+   one checkpoint share the cached file; on other disks O_DIRECT was faster), with
    `max-bandwidth` raised far above the disk's rate: QEMU's default of 128 MiB/s
    applies to a save to file too and otherwise dominates the pause. The RAM file is
    sparse (only non-zero pages are written) and written in parallel; the save runs at
@@ -785,7 +799,7 @@ Kubernetes objects; every field has a documented default or is required with a c
 error, and unknown fields are refused. The schema is `savestate_api::config::Config`:
 `namespaces` (required), `stateDir`, `kubeletDir`, `launcherImage`, `vm` (`cpuModel`
 required, `memoryOverhead`, `cpuRequestPerVcpu`, `shapes` with an optional
-`cpuRequest` each, `nodeSelector`, `nodeAffinity`, `tolerations`, `slotsPerNode`), `network`
+`cpuRequest` each, `nodeSelector`, `nodeAffinity`, `tolerations`, `slotsPerNode`, `memoryFileDirectIo`), `network`
 (`egressAllow`, `dns`, `exposeFrom`), `images` (`registries`, `auth`), `stores` (per name:
 `endpoint`, `bucket`, `region` and `credentialsSecret` required, `prefix`), `export`
 (a store name; default none), `cache.minFreePercent`, `transfers.perNode` and `ttl`

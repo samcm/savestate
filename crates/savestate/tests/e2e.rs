@@ -168,6 +168,13 @@ async fn checkpoint_fork_and_resume_exactly() {
         "setsid sh -c 'i=0; while :; do i=$((i+1)); echo \"$$ $i\" >/run/counter.new && mv /run/counter.new /run/counter; sleep 0.1; done' </dev/null >/dev/null 2>&1 &",
     );
     sh("web", "echo before >/root/state && sync");
+    // Page cache, which the pre-checkpoint hook drops: the memory file holds about
+    // the memory the guest uses, not its cache.
+    sh(
+        "web",
+        "head -c 256M /dev/urandom >/root/cache && sync && cat /root/cache >/dev/null",
+    );
+    let used = guest_used_bytes("web");
     std::thread::sleep(Duration::from_secs(2));
     let (pid, at_checkpoint) = counter("web");
     let machine_id = sh("web", "cat /etc/machine-id");
@@ -181,6 +188,16 @@ async fn checkpoint_fork_and_resume_exactly() {
         saved_note(&client, &ns, "web-1").await
     ));
     let ready = checkpoints.get("web-1").await.unwrap().status.unwrap();
+    let memory_bytes = ready.memory_bytes.unwrap();
+    report(&format!(
+        "checkpoint memory file: {:.0} MiB; the guest used {:.0} MiB besides 256 MiB of page cache",
+        f64_mib(memory_bytes),
+        f64_mib(used)
+    ));
+    assert!(
+        memory_bytes <= used + (96 << 20),
+        "the memory file holds {memory_bytes} bytes; the guest used {used} besides its page cache"
+    );
     let guest_time = ready.guest_time.unwrap().0.as_second();
     assert_eq!(ready.vcpus, Some(1));
     assert_eq!(ready.memory.unwrap().0, "1Gi");
@@ -546,6 +563,23 @@ fn sh(sandbox: &str, script: &str) -> String {
         describe(&out)
     );
     String::from_utf8(out.stdout).unwrap()
+}
+
+/// Memory a sandbox's guest uses besides what it can reclaim, such as its page cache:
+/// `MemTotal` minus `MemAvailable`.
+fn guest_used_bytes(sandbox: &str) -> u64 {
+    let meminfo = sh(sandbox, "cat /proc/meminfo");
+    let kib = |field: &str| -> u64 {
+        meminfo
+            .lines()
+            .find_map(|line| line.strip_prefix(field))
+            .and_then(|rest| rest.trim().strip_suffix("kB"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap()
+    };
+    (kib("MemTotal:") - kib("MemAvailable:")) << 10
 }
 
 /// The counting process's pid and count.

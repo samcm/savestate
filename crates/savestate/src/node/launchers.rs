@@ -194,6 +194,7 @@ async fn plan(
         state_dir: ctx.store.root().display().to_string(),
         layer_prefix: uid,
         vsock_cid: ctx.cids.allocate(&ctx.run_root, dir)?,
+        memory_file_direct_io: ctx.config.vm.memory_file_direct_io,
         source: Some(source),
     }))
 }

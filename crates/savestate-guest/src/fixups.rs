@@ -20,12 +20,16 @@ const MIN_ENTROPY: usize = 32;
 /// `_IOW('R', 0x03, int[2])` from linux/random.h.
 const RNDADDENTROPY: libc::Ioctl = 0x4008_5203;
 
-/// Syncs filesystems and drops the page cache, so the guest's free memory is not
-/// holding data the checkpoint would otherwise save.
+/// Syncs filesystems, drops the page cache and compacts memory, so the memory freed
+/// forms the 2 MiB blocks free page reporting hands back to the host, and the
+/// checkpoint does not save it. Without compaction most of a dropped cache lies in
+/// smaller holes between used pages, which are never reported.
 pub fn prepare_checkpoint() -> Result<(), String> {
     nix::unistd::sync();
     std::fs::write("/proc/sys/vm/drop_caches", "3")
         .map_err(|e| format!("dropping the page cache: {e}"))?;
+    std::fs::write("/proc/sys/vm/compact_memory", "1")
+        .map_err(|e| format!("compacting memory: {e}"))?;
     tracing::info!("prepared for checkpoint");
     Ok(())
 }

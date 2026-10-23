@@ -617,6 +617,8 @@ exports/<UID>.json             an export of checkpoint <UID> in progress: the fi
                                it references
 manifests/<UID>.json           the checkpoint's manifest.json and its files; written
                                last: the checkpoint is complete
+collections/<pass>.json        a garbage collection that may be deleting: written
+                               before it lists anything, removed when it is done
 ```
 
 `<path>` is the file's path in the state directory: `images/<hex>.qcow2`,
@@ -638,8 +640,8 @@ Every chunk is checked against its digest when it is downloaded, before it is
 written.
 
 **Export** (node agent on a node holding the checkpoint): write
-`exports/<UID>.json` listing the checkpoint's chain and memory file; wait 30 s; for
-each file, the memory file and newest layer first, skip it if its index exists, else
+`exports/<UID>.json` listing the checkpoint's chain and memory file; wait until the
+collections listed in `collections/` now have finished (at most 30 s); for each file, the memory file and newest layer first, skip it if its index exists, else
 upload the chunks not yet there and then its index; write `manifests/<UID>.json`;
 delete the export record. A checkpoint whose manifest exists is exported already.
 
@@ -649,17 +651,24 @@ into `checkpoints/<UID>.tmp/`), fsync and rename it into place; write the
 checkpoint's `manifest.json` into the `.tmp` directory last and publish it like a
 save.
 
-**Garbage collection** (controller, every minute per store): list `files/`; then,
+**Garbage collection** (controller, every minute per store): write its marker
+`collections/<pass>.json`; list `files/`; then,
 starting a 10 s deadline, list `exports/` and `manifests/`, then the Checkpoints of
 its namespaces (fresh); delete the manifests and export records of checkpoints that
 are gone; then delete every file, its index first, that no remaining manifest or
 export record names, stopping at the deadline (the next pass carries on). Files are
 listed before the records that name them, so a file uploaded meanwhile is never
 taken for garbage, and records are listed before the Checkpoints, so a checkpoint
-created meanwhile is never taken for gone. An export trusts that a file or chunk is
-there only 30 s after its export record is written: a collection that listed the
-records before that has stopped deleting by then, and every later one sees the
-record. One prefix belongs to one installation: GC deletes whatever names no
+created meanwhile is never taken for gone. Its marker is removed once it is done.
+An export trusts that a file or chunk is there only once the collections whose
+markers it listed after writing its export record have finished: a collection whose
+marker it did not see wrote it, and so listed the records, after the export's record
+existed. Exports therefore wait only while a collection runs (well under a second
+for most). A collection that fails leaves its marker; an export then waits at most
+30 s after writing its record, by when any collection that listed the records
+before it has passed its deadline and its last request's 5 s timeout, and the next
+collection removes markers written more than 10 min before its own (by the store's
+clock). One prefix belongs to one installation: GC deletes whatever names no
 checkpoint of its own cluster.
 
 ## Network and security

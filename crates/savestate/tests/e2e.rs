@@ -370,7 +370,7 @@ async fn export_drop_the_local_copy_and_restore_from_the_store() {
         .unwrap();
     assert_eq!(export.spec.from.node.as_deref(), Some(node.as_str()));
     report(&format!(
-        "export: spec.export set to Ready in {store} in {:.1} s (includes the 30 s settle); {}",
+        "export: spec.export set to Ready in {store} in {:.1} s; {}",
         secs(started),
         note(&client, &ns, &export.name_any(), "Copied").await
     ));

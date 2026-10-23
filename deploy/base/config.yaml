@@ -21,10 +21,10 @@ namespaces: [sandboxes]
 
 vm:
   # QEMU CPU model for every guest (required). `host` gives guests the node's own
-  # CPU: the simple choice while checkpoints stay on the node that took them. A
-  # named model every VM node can run (e.g. EPYC-Rome-v4, run with `enforce` and
-  # checked by the node agent at start-up) is what lets checkpoints move between
-  # nodes later.
+  # CPU: the simple choice where all VM nodes are one machine type, as checkpoints
+  # then restore only on nodes with an identical CPU. A named model every VM node
+  # can run (e.g. EPYC-Rome-v4, run with `enforce` and checked by the node agent at
+  # start-up) lets checkpoints move between any VM nodes.
   cpuModel: host
 
   # Added to each sandbox's memory for its pod's memory request, to cover QEMU.
@@ -69,6 +69,29 @@ images:
   # auth: /etc/savestate/registry/config.json
   # Registries (host[:port]) reached over plain HTTP. Default: [] (HTTPS only).
   # plainHttp: [registry.example.internal:5000]
+
+# S3-compatible object stores checkpoints are exported to and restored from, by
+# name. Each prefix belongs to this installation alone: garbage collection deletes
+# whatever under it names none of its checkpoints. The Secret lives in the
+# namespace of the controller and node agents (savestate-system) and holds
+# accessKeyId and secretAccessKey (optionally sessionToken). Default: {} (none).
+# stores:
+#   archive:
+#     endpoint: https://s3.example.com
+#     bucket: example-checkpoints
+#     region: example-region-1
+#     prefix: savestate
+#     credentialsSecret: savestate-store-archive
+
+# Store every checkpoint is exported to once Ready (a checkpoint's spec.export
+# overrides it). Default: none, only checkpoints with spec.export are exported.
+# export: archive
+
+# Local copies of exported checkpoints are a cache, dropped (oldest first, never
+# one a sandbox on the node was restored from) while the state directory's
+# filesystem has less than this percentage free.
+# cache:
+#   minFreePercent: 10
 
 # transfers:
 #   perNode: 1

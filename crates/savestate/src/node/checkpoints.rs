@@ -186,6 +186,7 @@ async fn ready(
     let status = CheckpointStatus {
         phase: CheckpointPhase::Ready,
         nodes: vec![ctx.node.clone()],
+        stores: Vec::new(),
         vcpus: Some(manifest.vcpus),
         memory: Some(super::quantity(manifest.memory_mib << 20)),
         disk: Some(super::quantity(manifest.disk_bytes)),

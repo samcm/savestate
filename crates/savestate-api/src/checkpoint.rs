@@ -7,7 +7,7 @@ use crate::Ttl;
 
 /// A named, read-only, complete picture of a sandbox at one instant: RAM, CPU and
 /// device state, and disk. Taking one pauses the sandbox for a few seconds; it then
-/// carries on. Only `ttl` can change after creation.
+/// carries on. Only `ttl` and `export` can change after creation.
 #[derive(CustomResource, KubeSchema, Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[kube(
     group = "savestate.dev",
@@ -23,6 +23,7 @@ use crate::Ttl;
     printcolumn(json_path = ".spec.sandbox", name = "Sandbox", type_ = "string"),
     printcolumn(json_path = ".status.phase", name = "Phase", type_ = "string"),
     printcolumn(json_path = ".status.nodes", name = "Nodes", type_ = "string"),
+    printcolumn(json_path = ".status.stores", name = "Stores", type_ = "string"),
     printcolumn(
         json_path = ".status.memoryBytes",
         name = "Memory",
@@ -65,6 +66,13 @@ pub struct CheckpointSpec {
     /// still builds on is deleted only once that sandbox is gone.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ttl: Option<Ttl>,
+
+    /// Object store (a name in the installation config's `stores`) to export the
+    /// checkpoint to once it is `Ready`, which makes it independent of the node that
+    /// took it. Default: the config's `export`, else none. Can be set later.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1, max = 63))]
+    pub export: Option<String>,
 }
 
 /// Written by the node agent holding the checkpoint.
@@ -77,6 +85,10 @@ pub struct CheckpointStatus {
     /// Every node holding a complete copy.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub nodes: Vec<String>,
+
+    /// Every object store holding a complete copy.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stores: Vec<String>,
 
     /// Virtual CPUs of the checkpointed VM; sandboxes started from it get the same.
     #[serde(default, skip_serializing_if = "Option::is_none")]

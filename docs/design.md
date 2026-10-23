@@ -7,9 +7,11 @@ QEMU over QMP. It shares its QEMU, QMP and guest-agent code with
 [orbd](https://github.com/samcm/orbd).
 
 Status: the engine runs: controller, node agent, launcher and CLI boot, checkpoint
-and restore sandboxes end to end (transfers are phase 4). This document is the
-contract every part of the implementation follows; change it in the same pull request
-as any change to the behaviour it describes.
+and restore sandboxes end to end. Export of checkpoints to S3-compatible object
+stores and restore from them (phase 4) are being built as described here;
+node-to-node copies come later. This document is the contract every part of the
+implementation follows; change it in the same pull request as any change to the
+behaviour it describes.
 
 ## User contract
 
@@ -39,8 +41,9 @@ Guarantees and limits:
 | Randomness | Every restored sandbox gets fresh kernel entropy (new VM generation ID, which makes the guest kernel reseed, plus an explicit reseed from the guest agent). The kernel tells userspace nothing about a restore; programs that must react use the after-restore hooks. Secrets that programs already derived stay identical across siblings. |
 | Identity | Each restored sandbox gets a new machine-id, hostname and SSH host keys. Its in-guest IP and MAC are unchanged, which is safe because every sandbox has its own isolated network namespace. |
 | Memory | Every running sandbox costs its full memory size. Nothing shares or overcommits guest RAM; KSM stays off. |
-| Placement | A sandbox from a checkpoint starts on a node that holds the checkpoint. Checkpoints live on node-local disk. Copies to other nodes are explicit `Transfer`s (see below). |
-| Lifetime | A checkpoint lives until its TTL expires or it is deleted, and cannot be deleted while a sandbox's disk still builds on it. |
+| Placement | A sandbox from a checkpoint starts on a node that holds the checkpoint. One from a checkpoint in an object store can start on any node that can run it (holders are preferred): that node first copies the checkpoint from the store while the sandbox waits in `WaitingForTransfer`. |
+| Durability | A checkpoint is taken on node-local disk. One held by no store is lost with its node, so that node is kept from cluster-autoscaler scale-down while it holds one. Export to an object store (per checkpoint, or for all by default) makes it independent of every node; node-local copies of exported checkpoints are then a cache the node may drop under disk pressure. |
+| Lifetime | A checkpoint lives until its TTL expires or it is deleted, and cannot be deleted while a sandbox's disk still builds on it. Deleting it deletes its copies on nodes and in stores. |
 | Not provided | Network connections to the outside surviving a restore; restoring on a different QEMU build (the build is pinned per checkpoint automatically). |
 
 ## API
@@ -70,10 +73,14 @@ status:
 ---
 kind: Checkpoint         # short name ckpt
 metadata: {name: web-1-parked}
-spec: {sandbox: web-1, ttl: 48h}
+spec:
+  sandbox: web-1
+  ttl: 48h
+  export: archive        # optional: store to export to once Ready (default: config `export`)
 status:
   phase: Ready           # Pending | Saving | Ready | Failed
   nodes: [node-a]        # every node holding a complete copy
+  stores: [archive]      # every store holding a complete copy
   vcpus: 4               # shape of the checkpointed VM; sandboxes from it get
   memory: 8Gi            #   the same
   disk: 60Gi
@@ -90,15 +97,15 @@ status:
     devices: …           # digest of the device configuration
   message: …
 ---
-kind: Transfer           # short name xfer; after the MVP
-metadata: {name: parked-to-node-b}
+kind: Transfer           # short name xfer
+metadata: {name: web-1-parked-to-archive}
 spec:
   checkpoint: web-1-parked
-  to: {node: node-b}     # later: {store: …} for off-cluster export
+  from: {node: node-a}   # export: from a node holding it to a store
+  to: {store: archive}   #   or import: from: {store: archive}, to: {node: node-b}
 status:
   phase: Copying         # Pending | Copying | Ready | Failed
-  from: node-a
-  bytesDone: …
+  bytesDone: …           # bytes of the checkpoint's files copied or found already there
   bytesTotal: …
   message: …
 ```
@@ -108,8 +115,9 @@ status:
   checkpoint inherits image, vCPUs, memory and disk from it and setting them is
   rejected (admission cannot see the checkpoint, so equal values are refused too).
   `clock` is only accepted with `from`; unset means `frozen`.
-- Specs are immutable except `ttl`: changing a sandbox's source, shape or clock, a
-  checkpoint's sandbox, or anything in a transfer is rejected.
+- Specs are immutable except `ttl` and a checkpoint's `export`: changing a
+  sandbox's source, shape or clock, a checkpoint's sandbox, or anything in a transfer
+  is rejected.
 - A TTL is whole numbers each followed by `d`, `h`, `m` or `s` (`7d`, `48h`,
   `1d12h`), counted from the object's creation. The installation config can set a
   default and a maximum per kind.
@@ -118,20 +126,35 @@ status:
   start). `Failed` is terminal for every kind.
 - `kubectl get savestate` lists all three kinds. Field selectors work on
   `status.node` and `spec.from.checkpoint` (sandboxes), `spec.sandbox`
-  (checkpoints), and `spec.checkpoint`, `spec.to.node` and `status.from`
+  (checkpoints), and `spec.checkpoint`, `spec.from.node` and `spec.to.node`
   (transfers), so node agents watch only their own node's objects.
-- A completed `Transfer` adds its node to the checkpoint's `status.nodes`. The copy
-  belongs to the checkpoint; deleting the `Transfer` afterwards only deletes the
-  record. Deleting a `Transfer` that is still copying cancels it and removes partial
-  files. Each node runs at most `transfers.perNode` transfers at a time (default one).
-- When a sandbox from a checkpoint fits on no node holding it, the controller creates
-  a `Transfer` owned by that sandbox and the sandbox waits in `WaitingForTransfer`.
+- A `Transfer` copies a checkpoint between a node and a store (`stores` in the
+  installation config): an export goes `from: {node}`, a node holding the checkpoint,
+  `to: {store}`; an import goes `from: {store}`, one holding it, `to: {node}`. Each
+  end names exactly one of `node` and `store`; node-to-node and store-to-store
+  copies are refused (node-to-node comes later). The node agent of the transfer's
+  node does the copy.
+- A completed export adds its store to the checkpoint's `status.stores`, a completed
+  import its node to `status.nodes`. The copy belongs to the checkpoint; deleting the
+  `Transfer` afterwards only deletes the record. Deleting a `Transfer` that is still
+  copying cancels it and removes partial files (an export's partial objects go with
+  the store's garbage collection). Each node runs at most `transfers.perNode`
+  transfers at a time (default one).
+- A checkpoint with `spec.export` (else the config's `export`) gets an export
+  `Transfer` from the controller once it is `Ready`, named `<checkpoint>-to-<store>`
+  and owned by the checkpoint. A failed export is not retried; delete its `Transfer`
+  to have the controller create it again.
+- A sandbox from a checkpoint held by a store may be scheduled onto a node that does
+  not hold the checkpoint; the controller then creates an import `Transfer` to that
+  node, named after the sandbox and owned by it, and the sandbox waits in
+  `WaitingForTransfer` until the node holds the checkpoint. A failed import fails the
+  sandbox.
 - Later, a `Migration` kind may move a running sandbox between nodes with QEMU live
   migration (for draining nodes). Not part of the MVP.
 
-The CLI is shorthand over these objects: `savestate create`, `checkpoint`, `fork NAME
--n 3` (one checkpoint plus three sandboxes), `exec NAME -- CMD`, `cp`, `copy CKPT --to
-NODE`, `delete`.
+The CLI is shorthand over these objects: `savestate create`, `checkpoint` (`--export
+STORE` also waits for the export), `fork NAME -n 3` (one checkpoint plus three
+sandboxes), `exec NAME -- CMD`, `cp`, `delete`.
 
 ## Architecture
 
@@ -140,13 +163,14 @@ NODE`, `delete`.
 │ savestate          │◀─────────▶│ kube-apiserver           │
 │ controller         │           └────────────▲─────────────┘
 │ Sandbox → Pod,     │                        │ watch (own node only)
-│ TTL, transfers     │           ┌────────────┴─────────────┐
-└────────────────────┘           │ savestate node           │
-                                 │ (DaemonSet): layer store,│
-                                 │ images, GC, transfers,   │
-                                 │ device plugin, seccomp   │
-                                 └────────────┬─────────────┘
-                                   unix socket│
+│ TTL, transfers,    │           ┌────────────┴─────────────┐
+│ store GC           │           │ savestate node           │
+└─────────┬──────────┘           │ (DaemonSet): layer store,│
+          │ S3                   │ images, GC, transfers,   │
+┌─────────▼──────────┐    S3     │ device plugin, seccomp   │
+│ object stores      │◀──────────┤                          │
+│ (off-cluster)      │           └────────────┬─────────────┘
+└────────────────────┘             unix socket│
 ┌─────────────────────────────────────────────▼──────────────┐
 │ VM pod (not privileged): savestate launcher → qemu (QMP)   │
 │ no service-account token · memory request = limit ·        │
@@ -161,16 +185,19 @@ One static `savestate` binary provides every role (`controller`, `node`, `launch
 and the CLI); `savestate-guest` runs inside the VM.
 
 - **Controller** (Deployment, one replica): creates one Pod per Sandbox, in the
-  sandbox's namespace, pins sandboxes from checkpoints to a holding node, enforces
-  TTLs, creates and schedules Transfers, keeps finalizers that protect checkpoints
-  still in use. VM pods run the launcher image from the installation config, by
-  default the controller's own image at the digest its pod runs.
+  sandbox's namespace, places sandboxes from checkpoints on nodes that hold them or
+  can fetch them, enforces TTLs, creates Transfers, keeps finalizers that protect
+  checkpoints still in use, and garbage-collects the object stores. VM pods run the
+  launcher image from the installation config, by default the controller's own image
+  at the digest its pod runs.
 - **Node agent** (DaemonSet): owns `/var/lib/savestate` on its node; caches base images
   by digest; tells launchers on its node to boot, restore or checkpoint; garbage-collects
-  layers, checkpoints and run directories whose objects are gone; serves and fetches
-  transfers; reports disk use. As a kubelet device plugin it hands VM pods their
-  devices, and it installs their seccomp profile. Only it holds API credentials on
-  the node.
+  layers, checkpoints and run directories whose objects are gone; exports checkpoints
+  to object stores and imports them; drops exported copies under disk pressure; labels
+  its node with its CPU identity and keeps it from scale-down while it holds the only
+  copy of a checkpoint; reports disk use. As a kubelet device plugin it hands VM pods
+  their devices, and it installs their seccomp profile. Only it holds API credentials
+  on the node.
 - **Launcher** (one per VM pod): starts and supervises QEMU, talks QMP, does the
   guest-agent work around boots, restores and checkpoints, streams the serial console
   to the pod log. It has no Kubernetes credentials; the node agent drives it over a
@@ -192,7 +219,10 @@ expects).
 
 savestate acts only in the sandbox namespaces the installation config lists; objects
 elsewhere are ignored. The controller and node agent get their permissions there
-through RoleBindings; cluster-wide, the controller only reads nodes.
+through RoleBindings; cluster-wide, the controller only reads nodes and the node
+agent reads nodes and patches labels and annotations on them (its own; Kubernetes
+RBAC cannot narrow that to one node). Both read the stores' credential Secrets in
+their own namespace.
 
 Capacity accounting is plain Kubernetes: each VM is a pod whose memory request and
 limit are guest RAM plus the installation's memory overhead (`vm.memoryOverhead`,
@@ -211,8 +241,10 @@ per configured namespace. It writes only through server-side apply (field manage
 Kubernetes Events on the Sandbox or Checkpoint.
 
 **VM pods.** Each Sandbox gets exactly one Pod, named after it, in its namespace,
-owned by it (deleting the sandbox deletes the pod) and labelled
-`app.kubernetes.io/name: savestate` and `app.kubernetes.io/component: vm`:
+owned by it (deleting the sandbox deletes the pod), labelled
+`app.kubernetes.io/name: savestate` and `app.kubernetes.io/component: vm`, and
+annotated `cluster-autoscaler.kubernetes.io/safe-to-evict: "false"` (evicting it
+destroys the VM):
 
 - one container, `launcher`, running `savestate launcher` from the launcher image:
   the installation's (`launcherImage`, else the controller's own image by digest)
@@ -248,8 +280,12 @@ owned by it (deleting the sandbox deletes the pod) and labelled
   (`status.hostIPs`) in `SAVESTATE_HOST_IPS`, and `terminationMessagePolicy:
   FallbackToLogsOnError` (the launcher writes why its VM stopped to its termination
   log).
-- for a sandbox from a checkpoint, required node affinity on `metadata.name` in the
-  checkpoint's `status.nodes`.
+- for a sandbox from a checkpoint held by no store, required node affinity on
+  `metadata.name` in the checkpoint's `status.nodes`. For one from a checkpoint in a
+  store, required node affinity on the CPU label `savestate.dev/cpu` (see "CPU
+  model") equal to the checkpoint's, and preferred affinity (weight 100) for the
+  nodes in `status.nodes`: the scheduler picks a holder with room if there is one,
+  else any node that can run the checkpoint, which then imports it.
 - host paths: `stateDir` at the same path, and the sandbox's run directory
   `/run/savestate/<namespace>/<sandbox>/<sandbox UID>/` at `/run/savestate`. The UID
   keeps a later sandbox of the same name from meeting an earlier one's files.
@@ -290,15 +326,29 @@ Before creating the pod the controller refuses (sandbox `Failed`) an image outsi
 `images.registries`, a shape not in `vm.shapes`, and a checkpoint that is `Failed`,
 being deleted, or `Ready` without fingerprint, vCPUs or memory. It waits (sandbox
 `Pending` with a message) while the checkpoint does not exist, is not yet `Ready` or
-is on no node. A pod of the same name owned by an earlier sandbox is waited out.
-Transfers are not created yet (phase 4).
+is on no node and in no store. A pod of the same name owned by an earlier sandbox
+is waited out.
 
-**Sandbox status** is derived from the pod alone:
+**Imports.** When the VM pod of a sandbox from a checkpoint is scheduled onto a node
+not in the checkpoint's `status.nodes`, the controller creates an import `Transfer`
+named after the sandbox and owned by it, from the first store in `status.stores` to
+that node (a transfer of the same name owned by an earlier sandbox is waited out).
+The node agent there holds the launcher until the import is `Ready`, and fails it
+with the transfer's message if the import fails.
+
+**Exports.** For a `Ready` checkpoint whose export store (`spec.export`, else the
+config's `export`) is not yet in `status.stores`, the controller creates the export
+`Transfer` `<checkpoint>-to-<store>` (owned by the checkpoint) from the first node in
+`status.nodes` that still exists. An export store missing from the config gets a
+`Warning` event and no transfer.
+
+**Sandbox status** is derived from the pod (and, while it imports, its transfer):
 
 | Pod | Sandbox |
 | --- | --- |
 | absent, not yet placed | `Pending` (message says what it waits for) |
 | not scheduled | `Pending`, message from the scheduler's `PodScheduled` condition |
+| on a node not holding its checkpoint | `WaitingForTransfer`; `node` set; message with the import's progress |
 | on a node, not Ready | `Booting` (from an image) or `Restoring` (from a checkpoint); `node` set; message from a waiting container (e.g. an image that cannot be pulled) |
 | Ready | `Running`, and it stays `Running` while the pod runs |
 | `Failed` or `Succeeded`, being deleted, or gone after placement | `Failed` with the launcher's exit code or the pod's reason |
@@ -321,14 +371,20 @@ checkpoint meanwhile. The node agent on the sandbox's node takes the rest.
 finalizer only once no Sandbox has `spec.from.checkpoint` naming it or a checkpoint
 descended from it (following `status.parent`), reading both lists fresh from the API
 server; until then an `InUse` event names the sandboxes. Once the object is gone, the
-node agent removes the checkpoint's files.
+node agents remove the checkpoint's files and the store garbage collection its
+objects.
+
+**Store garbage collection.** Every minute, for each configured store, the
+controller deletes what no checkpoint of its namespaces needs any more (see "Object
+stores"). One store prefix belongs to one installation: objects under it that name
+no checkpoint of this cluster are garbage.
 
 **Contract with the node agent and launcher.**
 
 | Who | Writes |
 | --- | --- |
-| Controller | VM pods; Sandbox `status` (all of it); TTL deletions; the Checkpoint finalizer; `Failed` on Checkpoints that cannot start; later Transfers |
-| Node agent | Checkpoint `status` (`phase`, `nodes`, `vcpus`, `memory`, `disk`, sizes, `guestTime`, `parent`, `fingerprint`, `message`); Transfer `status`; files under `stateDir`; removes run directories of sandboxes that are gone |
+| Controller | VM pods; Sandbox `status` (all of it); TTL deletions; the Checkpoint finalizer; `Failed` on Checkpoints that cannot start; Transfers (exports and imports); deletions in stores |
+| Node agent | Checkpoint `status` (`phase`, `nodes`, `stores`, `vcpus`, `memory`, `disk`, sizes, `guestTime`, `parent`, `fingerprint`, `message`); Transfer `status`; files under `stateDir`; objects in stores; its node's `savestate.dev/cpu` label and scale-down annotation; removes run directories of sandboxes that are gone |
 | Launcher | listens on `/run/savestate/launcher.sock` in its pod (the run directory on the host); creates `/run/savestate/ready` once the VM runs and never removes it while the VM lives. A readiness probe (`test -e /run/savestate/ready`, every 2 s) turns that into the pod's Ready condition, which the controller reads. It exits non-zero when QEMU exits or the VM cannot start, and zero when its pod is deleted. |
 
 The node agent finds a sandbox's launcher at
@@ -343,9 +399,13 @@ global on a host: the lowest free one from 100000, kept in the run directory as
 `vsock-cid`, so it lives exactly as long as the sandbox; a restore gets its own), makes
 sure the base image or checkpoint is on the node, and sends `Start`: boot an image
 with the sandbox's shape and `vm.cpuModel`, or restore a checkpoint with its clock.
-Starts that cannot happen (an image that cannot be pulled, a checkpoint not on this
-node) are sent as `Fail`, and the launcher exits with that message, so the sandbox
-fails with it. A booted guest gets its address, route, DNS and hostname from the
+A restore first records the checkpoint's UID in the run directory (`checkpoint`),
+which keeps the checkpoint's local copy from eviction while the sandbox lives. A
+checkpoint not on this node, while this node is not in its `status.nodes` and a
+store holds it, is waited for: the controller is importing it here. Starts that
+cannot happen (an image that cannot be pulled, a checkpoint not on this node and in
+no store, a failed import) are sent as `Fail`, and the launcher exits with that
+message, so the sandbox fails with it. A booted guest gets its address, route, DNS and hostname from the
 launcher through the guest agent; a restored one keeps what its checkpoint had and
 gets the post-restore fixups.
 
@@ -362,11 +422,39 @@ controller's `Failed`), so every `Saving` checkpoint has a directory on its node
 launcher runs the checkpoint steps below, writing the memory file and
 `manifest.json` into that directory; the node agent publishes it by rename and writes
 `Ready` with the manifest's shape, sizes, guest time, parent and fingerprint (the
-launcher image is the VM pod's), and a `Saved` event with the pause. A save that fails
+launcher image is the VM pod's), and a `Saved` event with the pause. Before writing
+`Ready` it marks its node as holding a checkpoint no store has (below). A save that fails
 (including because its sandbox is deleted meanwhile) is discarded and `Failed`.
 After a node agent restart, a `Saving` checkpoint with a directory on the node is
 finished from disk: published, or complete (manifest written) and published now, is
 `Ready`; anything else is discarded and `Failed`.
+
+**Transfers.** The node agent runs the exports from its node (`spec.from.node`) and
+the imports to it (`spec.to.node`), at most `transfers.perNode` at a time, writing
+`Copying` with `bytesTotal`, then `bytesDone` every few seconds, then `Ready` or
+`Failed` with a message and an event on the Transfer saying how many bytes moved and
+how long it took. An export of a checkpoint not on the node, or to or from a store
+not in the config, fails. A finished export adds the store to the checkpoint's
+`status.stores`; an import downloads into `checkpoints/<UID>.tmp/` and
+`<path>.part` files, publishes like a save, and adds the node to `status.nodes`
+(both with the checkpoint's resource version, retried on conflict). Both resume
+after a restart of the node agent: a `Copying` transfer is started again, and what
+is already in the store, or already on the node, is not copied twice. A transfer
+whose object is deleted while copying stops and removes its partial files.
+
+**Scale-down.** While the node holds a `Ready` checkpoint whose `status.stores` is
+empty, the node agent sets `cluster-autoscaler.kubernetes.io/scale-down-disabled:
+"true"` on its node; once every local checkpoint is in a store or gone, it removes
+the annotation. It recomputes this every minute and after each export, and sets it
+before marking a new checkpoint `Ready`.
+
+**Cache eviction.** A local copy of a checkpoint that a store holds is a cache.
+When the state directory's filesystem has less than `cache.minFreePercent` free
+(default 10), the node agent drops such copies, oldest checkpoint first, until it
+has enough: it removes its node from `status.nodes` (with the checkpoint's resource
+version), then the files. A copy a sandbox on this node was restored from (its run
+directory names it) is never dropped. Restores and evictions on a node take one lock,
+so a restore never starts from a copy being dropped.
 
 **Garbage collection.** Every minute the node agent lists its files, then the
 Sandboxes and Checkpoints of its namespaces (fresh), and removes checkpoints (and
@@ -403,7 +491,13 @@ default refuses. Nothing else is widened. QEMU additionally applies its own filt
 (privileged, for `/dev/kvm`) starts QEMU once with `-cpu <vm.cpuModel>,enforce`; on a
 node that cannot run the model it fails with the features the node lacks as its
 termination message, and the node agent does not run there. With `host` it only
-records that guests get the node's CPU.
+records that guests get the node's CPU. At start-up the node agent labels its node
+`savestate.dev/cpu` with the first 16 hex digits of the SHA-256 of the CPU guests
+get there: the node's CPU (`hostCpu`, model name and flags digest) with `host`,
+else the model name. A checkpoint's CPU label is the same digest of its
+fingerprint's `hostCpu`, else its `cpuModel`, so a sandbox from a checkpoint in a
+store is only scheduled onto nodes whose guests get exactly the CPU it was taken
+with.
 
 The controller serves Prometheus metrics (`--metrics-listen`, default
 `0.0.0.0:9090`, at `/metrics`): reconcile counts, errors and durations per kind,
@@ -416,13 +510,14 @@ release until Debian 13 backports ships 11.1 for amd64) and an explicit
 versioned machine type (`pc-q35-11.1`). The guest CPU model is installation
 configuration (`vm.cpuModel`), one of:
 
-- `host`: guests get the node's own CPU. The simple choice while checkpoints stay
-  on the node that took them, as they do until transfers exist. The checkpoint's
-  fingerprint records the node's CPU (`hostCpu`: model name and a digest of its
-  feature flags), and a restore on a node whose CPU differs is refused.
+- `host`: guests get the node's own CPU. The checkpoint's fingerprint records the
+  node's CPU (`hostCpu`: model name and a digest of its feature flags), and a
+  restore on a node whose CPU differs is refused; a checkpoint from a store is only
+  placed on nodes with an identical CPU (`savestate.dev/cpu`). The simple choice
+  where all VM nodes are one machine type.
 - a named model that every node in the cluster can run (for example `EPYC-Rome-v4`
   where Zen 2 and Zen 3 hosts mix), without `invtsc`: what lets checkpoints move
-  between nodes later. The launcher passes `-cpu <model>,enforce`, so a host that
+  between any VM nodes. The launcher passes `-cpu <model>,enforce`, so a host that
   lacks a feature refuses to start rather than silently weakening the model; the
   node agent probes the configured model that way at start-up and reports a node
   that cannot run it. (Nested hosts often hide speculation
@@ -484,7 +579,9 @@ destination, in QEMU master after 11.1).
   checkpoints/<UID>/manifest.json    shape, layer chain, machine arguments, guest time,
                                      sizes, parent, fingerprint
   checkpoints/<UID>/memory           mapped-ram file (sparse)
-  checkpoints/<UID>.tmp/             save in progress; complete once manifest.json exists
+  checkpoints/<UID>.tmp/             save or import in progress; complete once
+                                     manifest.json exists
+  images/*.part, layers/*.part       files being imported
   trash/                             delete-by-rename
 ```
 
@@ -493,10 +590,76 @@ file relative to its own directory (`<id>.qcow2`, `../images/<hex>.qcow2`), and 
 manifest lists its chain relative to the state directory. Every publication is
 build-then-rename and fsynced; the node agent reconciles what is on disk at start-up
 (a complete save is published, an incomplete one discarded, interrupted image pulls
-removed), so a crash at any point converges (the orbd pattern). The node agent owns
-the directory; `layers/` and each save's `.tmp` directory belong to the QEMU user, who
-writes them. Chains grow by one layer per checkpoint; capping their depth and
-flattening them in the background is phase 3.
+and imports removed), so a crash at any point converges (the orbd pattern). The node
+agent owns the directory; `layers/` and each save's `.tmp` directory belong to the
+QEMU user, who writes them. Chains grow by one layer per checkpoint; capping their
+depth and flattening them in the background is phase 3.
+
+## Object stores
+
+An installation names S3-compatible object stores in its config (`stores`): an
+endpoint URL (`https://…`, or `http://…` inside a trusted network), a bucket, a
+region, a key prefix and the name of a Secret, in the namespace the controller and
+node agents run in, holding `accessKeyId` and `secretAccessKey` (and optionally
+`sessionToken`). The Secret is read for every transfer and garbage collection, so
+rotating it needs no restart. Requests are path-style. The client is the
+`savestate-objstore` crate, built on `object_store`'s S3 client.
+
+Layout under `<prefix>/`:
+
+```text
+files/<path>/<sha256>          a chunk of the file's data, at most 16 MiB, named by
+                               its digest
+files/<path>/index.json        the file's size, data extents and chunk digests;
+                               written after its chunks: the file is complete
+exports/<UID>.json             an export of checkpoint <UID> in progress: the files
+                               it references
+manifests/<UID>.json           the checkpoint's manifest.json and its files; written
+                               last: the checkpoint is complete
+```
+
+`<path>` is the file's path in the state directory: `images/<hex>.qcow2`,
+`layers/<id>.qcow2` and `checkpoints/<UID>/memory`. Each of those names one
+immutable file (an image by digest, a layer once frozen, a memory file by its
+checkpoint), so a file is uploaded once and every checkpoint whose chain uses it
+shares it: exporting a child of an exported checkpoint uploads only its own layer and
+memory file.
+
+A file's data is its allocated extents (`SEEK_DATA`/`SEEK_HOLE`) in order: the
+memory file holds only the guest's non-zero pages, so its holes cost nothing to
+store or move. An import writes the extents back at their offsets into a file of the
+original size, which is then as sparse as the original. Nothing is compressed: the
+zero pages are already gone, and decompression would sit between the store and the
+disk on every restore. Chunks move with 16 requests in flight per transfer (one
+transfer buffers at most 256 MiB); each chunk is one PUT, so an interrupted export
+leaves only whole chunks, and a retry skips the chunks and files already there.
+Every chunk is checked against its digest when it is downloaded, before it is
+written.
+
+**Export** (node agent on a node holding the checkpoint): write
+`exports/<UID>.json` listing the checkpoint's chain and memory file; wait 30 s; for
+each file, the memory file and newest layer first, skip it if its index exists, else
+upload the chunks not yet there and then its index; write `manifests/<UID>.json`;
+delete the export record. A checkpoint whose manifest exists is exported already.
+
+**Import** (node agent of the destination node): read the manifest; for each file
+not already on the node, download its chunks into `<path>.part` (the memory file
+into `checkpoints/<UID>.tmp/`), fsync and rename it into place; write the
+checkpoint's `manifest.json` into the `.tmp` directory last and publish it like a
+save.
+
+**Garbage collection** (controller, every minute per store): list `files/`; then,
+starting a 10 s deadline, list `exports/` and `manifests/`, then the Checkpoints of
+its namespaces (fresh); delete the manifests and export records of checkpoints that
+are gone; then delete every file, its index first, that no remaining manifest or
+export record names, stopping at the deadline (the next pass carries on). Files are
+listed before the records that name them, so a file uploaded meanwhile is never
+taken for garbage, and records are listed before the Checkpoints, so a checkpoint
+created meanwhile is never taken for gone. An export trusts that a file or chunk is
+there only 30 s after its export record is written: a collection that listed the
+records before that has stopped deleting by then, and every later one sees the
+record. One prefix belongs to one installation: GC deletes whatever names no
+checkpoint of its own cluster.
 
 ## Network and security
 
@@ -537,10 +700,10 @@ installation is supplied at install time and never committed here:
 | In the repository | Supplied by each installation |
 | --- | --- |
 | CRD schemas, controller and node behaviour | Namespaces, RBAC subjects, quotas |
-| Generic defaults (state directory, transfer concurrency, TTL limits) and their config schema | Node selection, tolerations, which nodes run VMs |
+| Generic defaults (state directory, transfer concurrency, cache eviction threshold, TTL limits) and their config schema | Node selection, tolerations, which nodes run VMs |
 | Install manifests with placeholders (kustomize base, example values) | Guest CPU model, VM shapes offered and the CPU they request, memory overhead margin |
 | Guest image build recipe (kernel config, minimal rootfs, guest agent) | Base images and what is preinstalled in them, registries, pull secrets |
-| Test fixtures | Egress allowlists, DNS, off-cluster stores, credentials |
+| Test fixtures | Egress allowlists, DNS, object stores (endpoint, bucket, region, prefix), which store checkpoints export to, credentials |
 
 Installation config is one YAML file (operator and node agent) plus the usual
 Kubernetes objects; every field has a documented default or is required with a clear
@@ -548,8 +711,10 @@ error, and unknown fields are refused. The schema is `savestate_api::config::Con
 `namespaces` (required), `stateDir`, `kubeletDir`, `launcherImage`, `vm` (`cpuModel`
 required, `memoryOverhead`, `cpuRequestPerVcpu`, `shapes` with an optional
 `cpuRequest` each, `nodeSelector`, `tolerations`, `slotsPerNode`), `network`
-(`egressAllow`, `dns`), `images` (`registries`, `auth`), `transfers.perNode` and
-`ttl` (`default` and `max` per kind). `deploy/base` is a kustomize base with
+(`egressAllow`, `dns`), `images` (`registries`, `auth`), `stores` (per name:
+`endpoint`, `bucket`, `region` and `credentialsSecret` required, `prefix`), `export`
+(a store name; default none), `cache.minFreePercent`, `transfers.perNode` and `ttl`
+(`default` and `max` per kind). `deploy/base` is a kustomize base with
 placeholder values and `deploy/README.md` lists what an installation supplies.
 
 ## Phases
@@ -560,5 +725,5 @@ placeholder values and `deploy/README.md` lists what an installation supplies.
 | 1. Engine | Shared crates with orbd; launcher, layer store, checkpoint and restore flows, guest agent fixups, CLI creating VM pods directly. |
 | 2. Operator | CRDs, controller, node agent, GC and retention, metrics, install manifests. |
 | 3. Hardening | Failure injection, disk-full, node reboot, upgrades, soak. |
-| 4. Transfers | `Transfer` kind, node-to-node copy, export to an off-cluster store. |
-| Later | `Migration`, lazy restore, optional KSM. |
+| 4. Transfers | `Transfer` kind; export to S3-compatible object stores and restore from them onto any node that can run the checkpoint; cache eviction and scale-down protection on autoscaled clusters. |
+| Later | Node-to-node copies, `Migration`, lazy restore, optional KSM. |

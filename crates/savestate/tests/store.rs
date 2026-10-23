@@ -100,11 +100,17 @@ fn garbage_collection_keeps_what_live_objects_build_on() {
     // Image `base` booted sandbox s1, checkpointed as `kept` (its layer s1-0). A
     // sandbox s2 restored from `kept` was checkpointed as `gone` (layer s2-0), then s2
     // and `gone` were deleted. Sandbox s3 runs from image `other`; image `unused` and
-    // s4's layer belong to nothing left. s5 is gone, but a complete save whose object
-    // still exists uses its layer.
-    for image in ["base", "other", "unused"] {
+    // s4's layer belong to nothing left; so does image `recent`, but a sandbox booted
+    // from it moments ago. s5 is gone, but a complete save whose object still exists
+    // uses its layer.
+    for image in ["base", "other", "unused", "recent"] {
         touch(root, &image_path(image));
     }
+    let long_ago = std::time::SystemTime::now() - 2 * savestate::store::IMAGE_GRACE;
+    std::fs::File::open(root.join(image_path("unused")))
+        .unwrap()
+        .set_modified(long_ago)
+        .unwrap();
     for layer in [
         "s1-0", "s1-1", "s2-0", "s2-1", "s3-0", "s4-0", "s5-0", "s6-0",
     ] {
@@ -144,8 +150,10 @@ fn garbage_collection_keeps_what_live_objects_build_on() {
     for layer in ["s2-0", "s2-1", "s4-0"] {
         assert!(!exists(&layer_path(layer)), "{layer} was kept");
     }
-    // Images: in a remaining chain, or booted by a live sandbox.
+    // Images: in a remaining chain, booted by a live sandbox, or used lately.
     assert!(exists(&image_path("base")));
     assert!(exists(&image_path("other")));
     assert!(!exists(&image_path("unused")));
+    // Kept a while after its last use, so creating a sandbox again pulls nothing.
+    assert!(exists(&image_path("recent")));
 }

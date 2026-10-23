@@ -264,6 +264,14 @@ impl Store {
                 continue;
             }
             let path = self.image(hex);
+            // Used lately (its modification time is its last use): a sandbox deleted and
+            // created again from the same image should not pay its pull twice.
+            let idle = std::fs::metadata(&path)
+                .and_then(|meta| meta.modified())
+                .map(|used| used.elapsed().unwrap_or_default());
+            if idle.is_ok_and(|idle| idle < IMAGE_GRACE) {
+                continue;
+            }
             fsutil::remove_via_trash(&path, &self.trash())?;
             removed.push(path);
         }
@@ -279,6 +287,15 @@ impl Store {
             free: fsutil::free_bytes(&self.root).unwrap_or(0),
         }
     }
+}
+
+/// How long an image nothing uses any more stays on the node after its last use.
+pub const IMAGE_GRACE: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// Records that an image is in use now (its modification time), for
+/// [`IMAGE_GRACE`].
+pub fn touch(path: &Path) -> io::Result<()> {
+    std::fs::File::open(path)?.set_modified(std::time::SystemTime::now())
 }
 
 /// `images/<hex>.qcow2`, as chains name it.

@@ -80,7 +80,7 @@ savestate create web-1 --from web-1-parked
 cargo build --release -p savestate
 ```
 
-The image `ghcr.io/samcm/savestate` (QEMU 11.1 from Debian 13 backports) is published
+The image `ghcr.io/samcm/savestate` (stock QEMU 11.1 on Debian 13) is published
 from `main`; static binaries for x86_64 and aarch64 are attached to each release.
 
 ## License

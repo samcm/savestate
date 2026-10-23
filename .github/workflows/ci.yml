@@ -105,6 +105,11 @@ jobs:
           name: image-amd64
           path: artifacts
       - run: zstd -dc artifacts/image-amd64.tar.zst | docker load
+      - name: Start the shipped QEMU on KVM
+        run: |
+          printf '%s\n' '{"execute":"qmp_capabilities"}' '{"execute":"quit"}' |
+            docker run --rm -i --device /dev/kvm --entrypoint qemu-system-x86_64 savestate:smoke \
+              -accel kvm -machine pc-q35-11.1 -nodefaults -display none -S -qmp stdio
 
       # Static musl test binaries run in the image whatever its libc.
       - run: |

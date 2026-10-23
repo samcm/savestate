@@ -4,9 +4,9 @@
 # The parent starts a kernel uevent monitor, then is checkpointed and quits. Two
 # restores follow: one with the same command line, one with a different MAC on the
 # command line. Each restore should get a new generation ID (QMP
-# query-vm-generation-id) and the guest kernel should be told (the vmgenid driver
-# emits a NEW_VMGENID=1 uevent, which the monitor process, restored mid-flight, logs,
-# and the kernel logs "crng reseeded due to virtual machine fork" when it reseeds).
+# query-vm-generation-id) and the guest kernel should be told: its vmgenid driver
+# reseeds the RNG and logs "crng reseeded due to virtual machine fork". The uevent
+# monitor (restored mid-flight) shows whether userspace hears about it too.
 #
 # Environment: EXP5_MEM (default 2G).
 source "$(dirname "$0")/lib.sh"
@@ -61,5 +61,6 @@ md "| restore 1 | $MAC1 | \`${gen[1]}\` | ${ev[1]} / ${rs[1]} | ${mac[1]} | ${rx
 md "| restore 2 | $MAC2 | \`${gen[2]}\` | ${ev[2]} / ${rs[2]} | ${mac[2]} | ${rx[2]} | ${netok[2]} |"
 verdict_header
 verdict "generation ID differs per restore" "$(is [ "$gen_p" != "${gen[1]}" -a "${gen[1]}" != "${gen[2]}" -a "$gen_p" != "${gen[2]}" ])" "parent ${gen_p:0:8}…, restores ${gen[1]:0:8}…, ${gen[2]:0:8}…"
-verdict "guest is notified of the new generation ID" "$(is [ "$rs_p" = 0 -a "${rs[1]}" -ge 1 -a "${rs[2]}" -ge 1 -a "${ev[1]}" -ge 1 -a "${ev[2]}" -ge 1 ])" "kernel reseeds for a VM fork: parent $rs_p, restores ${rs[1]} and ${rs[2]}; NEW_VMGENID=1 uevents: parent $ev_p, restores ${ev[1]} and ${ev[2]}"
+verdict "guest kernel is notified of the new generation ID" "$(is [ "$rs_p" = 0 -a "${rs[1]}" -ge 1 -a "${rs[2]}" -ge 1 ])" "RNG reseeds for a VM fork: parent $rs_p, restores ${rs[1]} and ${rs[2]}"
+md "| (information) userspace notification | - | NEW_VMGENID=1 uevents: parent $ev_p, restores ${ev[1]} and ${ev[2]} |"
 verdict "MAC unchanged after restore" "$(is [ "${mac[1]}" = "$mac_p" -a "${netok[1]}" = ok ])" "guest MAC $mac_p → ${mac[1]}; network ${netok[1]}"

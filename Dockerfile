@@ -19,7 +19,7 @@ SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
 ARG QEMU_VERSION=11.1.2
 ARG QEMU_SHA256=731b5681e4bb18be313231579b8efd0296c5b015fa36dc533874b639ba838016
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        bison bzip2 ca-certificates curl flex gcc libaio-dev libc6-dev libglib2.0-dev \
+        bison bzip2 ca-certificates curl flex gcc libaio-dev libc6-dev libfdt-dev libglib2.0-dev \
         libpixman-1-dev libseccomp-dev liburing-dev libzstd-dev make ninja-build pkg-config \
         python3 python3-venv xz-utils
 RUN curl -fsSL -o /tmp/qemu.tar.xz "https://download.qemu.org/qemu-$QEMU_VERSION.tar.xz" \
@@ -44,7 +44,7 @@ FROM base AS base-arm64
 FROM base AS base-amd64
 RUN apt-get update \
     && apt-get install -y --no-install-recommends iproute2 nftables \
-        libaio1t64 libglib2.0-0t64 libpixman-1-0 libseccomp2 liburing2 libzstd1 \
+        libaio1t64 libfdt1 libglib2.0-0t64 libpixman-1-0 libseccomp2 liburing2 libzstd1 \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=qemu /out/usr/local /usr/local
 RUN ! ldd /usr/local/bin/qemu-system-x86_64 /usr/local/bin/qemu-img | grep 'not found' \

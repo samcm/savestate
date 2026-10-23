@@ -17,9 +17,10 @@
 #   --cpu MODEL       guest CPU model (default EPYC-Rome-v4)
 #   --mem SIZE        guest RAM (default 2G)
 #   --dir DIR         working directory on both hosts (default /var/tmp/savestate-cross-cpu)
-#   --image PATH      prepared guest image on SAVE_HOST, inside DIR when QEMU runs in
-#                     a container (default: built there by prepare-guest.sh from the
-#                     Debian 13 cloud image, which needs internet access)
+#   --image PATH      prepared guest image (NAME.qcow2 next to NAME.vmlinuz and
+#                     NAME.initrd, from prepare-guest.sh) on SAVE_HOST, inside DIR when
+#                     QEMU runs in a container (default: built there by
+#                     prepare-guest.sh, which needs internet access and root)
 #   --runtime R       how QEMU runs on the hosts: docker (default) or podman, both run
 #                     through sudo in a debian:trixie container with install-qemu.sh, so
 #                     both hosts get the same QEMU build; or host, which uses the hosts'
@@ -65,7 +66,13 @@ inner_save() {
   local dir=$1 mem=$2 cpu=$3 dio=$4 image=$5
   inner_setup "$dir" save
   export CPU_MODEL=$cpu
-  if [ -n "$image" ]; then cp "$image" "$LAYERS/base.qcow2"; else "$dir/prepare-guest.sh" "$LAYERS/base.qcow2"; fi
+  if [ -n "$image" ]; then
+    cp "$image" "$LAYERS/base.qcow2"
+    cp "${image%.qcow2}.vmlinuz" "$LAYERS/base.vmlinuz"
+    cp "${image%.qcow2}.initrd" "$LAYERS/base.initrd"
+  else
+    "$dir/prepare-guest.sh" "$LAYERS/base.qcow2"
+  fi
   boot xc-p "$mem"
   gexec xc-p 'echo saved-on-the-first-host >/root/marker && sync &&
     systemd-run --unit=counter sh -c "i=0; while :; do i=\$((i+1)); echo \$i >/run/counter; sleep 0.1; done"' >/dev/null

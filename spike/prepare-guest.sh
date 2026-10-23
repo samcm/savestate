@@ -1,15 +1,22 @@
 #!/usr/bin/env bash
-# Build the guest disk for the spike: the Debian 13 generic cloud image, booted once
-# with cloud-init to install qemu-guest-agent (and hwclock, which guest-set-time runs),
-# turn off time synchronisation (savestate owns guest time) and background timers, then
-# disable cloud-init so later boots are quick. The result is a standalone qcow2.
+# Build the guest for the spike: the Debian 13 generic cloud image, booted once with
+# cloud-init to install qemu-guest-agent (and hwclock, which guest-set-time runs), turn
+# off time synchronisation (savestate owns guest time) and background timers, then
+# disable cloud-init so later boots are quick.
 #
-# Usage: prepare-guest.sh OUTPUT.qcow2      (does nothing if OUTPUT exists)
+# The guest boots its own kernel and initrd directly (-kernel/-initrd), copied out of
+# the image's root partition: on the GitHub-hosted runners the image's GRUB hands over
+# to the kernel and the VM resets at once, while the same kernel boots fine directly.
+# Mounting the partition needs root.
+#
+# Usage: prepare-guest.sh OUTPUT.qcow2
+#   writes OUTPUT.qcow2, OUTPUT.vmlinuz and OUTPUT.initrd (does nothing if they exist)
 # Environment: CPU_MODEL (default EPYC-Rome-v4), ACCEL (default kvm)
 set -euo pipefail
 
 out=$1
-[ -s "$out" ] && { echo "guest image $out already present"; exit 0; }
+base=${out%.qcow2}
+[ -s "$out" ] && [ -s "$base.vmlinuz" ] && [ -s "$base.initrd" ] && { echo "guest $out already present"; exit 0; }
 url=https://cloud.debian.org/images/cloud/trixie/latest
 img=debian-13-genericcloud-amd64.qcow2
 tmp=$(mktemp -d)
@@ -35,9 +42,19 @@ power_state: {mode: poweroff, condition: true}
 EOF
 genisoimage -quiet -output seed.iso -volid cidata -joliet -rock user-data meta-data
 
+# Copy the kernel and initrd out of the root partition (partition 1).
+qemu-img convert -O raw "$img" raw.img
+mkdir mnt
+mount -o loop,ro,offset=$(($(partx -g -o START -n 1 raw.img) * 512)) raw.img mnt
+cp "$(ls -v mnt/boot/vmlinuz-* | tail -1)" vmlinuz
+cp "$(ls -v mnt/boot/initrd.img-* | tail -1)" initrd
+umount mnt
+rm raw.img
+
 echo "first boot with cloud-init (installs qemu-guest-agent, then powers off)"
 timeout 900 qemu-system-x86_64 -machine "pc-q35-11.1,accel=${ACCEL:-kvm}" -cpu "${CPU_MODEL:-EPYC-Rome-v4}" \
   -smp 2 -m 2G -nodefaults -no-user-config -display none -no-reboot -serial file:serial.log \
+  -kernel vmlinuz -initrd initrd -append "root=/dev/vda1 console=ttyS0,115200" \
   -drive "file=$img,if=virtio,format=qcow2" -drive file=seed.iso,if=virtio,format=raw,readonly=on \
   -netdev user,id=net0 -device virtio-net-pci,netdev=net0 ||
   { tail -50 serial.log; exit 1; }
@@ -45,5 +62,7 @@ grep -q 'Cloud-init.*finished' serial.log || { tail -50 serial.log; echo "cloud-
 
 mkdir -p "$(dirname "$out")"
 qemu-img convert -O qcow2 "$img" "$out.tmp"
+cp vmlinuz "$base.vmlinuz"
+cp initrd "$base.initrd"
 mv "$out.tmp" "$out"
 qemu-img info "$out"

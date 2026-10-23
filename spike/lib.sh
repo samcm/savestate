@@ -16,7 +16,8 @@ MACHINE=${MACHINE:-pc-q35-11.1}
 CPU_MODEL=${CPU_MODEL:-$(cat "$WORK/cpu-model" 2>/dev/null || echo EPYC-Rome-v4)}
 CHANNELS=${MULTIFD_CHANNELS:-4}
 # Every disk layer lives in one directory and names its backing file by bare file
-# name, so a checkpoint's layer chain can be copied elsewhere as a directory.
+# name, so a checkpoint's layer chain can be copied elsewhere as a directory. The guest
+# kernel and initrd (base.vmlinuz, base.initrd) live there too.
 LAYERS=$WORK/layers
 mkdir -p "$OUT" "$LAYERS" "$WORK/vm" "$WORK/ckpt"
 
@@ -69,6 +70,7 @@ vm_start() {
     -chardev "socket,id=qga0,path=$d/qga.sock,server=on,wait=off"
     -device virtio-serial-pci,id=vser0
     -device virtserialport,chardev=qga0,name=org.qemu.guest_agent.0
+    -kernel "$LAYERS/base.vmlinuz" -initrd "$LAYERS/base.initrd" -append "root=/dev/vda1 console=ttyS0,115200"
     -blockdev "driver=file,filename=$disk,node-name=disk-file"
     -blockdev "driver=qcow2,file=disk-file,node-name=disk"
     -device virtio-blk-pci,drive=disk,id=vd0

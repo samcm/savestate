@@ -35,6 +35,8 @@ CPU_MODEL=$("$spike/select-cpu.sh")
 image=${GUEST_IMAGE:-$WORK/guest.qcow2}
 "$spike/prepare-guest.sh" "$image"
 cp "$image" "$WORK/layers/base.qcow2"
+cp "${image%.qcow2}.vmlinuz" "$WORK/layers/base.vmlinuz"
+cp "${image%.qcow2}.initrd" "$WORK/layers/base.initrd"
 chmod a-w "$WORK/layers/base.qcow2"
 
 failed=()

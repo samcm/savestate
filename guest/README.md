@@ -11,6 +11,9 @@ root filesystem carries systemd and the guest agent (`crates/savestate-guest`).
 - `rootfs/`: the generic base image, a Dockerfile that `build.sh` turns into
   `rootfs.qcow2`: Debian 13, systemd, udev, D-Bus, `iproute2`, `procps` and the guest
   agent, nothing else. It is a base to build on, not something to run work in as is.
+  Every push to main publishes it, `:main` and `:sha-<short>`, as the sandbox image
+  `ghcr.io/samcm/savestate-base` (its disk) and as the container image
+  `ghcr.io/samcm/savestate-rootfs` (the `base` stage, to build FROM).
 
 ## Build
 
@@ -37,6 +40,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends build-essential
     && rm -rf /var/lib/apt/lists/*
 COPY after-restore.d/ /etc/savestate/after-restore.d/
 ```
+
+`savestate-base` is the `base` stage: the published `ghcr.io/samcm/savestate-rootfs`
+(pin it by digest), or built locally:
 
 ```sh
 guest/rootfs/build.sh base target/x86_64-unknown-linux-musl/release/savestate-guest savestate-base

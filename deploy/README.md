@@ -26,7 +26,8 @@ Install in this order:
    `savestate-system` to roll out. A node-agent pod stuck in `Init` on a node means
    that node cannot run `vm.cpuModel`: its `probe-cpu` container's termination
    message lists the missing CPU features.
-5. Publish a base image (below) and create a sandbox from it:
+5. Publish a base image (below), or use the generic one, `ghcr.io/samcm/savestate-base`
+   (`:main` from every push to main; pin it by digest), and create a sandbox from it:
    `savestate create web-1 --image <registry>/<repo>@sha256:<digest> --vcpus 2 --memory 4Gi --disk 30Gi --namespace <namespace>`.
 
 The overlay:

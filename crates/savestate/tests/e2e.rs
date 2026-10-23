@@ -55,8 +55,26 @@ async fn checkpoint_fork_and_resume_exactly() {
         .await
         .unwrap();
     let container = &pod.spec.unwrap().containers[0];
-    let security = serde_json::to_string(&container.security_context).unwrap();
+    let security = serde_json::to_value(&container.security_context).unwrap();
     report(&format!("VM pod security context: {security}"));
+    // Not privileged: devices come from the node agent's device plugin, and the
+    // runtime confines the container with savestate's seccomp profile.
+    assert_eq!(security.get("privileged"), None, "{security}");
+    assert_eq!(
+        security["seccompProfile"],
+        serde_json::json!({"type": "Localhost", "localhostProfile": "savestate/vm.json"})
+    );
+    let init = sh_pod(
+        &client,
+        &ns,
+        "web",
+        "grep -E '^Seccomp(_filters)?:' /proc/1/status",
+    )
+    .await;
+    assert!(
+        init.contains("Seccomp:\t2"),
+        "the container runs without a seccomp filter: {init}"
+    );
     // QEMU runs unprivileged, as the QEMU user.
     let qemu = sh_pod(
         &client,

@@ -8,7 +8,13 @@
   `sandboxes`.
 
 Nodes that run VMs need KVM, `/dev/net/tun` and `/dev/vhost-vsock` (`modprobe
-vhost_vsock`), and a disk for `stateDir`. Install in this order:
+vhost_vsock`), and a disk for `stateDir`. VM pods are never privileged: the node
+agent hands them those devices as a kubelet device plugin. Their launcher container
+runs as root with only `NET_ADMIN`, `CHOWN`, `SETUID` and `SETGID`, no privilege
+escalation, a read-only root filesystem and the seccomp profile
+`savestate/vm.json` (the container runtime's default plus `AF_VSOCK` sockets), and
+drops to uid 65532 before starting QEMU, which applies its own seccomp filter.
+Install in this order:
 
 1. Label the VM nodes (the base selects `savestate.dev/node: "true"`), or set your own
    selection in the config and `base/node.yaml`.
@@ -68,7 +74,8 @@ Everything below describes one installation and comes from your overlay; nothing
 | Guest CPU model | `vm.cpuModel` (required). `host` for installations whose checkpoints stay on the node that took them: guests get the node's CPU, and a restore is refused if the node's CPU changed. A named QEMU model every VM node can run (e.g. `EPYC-Rome-v4`) is run with `enforce`, checked on every node at start-up (a node that cannot run it shows the missing features in its node-agent pod's `probe-cpu` init container), and is what lets checkpoints move between nodes once transfers exist. |
 | VM shapes offered | `vm.shapes` (default: any shape). |
 | Memory overhead margin | `vm.memoryOverhead` (default `512Mi`); measure QEMU's overhead on your nodes. |
-| `/dev/kvm`, `/dev/net/tun`, `/dev/vhost-vsock` | `vm.devices`: extended resources from your device plugin. Without one, the launcher container runs privileged. With one it runs as root with only `NET_ADMIN`, `CHOWN`, `SETUID` and `SETGID`, no privilege escalation, a read-only root filesystem and seccomp `Unconfined` (the runtime default refuses vsock sockets; QEMU applies its own filter), and drops to uid 65532 before starting QEMU. |
+| VMs per node | `vm.slotsPerNode` (default `110`, the kubelet's default pod limit). The node agent is a kubelet device plugin: it advertises that many units of `savestate.dev/vm`, each VM pod takes one, and with it the kubelet hands the pod `/dev/kvm`, `/dev/net/tun` and `/dev/vhost-vsock`. Set it lower to cap VMs per node; CPU and memory requests limit them otherwise. |
+| Kubelet directory | `kubeletDir` (default `/var/lib/kubelet`, also k3s's) and the node agent's `device-plugins` and `seccomp` `hostPath`s in [`base/node.yaml`](base/node.yaml) must agree. The node agent installs the VM pods' seccomp profile as `seccomp/savestate/vm.json` there at start-up, before it advertises any VM slot. |
 | Base images, registries, pull credentials | `images.registries`, and `images.auth` pointing at a Docker `config.json` you mount into the node agent (for example from a Secret, by patching `base/node.yaml`); `images.plainHttp` for registries reached without TLS. |
 | Egress allowlist, DNS | `network.egressAllow` and `network.dns`. Guests reach the internet; cluster, node, link-local and private ranges are dropped except what you allow. |
 | State directory | `stateDir` (default `/var/lib/savestate`) and the node agent's `hostPath` must agree, on a disk large enough for your checkpoints. |

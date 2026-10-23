@@ -143,13 +143,15 @@ NODE`, `delete`.
 │ TTL, transfers     │           ┌────────────┴─────────────┐
 └────────────────────┘           │ savestate node           │
                                  │ (DaemonSet): layer store,│
-                                 │ images, GC, transfers    │
+                                 │ images, GC, transfers,   │
+                                 │ device plugin, seccomp   │
                                  └────────────┬─────────────┘
                                    unix socket│
 ┌─────────────────────────────────────────────▼──────────────┐
-│ VM pod (Guaranteed): savestate launcher → qemu (QMP)       │
-│ no service-account token · /dev/kvm, /dev/net/tun,         │
-│ /dev/vhost-vsock                                           │
+│ VM pod (Guaranteed, not privileged): savestate launcher →  │
+│ qemu (QMP) · no service-account token · /dev/kvm,          │
+│ /dev/net/tun, /dev/vhost-vsock from the node agent's       │
+│ device plugin · seccomp profile savestate/vm.json          │
 │ tap + nftables NAT inside the pod's network namespace      │
 │        └─ vsock ─▶ savestate-guest (exec, files, fixups)    │
 └────────────────────────────────────────────────────────────┘
@@ -166,7 +168,9 @@ and the CLI); `savestate-guest` runs inside the VM.
 - **Node agent** (DaemonSet): owns `/var/lib/savestate` on its node; caches base images
   by digest; tells launchers on its node to boot, restore or checkpoint; garbage-collects
   layers, checkpoints and run directories whose objects are gone; serves and fetches
-  transfers; reports disk use. Only it holds API credentials on the node.
+  transfers; reports disk use. As a kubelet device plugin it hands VM pods their
+  devices, and it installs their seccomp profile. Only it holds API credentials on
+  the node.
 - **Launcher** (one per VM pod): starts and supervises QEMU, talks QMP, does the
   guest-agent work around boots, restores and checkpoints, streams the serial console
   to the pod log. It has no Kubernetes credentials; the node agent drives it over a
@@ -215,15 +219,25 @@ owned by it (deleting the sandbox deletes the pod) and labelled
   sandbox from a checkpoint. The pod spec is the record of which image a sandbox
   runs; the controller never changes an existing pod.
 - Guaranteed QoS: CPU requests and limits are `vcpus`; memory requests and limits are
-  guest memory plus `vm.memoryOverhead`; `vm.devices` are requested and limited too.
-  For a sandbox from a checkpoint, shape comes from the checkpoint's status.
+  guest memory plus `vm.memoryOverhead`; and one `savestate.dev/vm`, the node agent's
+  device plugin resource that brings `/dev/kvm`, `/dev/net/tun` and
+  `/dev/vhost-vsock`. For a sandbox from a checkpoint, shape comes from the
+  checkpoint's status.
 - `automountServiceAccountToken: false`, `enableServiceLinks: false`,
-  `restartPolicy: Never`, `vm.nodeSelector` and `vm.tolerations`. The container's
-  root filesystem is read-only. Without `vm.devices` (a device plugin for `/dev/kvm`,
-  `/dev/net/tun` and `/dev/vhost-vsock`) it is privileged; with them it runs as root
-  with `allowPrivilegeEscalation: false`, the `RuntimeDefault` seccomp profile, and
-  all capabilities dropped but what the launcher needs before it drops to the QEMU
-  user (see "Network and security"): `NET_ADMIN`, `CHOWN`, `SETUID` and `SETGID`.
+  `restartPolicy: Never`, `vm.nodeSelector` and `vm.tolerations`. The container is
+  never privileged. Its security context:
+
+  ```yaml
+  runAsUser: 0
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities: {drop: [ALL], add: [NET_ADMIN, CHOWN, SETUID, SETGID]}
+  seccompProfile: {type: Localhost, localhostProfile: savestate/vm.json}
+  ```
+
+  The capabilities are what the launcher uses as root before it drops to the QEMU
+  user for good (see "Network and security"); the seccomp profile is the node
+  agent's (see "Devices and seccomp").
 - arguments `--egress-allow` and `--dns` from `network`, the node's addresses
   (`status.hostIPs`) in `SAVESTATE_HOST_IPS`, and `terminationMessagePolicy:
   FallbackToLogsOnError` (the launcher writes why its VM stopped to its termination
@@ -324,6 +338,28 @@ chain uses, and run directories of sandboxes that are gone. Files are listed fir
 a file created meanwhile is never taken for garbage. It reports bytes per kind and
 free bytes as metrics (`savestate_node_disk_bytes`, `savestate_node_disk_free_bytes`)
 on `--metrics-listen` (default `0.0.0.0:9090`).
+
+**Devices and seccomp.** The node agent is a kubelet device plugin (device plugin API
+v1beta1, `proto/kubelet/deviceplugin/v1beta1/api.proto`, copied from Kubernetes). At
+start-up it first installs the VM pods' seccomp profile as
+`<kubeletDir>/seccomp/savestate/vm.json` (written to a temporary file, fsynced and
+renamed), then serves the plugin on `<kubeletDir>/device-plugins/savestate.sock`
+and registers the resource `savestate.dev/vm` with the kubelet, so no VM pod is
+admitted on a node before its profile is there. It advertises `vm.slotsPerNode`
+healthy slots (default 110, the kubelet's default pod limit, so CPU and memory
+requests decide placement unless an installation caps VMs per node lower), and
+allocating any slot hands the container `/dev/kvm`, `/dev/net/tun` and
+`/dev/vhost-vsock` (read-write; the same device nodes for every VM). The kubelet
+removes every plugin socket when it restarts; the node agent notices its socket is
+gone and registers again. While no node agent runs on a node, its kubelet stops
+offering slots there, so no new VM pod starts where nothing would start its VM;
+running VMs are unaffected.
+
+The profile is containerd's default (`contrib/seccomp.DefaultProfile`, v2.4.2, for
+amd64; the VM pod's capabilities add no rules to it) with one rule added:
+`socket()` may create `AF_VSOCK` sockets, the guest agent's channel, which the
+default refuses. Nothing else is widened. QEMU additionally applies its own filter
+(`-sandbox on`).
 
 **CPU model.** With a named `vm.cpuModel`, an init container of the node agent's pod
 (privileged, for `/dev/kvm`) starts QEMU once with `-cpu <vm.cpuModel>,enforce`; on a
@@ -437,14 +473,19 @@ flattening them in the background is phase 3.
 - The launcher builds that network as root, hands its run directory to the QEMU user
   (uid and gid 65532), and then drops to that user for good, keeping only the groups
   that own `/dev/kvm`, `/dev/net/tun` and `/dev/vhost-vsock`. QEMU runs as that user
-  with `-sandbox on`; the launcher has no service-account token; devices come from a
-  device plugin rather than a privileged container where the cluster allows it.
+  with `-sandbox on`; the launcher has no service-account token. Its container is
+  never privileged: devices come from the node agent's device plugin, and the
+  container keeps only `NET_ADMIN` (the tap device, forwarding and nftables in its
+  own network namespace), `CHOWN` (handing the run directory to the QEMU user),
+  `SETUID` and `SETGID` (becoming it), under savestate's seccomp profile.
 - Exec and file copy use Kubernetes `pods/exec` RBAC; there is no separate API server.
   `savestate exec` and `cp` run `savestate guest` in the VM pod, which reaches the
   guest agent over vsock.
-- VM pods need host devices, `NET_ADMIN` in their own network namespace and the
-  node's state directory, which is the privileged Pod Security level. Sandbox
-  namespaces therefore hold only sandboxes; users get the `savestate-user` role
+- VM pods need `NET_ADMIN` in their own network namespace and `hostPath` volumes
+  (the node's state directory and their run directory). The baseline Pod Security
+  level forbids both (a Localhost seccomp profile and device-plugin devices would
+  pass it), so sandbox namespaces need the privileged level. They therefore hold
+  only sandboxes; users get the `savestate-user` role
   (savestate objects, read pods, `pods/exec`) and never pod creation there. A
   NetworkPolicy refuses all ingress to VM pods (`app.kubernetes.io/component: vm`):
   exec goes through the kubelet and the node agent uses a unix socket.
@@ -466,8 +507,9 @@ installation is supplied at install time and never committed here:
 Installation config is one YAML file (operator and node agent) plus the usual
 Kubernetes objects; every field has a documented default or is required with a clear
 error, and unknown fields are refused. The schema is `savestate_api::config::Config`:
-`namespaces` (required), `stateDir`, `launcherImage`, `vm` (`cpuModel` required,
-`memoryOverhead`, `shapes`, `nodeSelector`, `tolerations`, `devices`), `network`
+`namespaces` (required), `stateDir`, `kubeletDir`, `launcherImage`, `vm` (`cpuModel`
+required, `memoryOverhead`, `shapes`, `nodeSelector`, `tolerations`,
+`slotsPerNode`), `network`
 (`egressAllow`, `dns`), `images` (`registries`, `auth`), `transfers.perNode` and
 `ttl` (`default` and `max` per kind). `deploy/base` is a kustomize base with
 placeholder values and `deploy/README.md` lists what an installation supplies.

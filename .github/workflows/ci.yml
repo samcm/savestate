@@ -118,6 +118,14 @@ jobs:
           digest=$(docker exec kind-control-plane ctr -n k8s.io images ls "name==$ref" | awk 'NR == 2 {print $3}')
           docker exec kind-control-plane ctr -n k8s.io images tag "$ref" "docker.io/savestate-test/launcher@$digest"
           echo "SAVESTATE_TEST_LAUNCHER_IMAGE=docker.io/savestate-test/launcher@$digest" >>"$GITHUB_ENV"
+      # No node agent runs here: advertise its VM slots on the node and install the
+      # VM pods' seccomp profile the way it would.
+      - name: Stand in for the node agent's device plugin and seccomp profile
+        run: |
+          kubectl patch node kind-control-plane --subresource=status --type=json \
+            -p '[{"op": "add", "path": "/status/capacity/savestate.dev~1vm", "value": "8"}]'
+          docker exec kind-control-plane mkdir -p /var/lib/kubelet/seccomp/savestate
+          docker cp crates/savestate/src/node/vm-seccomp.json kind-control-plane:/var/lib/kubelet/seccomp/savestate/vm.json
       - run: cargo test --locked -p savestate --test controller -- --ignored --nocapture
 
   build:

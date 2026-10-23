@@ -2,10 +2,13 @@
 //! disk layers, checkpoints; see [`crate::store`]), starts the VM in each VM pod on
 //! its node, checkpoints sandboxes on its node and writes Checkpoint status,
 //! garbage-collects files and run directories whose objects are gone, and reports
-//! disk use. It is the only component on a node that holds API credentials. See
-//! "Contract with the node agent and launcher" in `docs/design.md`.
+//! disk use. As a kubelet device plugin it hands VM pods their devices and installs
+//! their seccomp profile ([`devices`]). It is the only component on a node that holds
+//! API credentials. See "Contract with the node agent and launcher" in
+//! `docs/design.md`.
 
 mod checkpoints;
+mod devices;
 mod gc;
 mod images;
 mod launchers;
@@ -21,6 +24,8 @@ use kube::{
 use savestate_api::Config;
 
 use crate::store::Store;
+
+pub use devices::{RESOURCE, SECCOMP_PROFILE};
 
 /// Field manager and event reporter for everything the node agent writes.
 const MANAGER: &str = "savestate-node";
@@ -63,6 +68,8 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         .prepare()
         .with_context(|| format!("preparing {}", config.state_dir.display()))?;
     let images = images::Images::new(&config, &store)?;
+    // Before any VM slot is advertised, so no VM pod starts here without it.
+    devices::install_seccomp_profile(&config.kubelet_dir)?;
     let recorder = Recorder::new(
         client.clone(),
         Reporter {
@@ -82,12 +89,15 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         recorder,
         config,
     });
-    let mut tasks: Vec<BoxFuture<'static, ()>> = vec![gc::run(ctx.clone()).boxed()];
+    let mut tasks: Vec<BoxFuture<'static, ()>> = vec![
+        gc::run(ctx.clone()).boxed(),
+        devices::run(ctx.clone()).boxed(),
+    ];
     for namespace in &ctx.config.namespaces {
         tasks.push(launchers::run(ctx.clone(), namespace.clone()).boxed());
         tasks.push(checkpoints::run(ctx.clone(), namespace.clone()).boxed());
     }
-    // The controllers stop on a signal; the collector with them.
+    // The controllers stop on a signal; the collector and the device plugin with them.
     futures::future::select_all(tasks).await;
     tracing::info!("node agent stopped");
     Ok(())

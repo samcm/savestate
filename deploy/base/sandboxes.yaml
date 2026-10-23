@@ -1,12 +1,14 @@
 # One sandbox namespace, `sandboxes`. Repeat this file for each namespace listed
 # in the installation config's `namespaces`.
 #
-# VM pods need /dev/kvm and /dev/net/tun, NET_ADMIN inside their own network
-# namespace for the tap device and nftables, and the state directory from the host.
-# That is the privileged Pod Security level, so keep sandbox namespaces for sandboxes
-# only and give people the savestate-user role there, never pod creation. The
-# controller builds every VM pod with no service-account token, QEMU as non-root
-# with its seccomp sandbox on, and a Guaranteed memory request.
+# VM pods are not privileged: their devices come from the node agent's device plugin
+# and the runtime confines them with savestate's seccomp profile. They still need
+# NET_ADMIN inside their own network namespace for the tap device and nftables, and
+# hostPath volumes for the state directory and their run directory; the baseline Pod
+# Security level forbids both, so this is the privileged level. Keep sandbox
+# namespaces for sandboxes only and give people the savestate-user role there, never
+# pod creation. The controller builds every VM pod with no service-account token,
+# QEMU as non-root with its seccomp sandbox on, and a Guaranteed memory request.
 apiVersion: v1
 kind: Namespace
 metadata:

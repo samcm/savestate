@@ -3,9 +3,8 @@
 # a kind cluster with savestate installed from the image IMAGE (loaded in Docker), a
 # plain-HTTP registry holding a base image made from ROOTFS (guest/rootfs's
 # rootfs.qcow2), and the guest CPU model this host runs, picked like spike/ does.
-# VM pods get their devices from a generic device plugin, so they run with the
-# tightened security context, not privileged. Writes the test's environment to OUT
-# (KEY=VALUE lines).
+# VM pods get their devices from the node agent's device plugin. Writes the test's
+# environment to OUT (KEY=VALUE lines).
 #
 #   crates/savestate/tests/e2e/setup.sh IMAGE ROOTFS OUT
 #
@@ -29,42 +28,6 @@ node=savestate-control-plane
 kubectl label node "$node" savestate.dev/node=true
 # Room for three 1-vCPU VMs on a 4-CPU runner: cluster DNS is not needed.
 kubectl -n kube-system scale deployment coredns --replicas=0
-
-# /dev/kvm, /dev/net/tun and /dev/vhost-vsock from a generic device plugin, so VM pods
-# run with the tightened security context rather than privileged.
-kubectl apply -f - <<'PLUGIN'
-apiVersion: apps/v1
-kind: DaemonSet
-metadata:
-  name: vm-devices
-  namespace: kube-system
-spec:
-  selector:
-    matchLabels: {app: vm-devices}
-  template:
-    metadata:
-      labels: {app: vm-devices}
-    spec:
-      containers:
-        - name: plugin
-          image: ghcr.io/squat/generic-device-plugin@sha256:5c48f7a16cfb37c4e07731bfa384b9dba6e12d2b0fb4350d8a321d49f12ac494
-          args:
-            - --domain=devices.example.com
-            - '--device={"name": "vm", "groups": [{"count": 16, "paths": [{"path": "/dev/kvm"}, {"path": "/dev/net/tun"}, {"path": "/dev/vhost-vsock"}]}]}'
-          securityContext: {privileged: true}
-          volumeMounts:
-            - {name: dev, mountPath: /dev}
-            - {name: plugins, mountPath: /var/lib/kubelet/device-plugins}
-      volumes:
-        - {name: dev, hostPath: {path: /dev}}
-        - {name: plugins, hostPath: {path: /var/lib/kubelet/device-plugins}}
-PLUGIN
-for _ in $(seq 60); do
-  [ "$(kubectl get node "$node" -o jsonpath='{.status.allocatable.devices\.example\.com/vm}')" = 16 ] && break
-  sleep 2
-done
-kubectl get node "$node" -o jsonpath='{.status.allocatable}'
-echo
 
 # The base image: a container image holding /rootfs.qcow2, in a registry on kind's
 # network, reached by IP over plain HTTP.
@@ -94,8 +57,6 @@ namespaces: [$ns]
 launcherImage: $pinned
 vm:
   cpuModel: "$cpu"
-  devices:
-    devices.example.com/vm: 1
   nodeSelector:
     savestate.dev/node: "true"
 network:
@@ -120,6 +81,14 @@ EOF
 kubectl apply -k "$overlay"
 kubectl -n savestate-system rollout status deployment/savestate-controller --timeout=3m
 kubectl -n savestate-system rollout status daemonset/savestate-node --timeout=3m
+# The node agent's device plugin advertises the VM slots (vm.slotsPerNode).
+for i in $(seq 60); do
+  [ "$(kubectl get node "$node" -o jsonpath='{.status.allocatable.savestate\.dev/vm}')" = 110 ] && break
+  [ "$i" = 60 ] && { echo "the node agent advertises no VM slots" >&2; exit 1; }
+  sleep 2
+done
+kubectl get node "$node" -o jsonpath='{.status.allocatable}'
+echo
 
 api=$(kubectl get service kubernetes -o jsonpath='{.spec.clusterIP}')
 cat >"$out" <<EOF

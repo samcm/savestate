@@ -7,6 +7,7 @@ use savestate_api::{Config, Sandbox};
 use serde_json::json;
 
 use super::Error;
+use crate::node::{RESOURCE, SECCOMP_PROFILE};
 
 /// Labels on every VM pod; the controller watches pods by them and the
 /// `NetworkPolicy` in `deploy/base/sandboxes.yaml` selects them.
@@ -36,29 +37,25 @@ pub(super) fn build(sandbox: &Sandbox, vm: &Vm, config: &Config) -> Result<Pod, 
 
     let memory =
         parse(&vm.memory, "memory")? + parse(&config.vm.memory_overhead, "vm.memoryOverhead")?;
-    // Guaranteed QoS: requests equal limits for everything.
-    let mut resources = json!({"cpu": vm.vcpus.to_string(), "memory": Quantity::from(memory)});
-    for (name, quantity) in &config.vm.devices {
-        resources[name] = json!(quantity);
-    }
-    // Without a device plugin for /dev/kvm, /dev/net/tun and /dev/vhost-vsock the
-    // container reaches them as privileged. With one it gets exactly what the launcher
-    // uses as root before it drops to the QEMU user for good: NET_ADMIN for the tap
-    // device, forwarding and nftables in its own network namespace; CHOWN to hand its
-    // run directory to the QEMU user; SETUID and SETGID to become it. The runtime's
-    // default seccomp profile refuses AF_VSOCK sockets, the guest agent's channel, so
-    // the container is unconfined and QEMU applies its own filter (`-sandbox on`).
-    let security = if config.vm.devices.is_empty() {
-        json!({"privileged": true, "readOnlyRootFilesystem": true})
-    } else {
-        json!({
-            "runAsUser": 0,
-            "allowPrivilegeEscalation": false,
-            "readOnlyRootFilesystem": true,
-            "capabilities": {"drop": ["ALL"], "add": ["NET_ADMIN", "CHOWN", "SETUID", "SETGID"]},
-            "seccompProfile": {"type": "Unconfined"},
-        })
-    };
+    // Guaranteed QoS: requests equal limits for everything. One VM slot from the node
+    // agent's device plugin brings /dev/kvm, /dev/net/tun and /dev/vhost-vsock.
+    let resources = json!({
+        "cpu": vm.vcpus.to_string(),
+        "memory": Quantity::from(memory),
+        RESOURCE: "1",
+    });
+    // Root with exactly what the launcher uses before it drops to the QEMU user for
+    // good: NET_ADMIN for the tap device, forwarding and nftables in its own network
+    // namespace; CHOWN to hand its run directory to the QEMU user; SETUID and SETGID
+    // to become it. The seccomp profile, installed by the node agent, is the runtime's
+    // default plus AF_VSOCK sockets, the guest agent's channel.
+    let security = json!({
+        "runAsUser": 0,
+        "allowPrivilegeEscalation": false,
+        "readOnlyRootFilesystem": true,
+        "capabilities": {"drop": ["ALL"], "add": ["NET_ADMIN", "CHOWN", "SETUID", "SETGID"]},
+        "seccompProfile": {"type": "Localhost", "localhostProfile": SECCOMP_PROFILE},
+    });
     let mut args = vec!["launcher".to_owned()];
     for net in &config.network.egress_allow {
         args.extend(["--egress-allow".into(), net.to_string()]);

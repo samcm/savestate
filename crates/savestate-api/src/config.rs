@@ -27,6 +27,12 @@ pub struct Config {
     #[serde(default = "default_state_dir")]
     pub state_dir: PathBuf,
 
+    /// The kubelet's root directory on every VM node. The node agent serves its
+    /// device plugin in `device-plugins/` and installs the VM pods' seccomp profile
+    /// in `seccomp/` below it. Default: `/var/lib/kubelet`.
+    #[serde(default = "default_kubelet_dir")]
+    pub kubelet_dir: PathBuf,
+
     /// Image VM pods run, pinned by digest (`…@sha256:…`). Default: the controller's
     /// own image, by the digest its pod is running.
     #[serde(default)]
@@ -77,11 +83,12 @@ pub struct Vm {
     #[serde(default)]
     pub tolerations: Vec<Toleration>,
 
-    /// Extended resources each VM pod requests to get `/dev/kvm` and
-    /// `/dev/net/tun` from a device plugin, e.g. `{devices.example.com/kvm: 1}`.
-    /// Default: empty; the launcher container is then privileged to reach them.
-    #[serde(default)]
-    pub devices: BTreeMap<String, Quantity>,
+    /// VM slots each node agent advertises to the kubelet (as the extended resource
+    /// `savestate.dev/vm`); every VM pod takes one. Caps the VMs per node. Default:
+    /// 110, the kubelet's default pod limit, so CPU and memory requests decide
+    /// placement unless this is set lower.
+    #[serde(default = "default_slots_per_node")]
+    pub slots_per_node: u32,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -168,6 +175,14 @@ fn default_state_dir() -> PathBuf {
     PathBuf::from("/var/lib/savestate")
 }
 
+fn default_kubelet_dir() -> PathBuf {
+    PathBuf::from("/var/lib/kubelet")
+}
+
+fn default_slots_per_node() -> u32 {
+    110
+}
+
 fn default_memory_overhead() -> Quantity {
     Quantity("512Mi".into())
 }
@@ -210,6 +225,9 @@ impl Config {
             return Err(format!(
                 "launcherImage: {image:?} must be pinned by digest (…@sha256:…)"
             ));
+        }
+        if self.vm.slots_per_node == 0 {
+            return Err("vm.slotsPerNode: must be at least 1".into());
         }
         if self.transfers.per_node == 0 {
             return Err("transfers.perNode: must be at least 1".into());

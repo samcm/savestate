@@ -4,6 +4,9 @@
 //!
 //! Needs a disposable cluster in `KUBECONFIG` (CI uses kind) and the dummy image,
 //! pinned by digest and present on the nodes, in `SAVESTATE_TEST_LAUNCHER_IMAGE`.
+//! With no node agent running, the first node must advertise `savestate.dev/vm` and
+//! hold the VM pods' seccomp profile (CI patches the node's capacity and copies the
+//! profile into the kubelet's seccomp directory).
 
 // clippy.toml allows these in `#[test]` functions only, not in a test file's helpers.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -127,7 +130,10 @@ async fn controller_runs_pins_fails_expires_and_protects() {
     let container = &spec.containers[0];
     assert_eq!(container.image.as_deref(), Some(launcher.as_str()));
     let resources = serde_json::to_value(container.resources.as_ref().unwrap()).unwrap();
-    assert_eq!(resources["requests"], json!({"cpu": "1", "memory": "96Mi"}));
+    assert_eq!(
+        resources["requests"],
+        json!({"cpu": "1", "memory": "96Mi", "savestate.dev/vm": "1"})
+    );
     assert_eq!(resources["limits"], resources["requests"]);
     let affinity = serde_json::to_value(spec.affinity.unwrap()).unwrap();
     assert_eq!(

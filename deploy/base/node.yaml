@@ -65,7 +65,8 @@ spec:
             limits:
               memory: 1Gi
           # Root without privilege: it owns the state directory and hands files to
-          # the VM pods' non-root QEMU.
+          # the VM pods' non-root QEMU, serves the kubelet a device plugin and
+          # installs the VM pods' seccomp profile.
           securityContext:
             runAsUser: 0
             allowPrivilegeEscalation: false
@@ -82,6 +83,12 @@ spec:
             # Launcher sockets: /run/savestate/<namespace>/<sandbox>/<sandbox UID>/.
             - name: run
               mountPath: /run/savestate
+            # The kubelet's device-plugin and seccomp directories, under `kubeletDir`
+            # in config.yaml.
+            - name: device-plugins
+              mountPath: /var/lib/kubelet/device-plugins
+            - name: seccomp
+              mountPath: /var/lib/kubelet/seccomp
             - name: tmp
               mountPath: /tmp
       volumes:
@@ -96,6 +103,16 @@ spec:
         - name: run
           hostPath:
             path: /run/savestate
+            type: DirectoryOrCreate
+        # Must be `kubeletDir` (default /var/lib/kubelet) from config.yaml, here and
+        # in the mount paths above.
+        - name: device-plugins
+          hostPath:
+            path: /var/lib/kubelet/device-plugins
+            type: Directory
+        - name: seccomp
+          hostPath:
+            path: /var/lib/kubelet/seccomp
             type: DirectoryOrCreate
         - name: tmp
           emptyDir: {}

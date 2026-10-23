@@ -11,6 +11,11 @@ namespaces: [sandboxes]
 # the node agent's hostPath in node.yaml.
 # stateDir: /var/lib/savestate
 
+# The kubelet's root directory on every VM node: the node agent serves its device
+# plugin in device-plugins/ and installs the VM pods' seccomp profile in seccomp/
+# below it. It must match the node agent's hostPaths in node.yaml.
+# kubeletDir: /var/lib/kubelet
+
 # Image VM pods run, pinned by digest. Default: the controller's own image.
 # launcherImage: ghcr.io/example/savestate@sha256:...
 
@@ -36,11 +41,10 @@ vm:
     savestate.dev/node: "true"
   # tolerations: []
 
-  # Extended resources from a device plugin that provide /dev/kvm and
-  # /dev/net/tun. Default: {} (the launcher container runs privileged instead).
-  # devices:
-  #   devices.example.com/kvm: 1
-  #   devices.example.com/tun: 1
+  # VMs each node may run: the node agent advertises this many units of the
+  # extended resource savestate.dev/vm, and every VM pod takes one. The default is
+  # the kubelet's default pod limit, so CPU and memory decide placement.
+  # slotsPerNode: 110
 
 network:
   # Cluster, node, link-local and private destinations guests may still reach;

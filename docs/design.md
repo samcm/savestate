@@ -262,7 +262,8 @@ destroys the VM):
   the pod is Guaranteed. A smaller request has no CPU limit, and the pod is
   Burstable (see "CPU requests below the vCPU count").
 - `automountServiceAccountToken: false`, `enableServiceLinks: false`,
-  `restartPolicy: Never`, `vm.nodeSelector` and `vm.tolerations`. The container is
+  `restartPolicy: Never`, `vm.nodeSelector`, `vm.tolerations`, and `vm.nodeAffinity` as
+  the required node affinity, with the placement below added to every one of its terms. The container is
   never privileged. Its security context:
 
   ```yaml
@@ -710,7 +711,7 @@ Kubernetes objects; every field has a documented default or is required with a c
 error, and unknown fields are refused. The schema is `savestate_api::config::Config`:
 `namespaces` (required), `stateDir`, `kubeletDir`, `launcherImage`, `vm` (`cpuModel`
 required, `memoryOverhead`, `cpuRequestPerVcpu`, `shapes` with an optional
-`cpuRequest` each, `nodeSelector`, `tolerations`, `slotsPerNode`), `network`
+`cpuRequest` each, `nodeSelector`, `nodeAffinity`, `tolerations`, `slotsPerNode`), `network`
 (`egressAllow`, `dns`), `images` (`registries`, `auth`), `stores` (per name:
 `endpoint`, `bucket`, `region` and `credentialsSecret` required, `prefix`), `export`
 (a store name; default none), `cache.minFreePercent`, `transfers.perNode` and `ttl`

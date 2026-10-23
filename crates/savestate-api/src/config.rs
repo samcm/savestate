@@ -8,7 +8,10 @@
 use std::{collections::BTreeMap, net::IpAddr, path::PathBuf};
 
 use ipnet::IpNet;
-use k8s_openapi::{api::core::v1::Toleration, apimachinery::pkg::api::resource::Quantity};
+use k8s_openapi::{
+    api::core::v1::{NodeSelector, Toleration},
+    apimachinery::pkg::api::resource::Quantity,
+};
 use kube_quantity::ParsedQuantity;
 use serde::Deserialize;
 
@@ -147,6 +150,13 @@ pub struct Vm {
     /// nodes. Default: empty, any node.
     #[serde(default)]
     pub node_selector: BTreeMap<String, String>,
+
+    /// Required node affinity for VM pods (`nodeSelectorTerms`, any one of which a
+    /// node must match), for selections a `nodeSelector` cannot express, such as a
+    /// list of hostnames. Applies on top of `nodeSelector`; the node-agent
+    /// `DaemonSet` must cover the same nodes. Default: none.
+    #[serde(default)]
+    pub node_affinity: Option<NodeSelector>,
 
     /// Tolerations for VM pods. Default: none.
     #[serde(default)]

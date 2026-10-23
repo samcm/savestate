@@ -1,6 +1,9 @@
 //! The VM pod for one sandbox (see "VM pods" in `docs/design.md`).
 
-use k8s_openapi::{api::core::v1::Pod, apimachinery::pkg::api::resource::Quantity};
+use k8s_openapi::{
+    api::core::v1::{NodeSelector, NodeSelectorRequirement, NodeSelectorTerm, Pod},
+    apimachinery::pkg::api::resource::Quantity,
+};
 use kube::{Resource as _, ResourceExt};
 use kube_quantity::ParsedQuantity;
 use savestate_api::{Config, Sandbox};
@@ -79,7 +82,7 @@ pub(super) fn build(sandbox: &Sandbox, vm: &Vm, config: &Config) -> Result<Pod, 
     for ip in &config.network.dns {
         args.extend(["--dns".into(), ip.to_string()]);
     }
-    let affinity = affinity(&vm.placement);
+    let affinity = affinity(&vm.placement, config.vm.node_affinity.as_ref());
     let state_dir = config.state_dir.display().to_string();
 
     let pod = json!({
@@ -138,35 +141,85 @@ pub(super) fn build(sandbox: &Sandbox, vm: &Vm, config: &Config) -> Result<Pod, 
     serde_json::from_value(pod).map_err(|error| Error::PodSpec(error.to_string()))
 }
 
-/// Node affinity for `placement`.
-fn affinity(placement: &Placement) -> Option<serde_json::Value> {
-    match placement {
-        Placement::Any => None,
-        Placement::Nodes(nodes) => Some(json!({"nodeAffinity": {
-            "requiredDuringSchedulingIgnoredDuringExecution": {"nodeSelectorTerms": [{"matchFields": [
-                {"key": "metadata.name", "operator": "In", "values": nodes}
-            ]}]},
-        }})),
-        Placement::Cpu { label, prefer } => {
-            let mut affinity = json!({"nodeAffinity": {
-                "requiredDuringSchedulingIgnoredDuringExecution": {"nodeSelectorTerms": [{"matchExpressions": [
-                    {"key": crate::CPU_LABEL, "operator": "In", "values": [label]}
-                ]}]},
-            }});
-            if !prefer.is_empty() {
-                affinity["nodeAffinity"]["preferredDuringSchedulingIgnoredDuringExecution"] = json!([{
-                    "weight": 100,
-                    "preference": {"matchFields": [
-                        {"key": "metadata.name", "operator": "In", "values": prefer}
-                    ]},
-                }]);
+/// Node affinity for `placement`, within the installation's `vm.nodeAffinity`.
+/// Configured terms are alternatives, so the placement's requirement is added to
+/// every term rather than as a term of its own.
+fn affinity(placement: &Placement, configured: Option<&NodeSelector>) -> Option<serde_json::Value> {
+    let requirement = |key: &str, values: &[String]| NodeSelectorRequirement {
+        key: key.into(),
+        operator: "In".into(),
+        values: Some(values.to_vec()),
+    };
+    let (fields, expressions, prefer) = match placement {
+        Placement::Any => (None, None, &[][..]),
+        Placement::Nodes(nodes) => (Some(requirement("metadata.name", nodes)), None, &[][..]),
+        Placement::Cpu { label, prefer } => (
+            None,
+            Some(requirement(crate::CPU_LABEL, std::slice::from_ref(label))),
+            prefer.as_slice(),
+        ),
+    };
+    let mut required = configured.cloned();
+    if fields.is_some() || expressions.is_some() {
+        let required = required.get_or_insert_with(|| NodeSelector {
+            node_selector_terms: vec![NodeSelectorTerm::default()],
+        });
+        for term in &mut required.node_selector_terms {
+            if let Some(fields) = &fields {
+                term.match_fields
+                    .get_or_insert_with(Vec::new)
+                    .push(fields.clone());
             }
-            Some(affinity)
+            if let Some(expressions) = &expressions {
+                term.match_expressions
+                    .get_or_insert_with(Vec::new)
+                    .push(expressions.clone());
+            }
         }
     }
+    let mut affinity = json!({});
+    if let Some(required) = required {
+        affinity["requiredDuringSchedulingIgnoredDuringExecution"] = json!(required);
+    }
+    if !prefer.is_empty() {
+        affinity["preferredDuringSchedulingIgnoredDuringExecution"] = json!([{
+            "weight": 100,
+            "preference": {"matchFields": [
+                {"key": "metadata.name", "operator": "In", "values": prefer}
+            ]},
+        }]);
+    }
+    (affinity != json!({})).then(|| json!({"nodeAffinity": affinity}))
 }
 
 pub(super) fn parse(quantity: &Quantity, what: &str) -> Result<ParsedQuantity, Error> {
     ParsedQuantity::try_from(quantity)
         .map_err(|error| Error::PodSpec(format!("{what} {:?}: {error}", quantity.0)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A sandbox from a checkpoint must land on a node that holds the checkpoint
+    /// and that the installation allows, under every alternative term: a pin added
+    /// as a term of its own would let the pod run on any allowed node instead.
+    #[test]
+    fn placement_narrows_every_configured_term() {
+        let term = |host: &str| json!({"matchExpressions": [{"key": "kubernetes.io/hostname", "operator": "In", "values": [host]}]});
+        let configured: NodeSelector =
+            serde_json::from_value(json!({"nodeSelectorTerms": [term("node-a"), term("node-b")]}))
+                .unwrap();
+        let pin = json!([{"key": "metadata.name", "operator": "In", "values": ["node-b"]}]);
+
+        let affinity =
+            affinity(&Placement::Nodes(vec!["node-b".into()]), Some(&configured)).unwrap();
+
+        let terms = &affinity["nodeAffinity"]["requiredDuringSchedulingIgnoredDuringExecution"]["nodeSelectorTerms"];
+        let mut want_a = term("node-a");
+        want_a["matchFields"] = pin.clone();
+        let mut want_b = term("node-b");
+        want_b["matchFields"] = pin;
+        assert_eq!(terms, &json!([want_a, want_b]));
+    }
 }

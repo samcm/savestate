@@ -86,7 +86,7 @@ connection:
 - `Exec`: run a program as root with streamed stdin, stdout and stderr; returns its
   exit code or signal.
 - `ReadFile`, `WriteFile`: copy one file out or in (written atomically).
-- `PrepareCheckpoint`: sync and drop the page cache before the host stops the VM.
+- `PrepareCheckpoint`: sync, drop the page cache and compact memory before the host stops the VM.
 - `Restore`: after a restored VM runs again, in this order: step the wall clock to a
   host-supplied time (clock `stepped` only), credit host-supplied entropy to the
   kernel, write a new machine id, set the hostname, regenerate the SSH host keys present

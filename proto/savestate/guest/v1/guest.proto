@@ -108,9 +108,9 @@ message Chunk {
   bool eof = 2;
 }
 
-// Before the host stops the VM for a checkpoint: syncs filesystems and drops the page
-// cache, so less guest memory holds data and the memory file is smaller. Answered with
-// `Done`.
+// Before the host stops the VM for a checkpoint: syncs filesystems, drops the page
+// cache and compacts memory, so the freed memory forms blocks free page reporting
+// hands back to the host and the memory file is smaller. Answered with `Done`.
 message PrepareCheckpoint {}
 
 // After a VM restored from a checkpoint is running again, applies these fixups in order,

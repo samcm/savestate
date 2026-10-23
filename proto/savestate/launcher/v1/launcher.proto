@@ -36,6 +36,9 @@ message StartRequest {
   string layer_prefix = 3;
   // vsock context id for the guest agent, unique on the node.
   uint32 vsock_cid = 4;
+  // Write and read checkpoint memory files with O_DIRECT (`vm.memoryFileDirectIo`),
+  // where the state directory's filesystem supports it.
+  bool memory_file_direct_io = 5;
   oneof source {
     Boot boot = 10;
     Restore restore = 11;

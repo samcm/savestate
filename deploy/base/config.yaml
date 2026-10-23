@@ -60,6 +60,11 @@ vm:
   # the kubelet's default pod limit, so CPU and memory decide placement.
   # slotsPerNode: 110
 
+  # Write and read checkpoint memory files with O_DIRECT. Through the page cache
+  # (the default) a save usually pauses the VM for less, and concurrent restores
+  # share the cached file; measure on your nodes' disks before turning it on.
+  # memoryFileDirectIo: false
+
 network:
   # Cluster, node, link-local and private destinations guests may still reach;
   # the rest of those ranges is dropped. Default: [].

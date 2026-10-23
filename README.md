@@ -7,9 +7,10 @@
 Save a running VM, then start as many copies of that exact moment as you like, on
 Kubernetes.
 
-> **Early: not usable yet.** The binary parses its commands and stops there. The
-> design is in [docs/design.md](docs/design.md), which is the detailed reference; the
-> CRDs and install manifests are in [deploy/](deploy).
+> **Early.** Sandboxes boot, checkpoint, restore and fork on one node; copying
+> checkpoints between nodes (transfers) is not built yet. The design is in
+> [docs/design.md](docs/design.md), which is the detailed reference; installing is in
+> [deploy/README.md](deploy/README.md).
 
 ## Why
 

@@ -145,6 +145,10 @@ pub struct Fingerprint {
     pub machine_type: String,
     /// Guest CPU model.
     pub cpu_model: String,
+    /// With CPU model `host`: the node CPU the guest was given (model name and a
+    /// digest of its feature flags). A restore needs the same.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_cpu: Option<String>,
     /// Digest of the VM's device configuration.
     pub devices: String,
 }

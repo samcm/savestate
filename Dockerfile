@@ -1,10 +1,11 @@
 # syntax=docker/dockerfile:1
 #
 # ghcr.io/samcm/savestate: every role of the `savestate` binary. linux/amd64 also
-# carries QEMU for the launcher; linux/arm64 runs the controller and the CLI. Built
-# from prebuilt artifacts (the build.yml outputs) in the context:
+# carries QEMU and the guest kernel for the launcher; linux/arm64 runs the controller
+# and the CLI. Built from prebuilt artifacts (the build.yml and guest-kernel.yml
+# outputs) in the context:
 #
-#   amd64/savestate  arm64/savestate
+#   amd64/savestate  amd64/bzImage  arm64/savestate
 #
 #   docker buildx build --platform linux/amd64,linux/arm64 -f Dockerfile <context>
 
@@ -47,6 +48,8 @@ RUN apt-get update \
         libaio1t64 libfdt1 libglib2.0-0t64 libpixman-1-0 libseccomp2 liburing2 libzstd1 \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=qemu /out/usr/local /usr/local
+# The guest kernel QEMU boots directly; part of every checkpoint's launcher image.
+COPY --chmod=0644 amd64/bzImage /usr/local/share/savestate/bzImage
 RUN ! ldd /usr/local/bin/qemu-system-x86_64 /usr/local/bin/qemu-img | grep 'not found' \
     && qemu-system-x86_64 --version | grep -q '^QEMU emulator version 11\.1\.' \
     && qemu-system-x86_64 -machine help | grep -q '^pc-q35-11\.1 '

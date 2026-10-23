@@ -26,10 +26,33 @@ spec:
       securityContext:
         seccompProfile:
           type: RuntimeDefault
+      # Checks that this node runs the guest CPU model (`vm.cpuModel`) under
+      # `enforce`, as every VM does; it needs /dev/kvm, hence privileged, and only for
+      # this one QEMU start. A node that cannot run the model shows the missing
+      # features as this container's termination message, and runs no node agent.
+      initContainers:
+        - name: probe-cpu
+          image: ghcr.io/samcm/savestate
+          args: [node, --probe-cpu, --config, /etc/savestate/config.yaml]
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          securityContext:
+            privileged: true
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - name: config
+              mountPath: /etc/savestate
+              readOnly: true
       containers:
         - name: node
           image: ghcr.io/samcm/savestate
           args: [node, --config, /etc/savestate/config.yaml]
+          ports:
+            - name: metrics
+              containerPort: 9090
           env:
             - name: NODE_NAME
               valueFrom:

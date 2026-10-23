@@ -1,0 +1,100 @@
+// savestate launcher protocol, version 1: the node agent <-> the launcher of one VM pod.
+//
+// Transport: gRPC over the unix socket `launcher.sock` in the sandbox's run directory
+// (`/run/savestate` in the VM pod, `/run/savestate/<namespace>/<sandbox>/<sandbox UID>/`
+// on the node). Paths in messages are absolute paths on the node, which the VM pod
+// mounts at the same place.
+syntax = "proto3";
+
+package savestate.launcher.v1;
+
+service Launcher {
+  // Starts the VM once: boots it from a disk image or restores it from a checkpoint.
+  // Answers as soon as the start is under way; the launcher creates `ready` in its run
+  // directory once the VM runs, or exits non-zero if it cannot start. A second Start
+  // fails with FAILED_PRECONDITION.
+  rpc Start(StartRequest) returns (StartReply);
+  // Where the launcher is in its life.
+  rpc Status(StatusRequest) returns (StatusReply);
+  // Checkpoints the running VM into `<checkpoints>/<id>.tmp/` (memory file and
+  // manifest.json); the VM pauses for the save and then carries on. The caller
+  // publishes the directory by renaming it. Idempotent per `id` while the launcher
+  // lives: a repeated call waits for (or returns) the first one's result.
+  rpc Checkpoint(CheckpointRequest) returns (CheckpointReply);
+  // Gives up on the VM: the launcher stops QEMU and exits non-zero with `message`,
+  // which becomes the sandbox's message. For starts that cannot happen.
+  rpc Fail(FailRequest) returns (FailReply);
+}
+
+message StartRequest {
+  // Name of the sandbox: the guest's hostname, and given to after-restore hooks.
+  string sandbox = 1;
+  // The node's state directory (`stateDir`).
+  string state_dir = 2;
+  // The sandbox's disk layers are `<state_dir>/layers/<layer_prefix>-<n>.qcow2`, from
+  // 0; the launcher creates them.
+  string layer_prefix = 3;
+  // vsock context id for the guest agent, unique on the node.
+  uint32 vsock_cid = 4;
+  oneof source {
+    Boot boot = 10;
+    Restore restore = 11;
+  }
+}
+
+message Boot {
+  // Base disk image, `images/sha256-<hex>.qcow2` relative to the state directory.
+  string image = 1;
+  uint32 vcpus = 2;
+  uint64 memory_mib = 3;
+  uint64 disk_bytes = 4;
+  // QEMU CPU model; the launcher adds `enforce`.
+  string cpu_model = 5;
+}
+
+message Restore {
+  // Published checkpoint directory (manifest.json and memory).
+  string checkpoint_dir = 1;
+  // Name of the checkpoint, for after-restore hooks.
+  string checkpoint = 2;
+  // Clock `stepped`: set the guest's wall clock to the host's after the restore.
+  bool stepped = 3;
+}
+
+message StartReply {}
+
+message StatusRequest {}
+
+message StatusReply {
+  enum State {
+    // Waiting for Start.
+    STATE_WAITING = 0;
+    STATE_STARTING = 1;
+    STATE_RUNNING = 2;
+  }
+  State state = 1;
+}
+
+message CheckpointRequest {
+  // Directory name under `<state_dir>/checkpoints/`: the Checkpoint's UID.
+  string id = 1;
+  // Recorded in manifest.json.
+  string namespace = 2;
+  string name = 3;
+  // Checkpoint the sandbox was started from, if any.
+  string parent = 4;
+  // The VM pod's image, by digest.
+  string launcher_image = 5;
+}
+
+message CheckpointReply {
+  // How long the guest was paused, and how much of that was the memory save.
+  uint64 pause_ms = 1;
+  uint64 save_ms = 2;
+}
+
+message FailRequest {
+  string message = 1;
+}
+
+message FailReply {}

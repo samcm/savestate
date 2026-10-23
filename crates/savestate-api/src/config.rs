@@ -51,9 +51,11 @@ pub struct Config {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Vm {
-    /// Guest CPU model passed to QEMU's `-cpu`: a named model every VM node can run,
-    /// e.g. `EPYC-Rome-v4`. Required. `host` and `max` are refused: checkpoints
-    /// taken with them cannot move between nodes.
+    /// Guest CPU model passed to QEMU's `-cpu`. Required. `host` gives guests the
+    /// node's own CPU: the simple choice when checkpoints stay on the node that took
+    /// them (a restore is refused on a node whose CPU differs). A named model that
+    /// every VM node can run, e.g. `EPYC-Rome-v4`, is run with `enforce` and is what
+    /// lets checkpoints move between nodes later. `max` is refused.
     pub cpu_model: String,
 
     /// Added to a sandbox's memory for its VM pod's memory request and limit, to
@@ -117,6 +119,11 @@ pub struct Images {
     /// into its pod. Default: none, anonymous pulls.
     #[serde(default)]
     pub auth: Option<PathBuf>,
+
+    /// Registries (`host[:port]`) the node agent reaches over plain HTTP instead of
+    /// HTTPS, e.g. a registry inside the cluster. Default: none.
+    #[serde(default)]
+    pub plain_http: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -186,10 +193,16 @@ impl Config {
             return Err("namespaces: list at least one namespace for sandboxes".into());
         }
         let cpu = self.vm.cpu_model.as_str();
-        if matches!(cpu.split(',').next(), Some("" | "host" | "max")) {
-            return Err(format!(
-                "vm.cpuModel: {cpu:?} is not a named CPU model every VM node can run (e.g. EPYC-Rome-v4)"
-            ));
+        match cpu.split(',').next() {
+            Some("" | "max") => {
+                return Err(format!(
+                    "vm.cpuModel: {cpu:?}: use host, or a named CPU model every VM node can run (e.g. EPYC-Rome-v4)"
+                ));
+            }
+            Some("host") if cpu != "host" => {
+                return Err(format!("vm.cpuModel: {cpu:?}: host takes no feature flags"));
+            }
+            _ => {}
         }
         if let Some(image) = &self.launcher_image
             && !image.contains("@sha256:")

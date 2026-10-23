@@ -296,6 +296,12 @@ spec:
                   devices:
                     description: Digest of the VM's device configuration.
                     type: string
+                  hostCpu:
+                    description: |-
+                      With CPU model `host`: the node CPU the guest was given (model name and a
+                      digest of its feature flags). A restore needs the same.
+                    nullable: true
+                    type: string
                   launcherImage:
                     description: Launcher image, by digest.
                     type: string

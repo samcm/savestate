@@ -17,8 +17,11 @@ jobs:
   build:
     uses: ./.github/workflows/build.yml
 
+  guest-kernel:
+    uses: ./.github/workflows/guest-kernel.yml
+
   image:
-    needs: [build]
+    needs: [build, guest-kernel]
     uses: ./.github/workflows/image.yml
     permissions:
       contents: read

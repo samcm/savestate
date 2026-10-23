@@ -50,12 +50,30 @@ savestate-api = { path = "crates/savestate-api" }
 savestate-guest-proto = { path = "crates/savestate-guest-proto", default-features = false }
 
 # orbd's shared QEMU and guest-agent crates, pinned to one revision.
-orbd-guest = { git = "https://github.com/samcm/orbd", rev = "d1c39ce6b0d6d11a0f2748a2592e8666f940a9d8" }
-orbd-qemu = { git = "https://github.com/samcm/orbd", rev = "d1c39ce6b0d6d11a0f2748a2592e8666f940a9d8" }
+orbd-guest = { git = "https://github.com/samcm/orbd", rev = "5c7658c834713db11642208eb2ac2d1036df4b2d" }
+orbd-qemu = { git = "https://github.com/samcm/orbd", rev = "5c7658c834713db11642208eb2ac2d1036df4b2d" }
+orbd-vm = { git = "https://github.com/samcm/orbd", rev = "5c7658c834713db11642208eb2ac2d1036df4b2d" }
 
 anyhow = "1"
+base64 = "0.23"
+fail = "0.5"
+flate2 = "1"
+hyper-util = { version = "0.1", features = ["tokio"] }
+nftables = "0.6"
+oci-client = { version = "0.18", default-features = false, features = ["rustls-tls-no-provider"] }
+rand = "0.10"
+rtnetlink = "0.23"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+sha2 = "0.11"
+tar = { version = "0.4", default-features = false }
+tokio-stream = { version = "0.1", features = ["net"] }
+tonic = { version = "0.14", default-features = false, features = ["transport", "codegen", "router"] }
+tonic-prost = "0.14"
+tonic-prost-build = "0.14"
+tower = "0.5"
 clap = { version = "4", features = ["derive", "env"] }
 futures = "0.3"
+hex = "0.4"
 ipnet = { version = "2", features = ["serde"] }
 jiff = "0.2"
 k8s-openapi = { version = "0.28", features = ["v1_36", "schemars"] }

@@ -1,3 +1,4 @@
+use std::io::Write;
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
@@ -17,11 +18,11 @@ struct Cli {
 enum Command {
     /// Run the controller (one replica per cluster).
     Controller(ConfigPath),
-    /// Run the node agent (one per node, as a DaemonSet).
+    /// Run the node agent (one per node, as a `DaemonSet`).
     Node(ConfigPath),
     /// Run the launcher for one VM (inside its pod; started by the controller).
     Launcher,
-    /// Print the CustomResourceDefinitions as YAML, for `kubectl apply -f -`.
+    /// Print the `CustomResourceDefinition`s as YAML, for `kubectl apply -f -`.
     Crds,
     #[command(flatten)]
     Verb(savestate::cli::Verb),
@@ -46,9 +47,10 @@ fn main() -> anyhow::Result<()> {
         Command::Node(args) => savestate::node::run(savestate::load_config(&args.config)?),
         Command::Launcher => savestate::launcher::run(),
         Command::Crds => {
-            print!("{}", savestate::crds_yaml()?);
+            let yaml = savestate::crds_yaml()?;
+            std::io::stdout().lock().write_all(yaml.as_bytes())?;
             Ok(())
         }
-        Command::Verb(verb) => savestate::cli::run(verb),
+        Command::Verb(verb) => savestate::cli::run(&verb),
     }
 }

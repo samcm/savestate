@@ -1,0 +1,7 @@
+# The one toolchain for local builds and CI. Bump it (and `rust-version` in
+# Cargo.toml) in its own pull request, fixing whatever new lints it brings.
+[toolchain]
+channel = "1.99.1"
+profile = "minimal"
+components = ["rustfmt", "clippy"]
+targets = ["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl"]

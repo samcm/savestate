@@ -106,7 +106,7 @@ pub enum Kind {
 }
 
 /// Run one verb against the cluster in the current kubeconfig context.
-pub fn run(verb: Verb) -> anyhow::Result<()> {
+pub fn run(verb: &Verb) -> anyhow::Result<()> {
     let name = match verb {
         Verb::Create(_) => "create",
         Verb::Checkpoint(_) => "checkpoint",

@@ -66,7 +66,7 @@ pub struct Vm {
     #[serde(default)]
     pub shapes: Vec<Shape>,
 
-    /// Node selector for VM pods; the node-agent DaemonSet must cover the same
+    /// Node selector for VM pods; the node-agent `DaemonSet` must cover the same
     /// nodes. Default: empty, any node.
     #[serde(default)]
     pub node_selector: BTreeMap<String, String>,

@@ -79,6 +79,7 @@ network:
   egressAllow: [$registry/32]
 images:
   plainHttp: ["$registry:5000"]
+  prefetch: [$base]
 stores:
   e2e:
     endpoint: http://$s3:9000

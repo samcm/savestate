@@ -23,6 +23,11 @@ spec:
       # `vm.nodeAffinity` and `vm.tolerations`) in config.yaml.
       nodeSelector:
         savestate.dev/node: "true"
+      # The startup taint an installation may give new VM nodes (deploy/README.md,
+      # "Running on an autoscaled cluster"); the node agent removes it.
+      tolerations:
+        - key: startup-taint.cluster-autoscaler.kubernetes.io/savestate
+          operator: Exists
       securityContext:
         seccompProfile:
           type: RuntimeDefault
@@ -31,6 +36,20 @@ spec:
       # this one QEMU start. A node that cannot run the model shows the missing
       # features as this container's termination message, and runs no node agent.
       initContainers:
+        # Loads vhost_vsock, the guest agents' channel, where /dev/vhost-vsock is
+        # missing; it needs the host's kernel modules, hence privileged. A privileged
+        # container sees the host's device nodes.
+        - name: load-modules
+          image: ghcr.io/samcm/savestate
+          command: [sh, -c, "test -c /dev/vhost-vsock || modprobe vhost_vsock"]
+          terminationMessagePolicy: FallbackToLogsOnError
+          securityContext:
+            privileged: true
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - name: modules
+              mountPath: /lib/modules
+              readOnly: true
         - name: probe-cpu
           image: ghcr.io/samcm/savestate
           args: [node, --probe-cpu, --config, /etc/savestate/config.yaml]
@@ -97,6 +116,10 @@ spec:
             - name: tmp
               mountPath: /tmp
       volumes:
+        - name: modules
+          hostPath:
+            path: /lib/modules
+            type: Directory
         - name: config
           configMap:
             name: savestate-config

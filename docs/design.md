@@ -193,8 +193,10 @@ through RoleBindings; cluster-wide, the controller only reads nodes.
 Capacity accounting is plain Kubernetes: each VM is a Guaranteed pod whose memory
 request is guest RAM plus the installation's memory overhead (`vm.memoryOverhead`,
 default 512 MiB), so the scheduler and ResourceQuota work unchanged. The spike
-measured QEMU's own resident memory outside guest RAM at 30–60 MiB; the margin also
-covers KVM kernel memory and the launcher, which phase 1 measures in the pod's cgroup.
+measured QEMU's own resident memory outside guest RAM at 30–60 MiB. In the end-to-end
+test the VM pod's cgroup peak (QEMU, the launcher and KVM's kernel memory) was about
+250 MiB for a 1 GiB guest whose memory file held about 170 MiB, so everything outside
+the guest's RAM stayed under 100 MiB; the default keeps a wide margin.
 
 ## Controller
 

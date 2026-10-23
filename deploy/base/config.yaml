@@ -1,0 +1,64 @@
+# savestate installation config, read by the controller and the node agents.
+# Every value below is an example: replace it with your installation's own (see
+# deploy/README.md). Commented-out fields show their defaults.
+
+# Namespaces whose sandboxes savestate runs (required). VM pods run in their
+# sandbox's namespace; bind the controller and node-agent roles in each (see
+# sandboxes.yaml). Objects in other namespaces are ignored.
+namespaces: [sandboxes]
+
+# Directory on every VM node for images, layers and checkpoints. It must match
+# the node agent's hostPath in node.yaml.
+# stateDir: /var/lib/savestate
+
+# Image VM pods run, pinned by digest. Default: the controller's own image.
+# launcherImage: ghcr.io/example/savestate@sha256:...
+
+vm:
+  # QEMU CPU model for every guest (required): a named model every VM node can
+  # run, never host or max, so checkpoints can move between nodes.
+  cpuModel: EPYC-Rome-v4
+
+  # Added to each sandbox's memory for its pod's memory request, to cover QEMU.
+  # memoryOverhead: 512Mi
+
+  # Shapes a sandbox from an image may use. Default: [] (any shape).
+  shapes:
+    - {vcpus: 2, memory: 4Gi, disk: 30Gi}
+    - {vcpus: 4, memory: 8Gi, disk: 60Gi}
+
+  # Where VM pods run. The node-agent DaemonSet in node.yaml must select the same
+  # nodes. Default: any node.
+  nodeSelector:
+    savestate.dev/node: "true"
+  # tolerations: []
+
+  # Extended resources from a device plugin that provide /dev/kvm and
+  # /dev/net/tun. Default: {} (the launcher container runs privileged instead).
+  # devices:
+  #   devices.example.com/kvm: 1
+  #   devices.example.com/tun: 1
+
+network:
+  # Cluster, node, link-local and private destinations guests may still reach;
+  # the rest of those ranges is dropped. Default: [].
+  # egressAllow: [10.0.0.53/32]
+  # DNS servers for guests. Default: [] (the VM pod's own resolvers).
+  # dns: [10.0.0.53]
+
+images:
+  # Registries sandbox images may come from. Default: [] (any).
+  registries: [ghcr.io/example]
+  # Docker config.json with registry credentials, mounted into the node agent.
+  # Default: none (anonymous pulls).
+  # auth: /etc/savestate/registry/config.json
+
+# transfers:
+#   perNode: 1
+
+ttl:
+  sandbox:
+    max: 30d
+  checkpoint:
+    default: 7d
+    max: 90d

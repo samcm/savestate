@@ -1,6 +1,6 @@
 [package]
 name = "savestate-api"
-description = "Kubernetes API types for savestate: Sandbox, Checkpoint and Transfer"
+description = "Kubernetes API types for savestate: Sandbox, Checkpoint and Transfer, and the installation config"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -9,3 +9,15 @@ rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
+ipnet.workspace = true
+k8s-openapi.workspace = true
+kube = { workspace = true, features = ["derive"] }
+schemars.workspace = true
+serde.workspace = true
+serde-saphyr.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+kube = { workspace = true, features = ["client", "rustls-tls", "ring"] }
+tokio = { workspace = true, features = ["time"] }

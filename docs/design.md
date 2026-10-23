@@ -42,36 +42,46 @@ Guarantees and limits:
 ## API
 
 API group `savestate.dev`, version `v1alpha1` (placeholder until the group is final).
-Validation uses CEL rules in the CRDs; there are no admission webhooks.
+All three kinds are namespaced and refer to each other by name within their
+namespace. Validation uses CEL rules and schema constraints in the CRDs; there are no
+admission webhooks. The Rust types are `crates/savestate-api`; `savestate crds` prints
+the CRDs, which are committed under `deploy/crds/`.
 
 ```yaml
-kind: Sandbox
+kind: Sandbox            # short name sbx
 metadata: {name: web-1}
 spec:
   image: ghcr.io/example/base@sha256:…   # or: from: {checkpoint: web-1-parked}
-  vcpus: 4
+  vcpus: 4               # vcpus, memory, disk: required with image, refused with from
   memory: 8Gi
   disk: 60Gi
-  clock: frozen          # frozen | stepped; only meaningful with `from`
+  # clock: stepped       # frozen (default) | stepped; only with from
   ttl: 7d
 status:
   phase: Running         # Pending | WaitingForTransfer | Booting | Restoring | Running | Failed
   node: node-a
   from: {checkpoint: web-1-parked}
+  message: …             # why it is in this phase, mainly for Failed
 ---
-kind: Checkpoint
+kind: Checkpoint         # short name ckpt
 metadata: {name: web-1-parked}
 spec: {sandbox: web-1, ttl: 48h}
 status:
   phase: Ready           # Pending | Saving | Ready | Failed
   nodes: [node-a]        # every node holding a complete copy
-  memoryBytes: …
-  diskBytes: …
+  memoryBytes: …         # bytes the sparse RAM file occupies
+  diskBytes: …           # bytes of the disk layer this checkpoint adds
   guestTime: …           # guest wall clock at the checkpoint
   parent: …              # checkpoint this one's sandbox was started from, if any
-  fingerprint: …         # launcher image, QEMU build, machine type, CPU model, device set
+  fingerprint:           # what a restore must run exactly
+    launcherImage: …     # by digest
+    qemu: …              # QEMU version
+    machineType: pc-q35-11.1
+    cpuModel: …
+    devices: …           # digest of the device configuration
+  message: …
 ---
-kind: Transfer           # after the MVP
+kind: Transfer           # short name xfer; after the MVP
 metadata: {name: parked-to-node-b}
 spec:
   checkpoint: web-1-parked
@@ -81,14 +91,30 @@ status:
   from: node-a
   bytesDone: …
   bytesTotal: …
+  message: …
 ```
 
-- A sandbox started from a checkpoint inherits image, vCPUs, memory and disk from it;
-  setting them differently is rejected.
+- A sandbox has exactly one of `image` and `from`. An image is pinned by digest. A
+  sandbox from an image sets `vcpus`, `memory` and `disk`; one started from a
+  checkpoint inherits image, vCPUs, memory and disk from it and setting them is
+  rejected (admission cannot see the checkpoint, so equal values are refused too).
+  `clock` is only accepted with `from`; unset means `frozen`.
+- Specs are immutable except `ttl`: changing a sandbox's source, shape or clock, a
+  checkpoint's sandbox, or anything in a transfer is rejected.
+- A TTL is whole numbers each followed by `d`, `h`, `m` or `s` (`7d`, `48h`,
+  `1d12h`), counted from the object's creation. The installation config can set a
+  default and a maximum per kind.
+- The controller writes Sandbox status; the node agent doing the work writes
+  Checkpoint and Transfer status (the controller marks them `Failed` when they cannot
+  start). `Failed` is terminal for every kind.
+- `kubectl get savestate` lists all three kinds. Field selectors work on
+  `status.node` and `spec.from.checkpoint` (sandboxes), `spec.sandbox`
+  (checkpoints), and `spec.checkpoint`, `spec.to.node` and `status.from`
+  (transfers), so node agents watch only their own node's objects.
 - A completed `Transfer` adds its node to the checkpoint's `status.nodes`. The copy
   belongs to the checkpoint; deleting the `Transfer` afterwards only deletes the
   record. Deleting a `Transfer` that is still copying cancels it and removes partial
-  files. The controller runs at most one transfer per node at a time.
+  files. Each node runs at most `transfers.perNode` transfers at a time (default one).
 - When a sandbox from a checkpoint fits on no node holding it, the controller creates
   a `Transfer` owned by that sandbox and the sandbox waits in `WaitingForTransfer`.
 - Later, a `Migration` kind may move a running sandbox between nodes with QEMU live
@@ -122,9 +148,11 @@ NODE`, `delete`.
 One static `savestate` binary provides every role (`controller`, `node`, `launcher`
 and the CLI); `savestate-guest` runs inside the VM.
 
-- **Controller** (Deployment, one replica): creates one Pod per Sandbox, pins
-  sandboxes from checkpoints to a holding node, enforces TTLs, creates and schedules
-  Transfers, keeps finalizers that protect checkpoints still in use.
+- **Controller** (Deployment, one replica): creates one Pod per Sandbox, in the
+  sandbox's namespace, pins sandboxes from checkpoints to a holding node, enforces
+  TTLs, creates and schedules Transfers, keeps finalizers that protect checkpoints
+  still in use. VM pods run the launcher image from the installation config, by
+  default the controller's own image at the digest its pod runs.
 - **Node agent** (DaemonSet): owns `/var/lib/savestate` on its node; caches base images
   by digest; tells launchers on its node to checkpoint or restore; garbage-collects
   layers and checkpoints whose objects are gone; serves and fetches transfers;
@@ -136,9 +164,13 @@ and the CLI); `savestate-guest` runs inside the VM.
   (clock, entropy, machine-id, hostname, SSH host keys, user hooks in
   `/etc/savestate/after-restore.d/`).
 
+savestate acts only in the sandbox namespaces the installation config lists; objects
+elsewhere are ignored. The controller and node agent get their permissions there
+through RoleBindings; cluster-wide, the controller only reads nodes.
+
 Capacity accounting is plain Kubernetes: each VM is a Guaranteed pod whose memory
-request is guest RAM plus QEMU overhead (measure; expect roughly 0.5 GiB), so the
-scheduler and ResourceQuota work unchanged.
+request is guest RAM plus the installation's memory overhead (`vm.memoryOverhead`,
+default 512 MiB; measure), so the scheduler and ResourceQuota work unchanged.
 
 ## QEMU mechanics
 
@@ -209,6 +241,12 @@ chains are capped in depth and flattened in the background.
   devices come from a device plugin rather than a privileged container where the
   cluster allows it.
 - Exec and file copy use Kubernetes `pods/exec` RBAC; there is no separate API server.
+- VM pods need host devices, `NET_ADMIN` in their own network namespace and the
+  node's state directory, which is the privileged Pod Security level. Sandbox
+  namespaces therefore hold only sandboxes; users get the `savestate-user` role
+  (savestate objects, read pods, `pods/exec`) and never pod creation there. A
+  NetworkPolicy refuses all ingress to VM pods (`app.kubernetes.io/component: vm`):
+  exec goes through the kubelet and the node agent uses a unix socket.
 
 ## Configuration boundary
 
@@ -226,7 +264,12 @@ installation is supplied at install time and never committed here:
 
 Installation config is one YAML file (operator and node agent) plus the usual
 Kubernetes objects; every field has a documented default or is required with a clear
-error.
+error, and unknown fields are refused. The schema is `savestate_api::config::Config`:
+`namespaces` (required), `stateDir`, `launcherImage`, `vm` (`cpuModel` required,
+`memoryOverhead`, `shapes`, `nodeSelector`, `tolerations`, `devices`), `network`
+(`egressAllow`, `dns`), `images` (`registries`, `auth`), `transfers.perNode` and
+`ttl` (`default` and `max` per kind). `deploy/base` is a kustomize base with
+placeholder values and `deploy/README.md` lists what an installation supplies.
 
 ## Phases
 

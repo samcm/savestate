@@ -1,7 +1,8 @@
 # Installing savestate
 
-> The controller and node agent are not implemented yet: they read and check the
-> installation config, then exit. The CRDs and these manifests are the contract the
+> The node agent and launcher are not implemented yet: the controller creates VM
+> pods and keeps sandbox status, TTLs and checkpoint finalizers, but nothing runs a
+> VM in those pods. The CRDs and these manifests are the contract the
 > implementation follows (see [docs/design.md](../docs/design.md)).
 
 - [`crds/`](crds) holds the CustomResourceDefinitions for `Sandbox`, `Checkpoint` and
@@ -28,7 +29,8 @@ configMapGenerator:
       - config.yaml
 ```
 
-Kubernetes 1.34 or newer is required (CI tests 1.34 and 1.37).
+Kubernetes 1.32 to 1.37 is supported (CI tests 1.32 and 1.37). The controller
+serves Prometheus metrics on port 9090 at `/metrics`.
 
 ## What your installation supplies
 

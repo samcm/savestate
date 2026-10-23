@@ -77,9 +77,9 @@ jobs:
             exit 1
           }
 
-  # The CRDs and the install manifests on a real API server (kind), on the oldest
-  # and the newest Kubernetes savestate supports. The CRD test is #[ignore]d
-  # locally because it needs a cluster.
+  # The CRDs, the install manifests and the controller on a real cluster (kind), on
+  # the oldest and the newest Kubernetes savestate supports (docs/design.md). These
+  # tests are #[ignore]d locally because they need a cluster.
   api:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -87,7 +87,7 @@ jobs:
       fail-fast: false
       matrix:
         node:
-          - kindest/node:v1.34.11@sha256:44e222ee2132dab25ff87301682f89eb82c7880ea3a1bf543bfe9708fd08d67d
+          - kindest/node:v1.32.11@sha256:5fc52d52a7b9574015299724bd68f183702956aa4a2116ae75a63cb574b35af8
           - kindest/node:v1.37.0@sha256:a1ed56cfb0e7b93589bdf97c8cd566405a265939e3620fc4f5de89adff580ae5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -98,7 +98,7 @@ jobs:
         with:
           key: api
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - run: cargo test -p savestate-api --locked --test apiserver --no-run
+      - run: cargo test --locked -p savestate-api --test apiserver -p savestate --test controller --no-run
       - name: Start a kind cluster
         run: |
           curl -fsSLo kind https://github.com/kubernetes-sigs/kind/releases/download/v0.33.0/kind-linux-amd64
@@ -107,7 +107,18 @@ jobs:
           kind create cluster --image "${{ matrix.node }}" --wait 2m
       - name: The kustomize base applies
         run: kubectl apply -k deploy/base
-      - run: cargo test -p savestate-api --locked --test apiserver -- --ignored
+      - run: cargo test --locked -p savestate-api --test apiserver -- --ignored
+      # The VM pods in the controller test run a dummy launcher, pinned by digest
+      # like a real one: load it into the node and name it by its digest there.
+      - name: Load the dummy launcher image
+        run: |
+          docker build -t savestate-test/launcher:dummy crates/savestate/tests/launcher
+          kind load docker-image savestate-test/launcher:dummy
+          ref=docker.io/savestate-test/launcher:dummy
+          digest=$(docker exec kind-control-plane ctr -n k8s.io images ls "name==$ref" | awk 'NR == 2 {print $3}')
+          docker exec kind-control-plane ctr -n k8s.io images tag "$ref" "docker.io/savestate-test/launcher@$digest"
+          echo "SAVESTATE_TEST_LAUNCHER_IMAGE=docker.io/savestate-test/launcher@$digest" >>"$GITHUB_ENV"
+      - run: cargo test --locked -p savestate --test controller -- --ignored --nocapture
 
   build:
     uses: ./.github/workflows/build.yml
@@ -121,7 +132,7 @@ jobs:
 
   # Real VMs on GitHub-hosted runners: ephemeral VMs with /dev/kvm and no secrets, so
   # pull requests run here too. Every test marked #[ignore] (the ones that need
-  # /dev/kvm; not the API server test, which the api job runs) runs inside the image
+  # /dev/kvm; not the cluster tests, which the api job runs) runs inside the image
   # built above, so it tests the shipped QEMU.
   kvm:
     needs: [build, image]
@@ -165,7 +176,7 @@ jobs:
           CARGO_PROFILE_DEV_DEBUG: "0"
         run: |
           cargo test --workspace --locked --target x86_64-unknown-linux-musl --no-run --message-format=json |
-            jq -r 'select(.profile.test == true and .executable != null and .target.name != "apiserver") | .executable' >tests.txt
+            jq -r 'select(.profile.test == true and .executable != null and (.target.name | IN("apiserver", "controller") | not)) | .executable' >tests.txt
           cat tests.txt
       - name: Run the ignored tests in the image
         run: |

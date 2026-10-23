@@ -42,8 +42,9 @@ Guarantees and limits:
 ## API
 
 API group `savestate.dev`, version `v1alpha1` (placeholder until the group is final).
-All three kinds are namespaced and refer to each other by name within their
-namespace. Validation uses CEL rules and schema constraints in the CRDs; there are no
+Kubernetes 1.32 to 1.37 is supported; CI runs the API and controller tests on kind
+at both ends of that range. All three kinds are namespaced and
+refer to each other by name within their namespace. Validation uses CEL rules and schema constraints in the CRDs; there are no
 admission webhooks. The Rust types are `crates/savestate-api`; `savestate crds` prints
 the CRDs, which are committed under `deploy/crds/`.
 
@@ -69,6 +70,9 @@ spec: {sandbox: web-1, ttl: 48h}
 status:
   phase: Ready           # Pending | Saving | Ready | Failed
   nodes: [node-a]        # every node holding a complete copy
+  vcpus: 4               # shape of the checkpointed VM; sandboxes from it get
+  memory: 8Gi            #   the same
+  disk: 60Gi
   memoryBytes: …         # bytes the sparse RAM file occupies
   diskBytes: …           # bytes of the disk layer this checkpoint adds
   guestTime: …           # guest wall clock at the checkpoint
@@ -171,6 +175,81 @@ through RoleBindings; cluster-wide, the controller only reads nodes.
 Capacity accounting is plain Kubernetes: each VM is a Guaranteed pod whose memory
 request is guest RAM plus the installation's memory overhead (`vm.memoryOverhead`,
 default 512 MiB; measure), so the scheduler and ResourceQuota work unchanged.
+
+## Controller
+
+The controller runs one sandbox and one checkpoint controller (kube-rs `Controller`)
+per configured namespace. It writes only through server-side apply (field manager
+`savestate-controller`) or create, and reports what a user would want to know as
+Kubernetes Events on the Sandbox or Checkpoint.
+
+**VM pods.** Each Sandbox gets exactly one Pod, named after it, in its namespace,
+owned by it (deleting the sandbox deletes the pod) and labelled
+`app.kubernetes.io/name: savestate` and `app.kubernetes.io/component: vm`:
+
+- one container, `launcher`, running `savestate launcher` from the launcher image:
+  the installation's (`launcherImage`, else the controller's own image by digest)
+  for a sandbox from an image, the checkpoint's `fingerprint.launcherImage` for a
+  sandbox from a checkpoint. The pod spec is the record of which image a sandbox
+  runs; the controller never changes an existing pod.
+- Guaranteed QoS: CPU requests and limits are `vcpus`; memory requests and limits are
+  guest memory plus `vm.memoryOverhead`; `vm.devices` are requested and limited too.
+  For a sandbox from a checkpoint, shape comes from the checkpoint's status.
+- `automountServiceAccountToken: false`, `enableServiceLinks: false`,
+  `restartPolicy: Never`, `vm.nodeSelector` and `vm.tolerations`. Without
+  `vm.devices` the container is privileged; with them it gets `NET_ADMIN` only.
+- for a sandbox from a checkpoint, required node affinity on `metadata.name` in the
+  checkpoint's `status.nodes`.
+- host paths: `stateDir` at the same path, and the sandbox's run directory
+  `/run/savestate/<namespace>/<sandbox>/<sandbox UID>/` at `/run/savestate`. The UID
+  keeps a later sandbox of the same name from meeting an earlier one's files.
+
+Before creating the pod the controller refuses (sandbox `Failed`) an image outside
+`images.registries`, a shape not in `vm.shapes`, and a checkpoint that is `Failed`,
+being deleted, or `Ready` without fingerprint, vCPUs or memory. It waits (sandbox
+`Pending` with a message) while the checkpoint does not exist, is not yet `Ready` or
+is on no node. A pod of the same name owned by an earlier sandbox is waited out.
+Transfers are not created yet (phase 4).
+
+**Sandbox status** is derived from the pod alone:
+
+| Pod | Sandbox |
+| --- | --- |
+| absent, not yet placed | `Pending` (message says what it waits for) |
+| not scheduled | `Pending`, message from the scheduler's `PodScheduled` condition |
+| on a node, not Ready | `Booting` (from an image) or `Restoring` (from a checkpoint); `node` set; message from a waiting container (e.g. an image that cannot be pulled) |
+| Ready | `Running`, and it stays `Running` while the pod runs |
+| `Failed` or `Succeeded`, being deleted, or gone after placement | `Failed` with the launcher's exit code or the pod's reason |
+
+`Failed` is terminal: the pod is kept for its logs and never replaced.
+
+**TTL.** A Sandbox or Checkpoint is deleted (with a UID precondition) once
+`creationTimestamp` + TTL has passed, where TTL is its own `ttl`, else the configured
+`ttl.<kind>.default`, capped at `ttl.<kind>.max` (which also applies to objects with
+no TTL). An `Expired` event records it.
+
+**Checkpoint finalizer.** Every Checkpoint carries the finalizer
+`savestate.dev/in-use`. While it is being deleted, the controller removes the
+finalizer only once no Sandbox has `spec.from.checkpoint` naming it or a checkpoint
+descended from it (following `status.parent`), reading both lists fresh from the API
+server; until then an `InUse` event names the sandboxes. Once the object is gone, the
+node agent removes the checkpoint's files.
+
+**Contract with the node agent and launcher.**
+
+| Who | Writes |
+| --- | --- |
+| Controller | VM pods; Sandbox `status` (all of it); TTL deletions; the Checkpoint finalizer; later Transfers |
+| Node agent | Checkpoint `status` (`phase`, `nodes`, `vcpus`, `memory`, `disk`, sizes, `guestTime`, `parent`, `fingerprint`, `message`); Transfer `status`; files under `stateDir`; removes run directories of sandboxes that are gone |
+| Launcher | listens on `/run/savestate/launcher.sock` in its pod (the run directory on the host); creates `/run/savestate/ready` once the VM runs and never removes it while the VM lives. A readiness probe (`test -e /run/savestate/ready`, every 2 s) turns that into the pod's Ready condition, which the controller reads. It exits non-zero when QEMU fails. |
+
+The node agent finds a sandbox's launcher at
+`/run/savestate/<namespace>/<sandbox>/<sandbox UID>/launcher.sock` on its node, and a
+VM pod's image (for a checkpoint's `fingerprint.launcherImage`) in the pod spec.
+
+The controller serves Prometheus metrics (`--metrics-listen`, default
+`0.0.0.0:9090`, at `/metrics`): reconcile counts, errors and durations per kind,
+sandbox phase transitions and TTL deletions. Logs are JSON lines from `tracing`.
 
 ## QEMU mechanics
 

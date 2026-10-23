@@ -29,6 +29,9 @@ spec:
         - name: controller
           image: ghcr.io/samcm/savestate
           args: [controller, --config, /etc/savestate/config.yaml]
+          ports:
+            - name: metrics
+              containerPort: 9090
           env:
             - name: POD_NAME
               valueFrom:

@@ -68,7 +68,7 @@ Everything below describes one installation and comes from your overlay; nothing
 | What | Where |
 | --- | --- |
 | Image, pinned by digest | kustomize `images:`. Checkpoints restore only on the image they were taken with. |
-| Sandbox namespaces | `namespaces` in the config, and one copy of [`base/sandboxes.yaml`](base/sandboxes.yaml) per namespace (Namespace with the privileged Pod Security level, RoleBindings for the controller and node agent, a NetworkPolicy refusing ingress to VM pods). |
+| Sandbox namespaces | `namespaces` in the config, and one copy of [`base/sandboxes.yaml`](base/sandboxes.yaml) per namespace (Namespace with the privileged Pod Security level, RoleBindings for the controller and node agent, a NetworkPolicy refusing ingress to VM pods except the ports sandboxes expose). |
 | Who may use sandboxes | RoleBindings of the `savestate-user` ClusterRole in sandbox namespaces. Do not give them pod creation there. |
 | Quotas | ResourceQuotas in sandbox namespaces. A VM pod requests its sandbox's memory plus `vm.memoryOverhead`, so memory quotas count sandboxes directly. |
 | Which nodes run VMs, tolerations | `vm.nodeSelector`, `vm.nodeAffinity` (e.g. a list of hostnames, without labelling nodes) and `vm.tolerations` in the config, and the same selection on the node-agent DaemonSet ([`base/node.yaml`](base/node.yaml)). The base selects nodes labelled `savestate.dev/node: "true"`. |
@@ -81,6 +81,8 @@ Everything below describes one installation and comes from your overlay; nothing
 | Kubelet directory | `kubeletDir` (default `/var/lib/kubelet`, also k3s's) and the node agent's `device-plugins` and `seccomp` `hostPath`s in [`base/node.yaml`](base/node.yaml) must agree. The node agent installs the VM pods' seccomp profile as `seccomp/savestate/vm.json` there at start-up, before it advertises any VM slot. |
 | Base images, registries, pull credentials | `images.registries`, and `images.auth` pointing at a Docker `config.json` you mount into the node agent (for example from a Secret, by patching `base/node.yaml`); `images.plainHttp` for registries reached without TLS. |
 | Egress allowlist, DNS | `network.egressAllow` and `network.dns`. Guests reach the internet; cluster, node, link-local and private ranges are dropped except what you allow. |
+| Who reaches exposed ports | `network.exposeFrom`: NetworkPolicy sources (namespace and pod selectors, IP blocks) allowed to connect to the ports sandboxes expose (`spec.ports`). Default: pods in the sandbox's own namespace. Your CNI must enforce NetworkPolicies; the launcher forwards only exposed ports either way. |
+| External exposure | Your choice of Ingress or `LoadBalancer`; see [Exposing a sandbox outside the cluster](#exposing-a-sandbox-outside-the-cluster). |
 | State directory | `stateDir` (default `/var/lib/savestate`) and the node agent's `hostPath` must agree, on a disk large enough for your checkpoints. |
 | Object stores | `stores`: per store an S3-compatible `endpoint`, `bucket`, `region`, `prefix` (one prefix per installation) and `credentialsSecret`, a Secret in `savestate-system` with `accessKeyId` and `secretAccessKey`. `export` names the store every checkpoint is exported to (default: only checkpoints with `spec.export`). Without stores, checkpoints live only on the node that took them. |
 | Cache eviction | `cache.minFreePercent` (default 10): below that much free space on the state directory's filesystem, nodes drop their copies of exported checkpoints. |
@@ -90,3 +92,44 @@ Everything below describes one installation and comes from your overlay; nothing
 documented there and in `crates/savestate-api/src/config.rs`. Fields not set take
 their defaults; a missing required field or an unknown field stops the controller
 and node agent with an error naming it.
+
+## Exposing a sandbox outside the cluster
+
+A sandbox with `spec.ports` and `spec.service: true` has a `ClusterIP` Service named
+after it. Reaching it from outside the cluster is up to the installation. For
+example, with an ingress controller running in the namespace `ingress`, let it
+through in the config:
+
+```yaml
+network:
+  exposeFrom:
+    - namespaceSelector:
+        matchLabels: {kubernetes.io/metadata.name: ingress}
+```
+
+and route a host to the sandbox's Service:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: web-1
+  namespace: sandboxes
+spec:
+  rules:
+    - host: web-1.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: web-1          # the sandbox's Service
+                port: {number: 8080}
+```
+
+A `LoadBalancer` Service of your own works the same way: select the VM pod with
+`savestate.dev/sandbox-uid: <the sandbox's UID>` and add the load balancer's
+source ranges (or `0.0.0.0/0`) to `exposeFrom` as an `ipBlock`. Each fork of a
+sandbox is its own sandbox, with its own pod and Service, so route to each one
+separately.

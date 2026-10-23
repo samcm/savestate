@@ -26,6 +26,14 @@ echo "guest CPU model: $cpu"
 
 kind create cluster --name savestate ${KIND_NODE_IMAGE:+--image "$KIND_NODE_IMAGE"} --wait 2m
 node=savestate-control-plane
+# kind's network plugin does not enforce NetworkPolicies; this does.
+curl -fsSL -o "$work/netpol.yaml" https://raw.githubusercontent.com/kubernetes-sigs/kube-network-policies/v1.1.2/install.yaml
+echo "a8345bd40f74e812c7f2e13c40a841d4d6c7b1fc22e245750116072807a0f4ba  $work/netpol.yaml" | sha256sum -c
+sed -i 's|image: registry.k8s.io/networking/kube-network-policies:.*|image: registry.k8s.io/networking/kube-network-policies:v1.1.2@sha256:c671f98e444825d57c590c92da1b5e66070917c4d3dff1f9279775e6b73254fe|' "$work/netpol.yaml"
+kubectl apply -f "$work/netpol.yaml"
+kubectl -n kube-system rollout status daemonset/kube-network-policies --timeout=3m
+# Clients the sandboxes' exposed ports admit (network.exposeFrom).
+kubectl create namespace clients
 kubectl label node "$node" savestate.dev/node=true
 # Room for three 1-vCPU VMs on a 4-CPU runner: cluster DNS is not needed.
 kubectl -n kube-system scale deployment coredns --replicas=0
@@ -77,6 +85,9 @@ vm:
     savestate.dev/node: "true"
 network:
   egressAllow: [$registry/32]
+  exposeFrom:
+    - namespaceSelector:
+        matchLabels: {kubernetes.io/metadata.name: clients}
 images:
   plainHttp: ["$registry:5000"]
 stores:
@@ -133,6 +144,8 @@ SAVESTATE_E2E_BLOCKED=$api:443
 SAVESTATE_E2E_CPU_MODEL=$cpu
 SAVESTATE_E2E_NODE=$node
 SAVESTATE_E2E_STORE=e2e
+SAVESTATE_E2E_CLIENTS=clients
+SAVESTATE_E2E_CLIENT_IMAGE=$pinned
 SAVESTATE_E2E_S3_ENDPOINT=http://127.0.0.1:9000
 SAVESTATE_E2E_S3_BUCKET=savestate
 SAVESTATE_E2E_S3_PREFIX=e2e

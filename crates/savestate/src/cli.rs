@@ -15,13 +15,14 @@ use std::{
 
 use anyhow::{Context as _, bail};
 use clap::{Args, Subcommand, ValueEnum};
-use k8s_openapi::api::core::v1::Pod;
+use k8s_openapi::api::core::v1::{Pod, Service};
 use kube::{
     Api, Client, Resource, ResourceExt,
-    api::{AttachParams, DeleteParams, ListParams, PostParams},
+    api::{AttachParams, DeleteParams, ListParams, Patch, PatchParams, PostParams},
 };
 use savestate_api::{
-    Checkpoint, CheckpointPhase, Sandbox, SandboxPhase, Transfer, TransferPhase, Ttl,
+    Checkpoint, CheckpointPhase, Port, Protocol, Sandbox, SandboxPhase, Transfer, TransferPhase,
+    Ttl,
 };
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::json;
@@ -39,6 +40,10 @@ pub enum Verb {
     Exec(Exec),
     /// Copy a file into or out of a sandbox (`NAME:PATH` names a path in a sandbox).
     Cp(Cp),
+    /// Expose guest ports of a sandbox on its pod's address (adds to `spec.ports`).
+    Expose(Expose),
+    /// Forward local ports to a sandbox's guest ports (TCP), with `kubectl port-forward`.
+    PortForward(PortForward),
     /// List sandboxes or checkpoints.
     List(List),
     /// Show a sandbox or a checkpoint: phase, node, message, shape, sizes and parent.
@@ -106,10 +111,46 @@ pub struct Create {
     /// A label, `KEY=VALUE`, on top of the checkpoint's (with `--from`); repeatable.
     #[arg(long = "label", value_name = "KEY=VALUE", value_parser = parse_label)]
     pub labels: Vec<(String, String)>,
+    /// Guest port to expose, e.g. `8080` or `53/udp` (repeat).
+    #[arg(long = "port", value_name = "PORT[/udp]", value_parser = parse_port)]
+    pub ports: Vec<Port>,
+    /// Also create a Service named after the sandbox for the exposed ports.
+    #[arg(long, requires = "ports")]
+    pub service: bool,
     #[command(flatten)]
     pub wait: Wait,
     #[command(flatten)]
     pub output: Output,
+    #[command(flatten)]
+    pub common: Common,
+}
+
+#[derive(Args)]
+pub struct Expose {
+    /// Sandbox whose guest ports to expose.
+    pub sandbox: String,
+    /// Guest ports, e.g. `8080` or `53/udp`; ports already exposed stay.
+    #[arg(required = true, value_name = "PORT[/udp]", value_parser = parse_port)]
+    pub ports: Vec<Port>,
+    /// Also create a Service named after the sandbox for its exposed ports, and wait
+    /// for its address.
+    #[arg(long)]
+    pub service: bool,
+    #[command(flatten)]
+    pub common: Common,
+}
+
+#[derive(Args)]
+pub struct PortForward {
+    /// Sandbox to forward to.
+    pub sandbox: String,
+    /// `LOCAL:GUEST` port pairs, or `PORT` for the same number on both sides. Any
+    /// TCP port of the guest works; it need not be exposed.
+    #[arg(required = true, value_name = "LOCAL:GUEST")]
+    pub ports: Vec<String>,
+    /// Local addresses to listen on, comma-separated [default: localhost].
+    #[arg(long)]
+    pub address: Option<String>,
     #[command(flatten)]
     pub common: Common,
 }
@@ -339,6 +380,8 @@ pub async fn run(verb: Verb) -> anyhow::Result<ExitCode> {
             }
         }
         Verb::Get(args) => get(&client, &args).await?,
+        Verb::Expose(args) => expose(&client, args).await?,
+        Verb::PortForward(args) => port_forward(&client, args)?,
         Verb::Delete(args) => {
             let ns = namespace(&client, &args.common);
             match args.kind {
@@ -363,7 +406,7 @@ async fn create(client: &Client, args: Create) -> anyhow::Result<()> {
     let ns = namespace(client, &args.common);
     let started = Instant::now();
     let mut labels = BTreeMap::new();
-    let spec = if let Some(from) = &args.from {
+    let mut spec = if let Some(from) = &args.from {
         // A sandbox from a checkpoint carries the checkpoint's labels, so parking and
         // resuming keeps them. The controller waits for a checkpoint that does not
         // exist yet; it has no labels to give.
@@ -377,6 +420,8 @@ async fn create(client: &Client, args: Create) -> anyhow::Result<()> {
     } else {
         json!({"image": args.image, "vcpus": args.vcpus, "memory": args.memory, "disk": args.disk, "ttl": args.ttl})
     };
+    spec["ports"] = json!(args.ports);
+    spec["service"] = json!(args.service);
     labels.extend(args.labels);
     let sandbox = create_sandbox(client, &ns, &args.name, &labels, spec).await?;
     if args.wait.no_wait {
@@ -475,10 +520,20 @@ async fn fork(client: &Client, args: Fork) -> anyhow::Result<()> {
     }
     let mut labels = checkpoint.labels().clone();
     labels.extend(args.labels);
+    // Each fork exposes what the forked sandbox does, on its own pod and Service.
+    let parent = Api::<Sandbox>::namespaced(client.clone(), &ns)
+        .get(&args.sandbox)
+        .await?
+        .spec;
     let names: Vec<String> = (1..=args.count).map(|i| format!("{name}-{i}")).collect();
     let mut sandboxes = Vec::new();
     for sandbox in &names {
-        let spec = json!({"from": {"checkpoint": name}, "clock": args.clock.map(Clock::as_str)});
+        let spec = json!({
+            "from": {"checkpoint": name},
+            "clock": args.clock.map(Clock::as_str),
+            "ports": parent.ports,
+            "service": parent.service,
+        });
         sandboxes.push(create_sandbox(client, &ns, sandbox, &labels, spec).await?);
     }
     if wait {
@@ -561,6 +616,90 @@ async fn get(client: &Client, args: &Get) -> anyhow::Result<()> {
             };
             bail!("no {what} named {} in namespace {ns}", args.name)
         }
+    }
+}
+
+/// Adds ports (and the Service) to a sandbox's exposure; prints what it exposes.
+async fn expose(client: &Client, args: Expose) -> anyhow::Result<()> {
+    let ns = namespace(client, &args.common);
+    let sandboxes = Api::<Sandbox>::namespaced(client.clone(), &ns);
+    let sandbox = sandboxes.get(&args.sandbox).await?;
+    let mut ports = sandbox.spec.ports;
+    for port in args.ports {
+        if !ports
+            .iter()
+            .any(|p| p.port == port.port && p.protocol == port.protocol)
+        {
+            ports.push(port);
+        }
+    }
+    let service = args.service || sandbox.spec.service;
+    // The resource version makes a concurrent change fail rather than be lost.
+    let patch = json!({
+        "metadata": {"resourceVersion": sandbox.metadata.resource_version},
+        "spec": {"ports": ports, "service": service},
+    });
+    sandboxes
+        .patch(&args.sandbox, &PatchParams::default(), &Patch::Merge(patch))
+        .await
+        .with_context(|| format!("exposing ports of sandbox {}", args.sandbox))?;
+    let list = ports
+        .iter()
+        .map(|p| format!("{}/{}", p.port, p.protocol.as_str()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    say(&format!("sandbox {} exposes {list}", args.sandbox))?;
+    if service {
+        let services = Api::<Service>::namespaced(client.clone(), &ns);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let ip = loop {
+            let ip = services
+                .get_opt(&args.sandbox)
+                .await?
+                .and_then(|s| s.spec?.cluster_ip)
+                .filter(|ip| !ip.is_empty());
+            if let Some(ip) = ip {
+                break ip;
+            }
+            if Instant::now() >= deadline {
+                bail!("timed out waiting for service {}", args.sandbox);
+            }
+            tokio::time::sleep(POLL).await;
+        };
+        say(&format!("service {} at {ip}", args.sandbox))?;
+    }
+    Ok(())
+}
+
+/// Runs `kubectl port-forward` to the sandbox's VM pod in place of this process;
+/// returns only if kubectl could not be started.
+fn port_forward(client: &Client, args: PortForward) -> anyhow::Result<()> {
+    let ns = namespace(client, &args.common);
+    let mut kubectl = std::process::Command::new("kubectl");
+    kubectl
+        .args(["port-forward", "--namespace", &ns])
+        .arg(format!("pod/{}", args.sandbox))
+        .args(args.address.map(|a| format!("--address={a}")))
+        .args(args.ports);
+    let error = std::os::unix::process::CommandExt::exec(&mut kubectl);
+    bail!("running kubectl: {error}")
+}
+
+/// `PORT`, `PORT/tcp` or `PORT/udp`.
+fn parse_port(arg: &str) -> Result<Port, String> {
+    let (port, protocol) = arg.split_once('/').unwrap_or((arg, "tcp"));
+    let protocol = match protocol {
+        "tcp" => Protocol::Tcp,
+        "udp" => Protocol::Udp,
+        _ => return Err(format!("{arg}: the protocol is tcp or udp")),
+    };
+    match port.parse() {
+        Ok(port) if port > 0 => Ok(Port {
+            name: None,
+            port,
+            protocol,
+        }),
+        _ => Err(format!("{arg}: a port is 1 to 65535")),
     }
 }
 

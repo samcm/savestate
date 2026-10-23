@@ -21,6 +21,9 @@ enum Command {
     Node(Node),
     /// Run the launcher for one VM (inside its pod; started by the controller).
     Launcher(savestate::launcher::Args),
+    /// Keep the guest's exposed ports in step with the pod (inside a VM pod; started by the launcher).
+    #[command(hide = true)]
+    LauncherPorts(savestate::launcher::ports::Args),
     /// Talk to the guest agent of this pod's VM (inside a VM pod; used by `exec` and `cp`).
     #[command(subcommand, hide = true)]
     Guest(savestate::launcher::guest::Guest),
@@ -57,6 +60,7 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
         Command::Launcher(args) => return savestate::launcher::run(&args),
+        Command::LauncherPorts(args) => return savestate::launcher::ports::run(&args),
         Command::Guest(command) => return savestate::launcher::guest::run(command),
         Command::Verb(verb) => return savestate::cli::main(verb),
         _ => {}
@@ -91,7 +95,10 @@ fn main() -> ExitCode {
                     std::io::stdout().lock().write_all(yaml.as_bytes())?;
                     Ok(())
                 }
-                Command::Launcher(_) | Command::Guest(_) | Command::Verb(_) => Ok(()),
+                Command::Launcher(_)
+                | Command::LauncherPorts(_)
+                | Command::Guest(_)
+                | Command::Verb(_) => Ok(()),
             }
         })
     });

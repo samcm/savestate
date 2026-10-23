@@ -40,7 +40,11 @@ verdict() {
   echo "$EXP | $1 | $2 | $3" >>"$OUT/verdicts.txt"
   log "VERDICT $2: $1 ($3)"
 }
-verdict_header() { md "" "| Check | Verdict | Evidence |" "| --- | --- | --- |"; }
+verdict_header() {
+  md ""
+  md "| Check | Verdict | Evidence |"
+  md "| --- | --- | --- |"
+}
 
 # --- VMs ----------------------------------------------------------------------------
 

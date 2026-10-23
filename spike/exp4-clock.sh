@@ -26,7 +26,7 @@ read_clocks() {
 
 boot exp4-p "$MEM"
 clocksource=$(gexec exp4-p 'cat /sys/devices/system/clocksource/clocksource0/current_clocksource')
-ntp=$(gexec exp4-p 'timedatectl show -p NTP --value 2>/dev/null; systemctl is-active systemd-timesyncd chrony 2>/dev/null | tr "\n" " "' || true)
+ntp=$(gexec exp4-p '{ timedatectl show -p NTP --value; systemctl is-active systemd-timesyncd chrony; } 2>/dev/null | paste -sd" "' || true)
 read_clocks exp4-p
 rt0=$RT mono0=$MONO boot0=$BOOT rtc0=$RTC host0=$HOST
 checkpoint exp4-p "$c" true nocont
@@ -66,7 +66,7 @@ lt() { awk -v a="$(abs "$1")" -v b="$2" 'BEGIN { exit !(a < b) }'; }
 
 md "## Experiment 4: clocks across a ${WAIT} s gap between save and restore (\`-rtc base=utc,clock=vm\`)"
 md ""
-md "Guest clocksource: \`$clocksource\`; time sync in the guest: \`$ntp\`."
+md "Guest clocksource: \`$clocksource\`; time sync in the guest (timedatectl NTP, systemd-timesyncd, chrony): \`$ntp\`."
 md ""
 md "Frozen (plain restore). The guest ran for about $ran s between the two readings; the host advanced $host_el s."
 md ""

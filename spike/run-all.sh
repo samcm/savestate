@@ -27,6 +27,12 @@ mkdir -p "$WORK/layers" "$OUT"
   echo "| KVM nested | $(cat /sys/module/kvm_amd/parameters/nested /sys/module/kvm_intel/parameters/nested 2>/dev/null | head -1) |"
   echo "| QEMU | $(qemu-system-x86_64 --version | head -1); $(cat /etc/qemu-spike-source 2>/dev/null || echo 'source unknown') |"
   echo "| Scratch filesystem | $(df -hT "$WORK" | awk 'NR == 2 { print $2 ", " $5 " free of " $3 }') |"
+  # Raw sequential bandwidth of the scratch disk, for comparison with the save and
+  # restore rates (O_DIRECT, 4 GiB, 4 MiB blocks).
+  w=$(dd if=/dev/zero of="$WORK/dd.test" bs=4M count=1024 oflag=direct 2>&1 | awk -F', ' 'END { print $NF }')
+  r=$(dd if="$WORK/dd.test" of=/dev/null bs=4M iflag=direct 2>&1 | awk -F', ' 'END { print $NF }')
+  rm -f "$WORK/dd.test"
+  echo "| Scratch disk, dd O_DIRECT 4 GiB | write $w, read $r |"
 } >"$OUT/host.md"
 cat "$OUT/host.md"
 

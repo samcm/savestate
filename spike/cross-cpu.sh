@@ -17,6 +17,8 @@
 #   --cpu MODEL       guest CPU model (default EPYC-Rome-v4)
 #   --mem SIZE        guest RAM (default 2G)
 #   --dir DIR         working directory on both hosts (default /var/tmp/savestate-cross-cpu)
+#   --restore-dir DIR working directory on RESTORE_HOST if different (needed when both
+#                     hosts are the same machine, as in the workflow's self-test)
 #   --image PATH      prepared guest image (NAME.qcow2 next to NAME.vmlinuz and
 #                     NAME.initrd, from prepare-guest.sh) on SAVE_HOST, inside DIR when
 #                     QEMU runs in a container (default: built there by
@@ -148,12 +150,13 @@ esac
 
 # --- on the coordinating machine --------------------------------------------------
 
-cpu=EPYC-Rome-v4 mem=2G dir=/var/tmp/savestate-cross-cpu image='' runtime=docker dio=true keep=''
+cpu=EPYC-Rome-v4 mem=2G dir=/var/tmp/savestate-cross-cpu rdir='' image='' runtime=docker dio=true keep=''
 while [ $# -gt 2 ]; do
   case "$1" in
     --cpu) cpu=$2; shift 2 ;;
     --mem) mem=$2; shift 2 ;;
     --dir) dir=$2; shift 2 ;;
+    --restore-dir) rdir=$2; shift 2 ;;
     --image) image=$2; shift 2 ;;
     --runtime) runtime=$2; shift 2 ;;
     --direct-io) dio=$2; shift 2 ;;
@@ -163,43 +166,47 @@ while [ $# -gt 2 ]; do
 done
 [ $# -eq 2 ] || { sed -n '2,/^set -euo/p' "$0" | sed '$d; s/^# \{0,1\}//'; exit 2; }
 save_host=$1 restore_host=$2
+rdir=${rdir:-$dir}
 spike=$(cd "$(dirname "$0")" && pwd)
 
-# on HOST ARGS...: run ARGS in DIR on HOST, inside a fresh QEMU container unless
+# on HOST DIR ARGS...: run ARGS in DIR on HOST, inside a fresh QEMU container unless
 # --runtime host. Only the spike's own commands need QEMU installed first.
 on() {
-  local host=$1
-  shift
+  local host=$1 d=$2
+  shift 2
   local cmd prep=
   cmd=$(printf '%q ' "$@")
   [ "$1" = ./cross-cpu.sh ] && prep='./install-qemu.sh >&2 && '
   case "$runtime" in
-    host) ssh "$host" "cd $(printf %q "$dir") && $cmd" ;;
+    host) ssh "$host" "cd $(printf %q "$d") && $cmd" ;;
     docker | podman)
-      ssh "$host" "sudo $runtime run --rm -i --privileged -v $(printf %q "$dir:$dir") -w $(printf %q "$dir") \
+      ssh "$host" "sudo $runtime run --rm -i --privileged -v $(printf %q "$d:$d") -w $(printf %q "$d") \
         $IMAGE_REF bash -c $(printf %q "$prep$cmd")" ;;
     *) echo "unknown runtime $runtime" >&2; exit 2 ;;
   esac
 }
 
-for h in "$save_host" "$restore_host"; do
-  echo "== copying the spike scripts to $h:$dir"
-  tar -C "$spike" -cf - "${FILES[@]}" | ssh "$h" "mkdir -p $(printf %q "$dir") && tar -C $(printf %q "$dir") -xf -"
+for hd in "$save_host $dir" "$restore_host $rdir"; do
+  read -r h d <<<"$hd"
+  echo "== copying the spike scripts to $h:$d"
+  tar -C "$spike" -cf - "${FILES[@]}" | ssh "$h" "mkdir -p $(printf %q "$d") && tar -C $(printf %q "$d") -xf -"
   echo "== $h: can it run -cpu $cpu,enforce?"
-  on "$h" ./cross-cpu.sh _probe "$cpu"
+  on "$h" "$d" ./cross-cpu.sh _probe "$cpu"
 done
 
 echo "== saving on $save_host"
-on "$save_host" ./cross-cpu.sh _save "$dir" "$mem" "$cpu" "$dio" "$image"
+on "$save_host" "$dir" ./cross-cpu.sh _save "$dir" "$mem" "$cpu" "$dio" "$image"
 
 echo "== streaming the checkpoint (RAM file and layer chain) $save_host -> $restore_host"
-on "$save_host" tar -C work -cSf - ckpt/xc layers | on "$restore_host" bash -c 'mkdir -p work && tar -C work -xSf -'
+on "$save_host" "$dir" tar -C work -cSf - ckpt/xc layers |
+  on "$restore_host" "$rdir" bash -c 'mkdir -p work && tar -C work -xSf -'
 
 echo "== restoring on $restore_host"
 status=0
-on "$restore_host" ./cross-cpu.sh _restore "$dir" "$dio" || status=$?
+on "$restore_host" "$rdir" ./cross-cpu.sh _restore "$rdir" "$dio" || status=$?
 
 if [ -z "$keep" ]; then
-  for h in "$save_host" "$restore_host"; do on "$h" rm -rf work out || true; done
+  on "$save_host" "$dir" rm -rf work out || true
+  on "$restore_host" "$rdir" rm -rf work out || true
 fi
 exit "$status"

@@ -1,0 +1,22 @@
+[workspace]
+resolver = "3"
+members = ["crates/savestate", "crates/savestate-api"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/samcm/savestate"
+rust-version = "1.90"
+publish = false
+
+[workspace.dependencies]
+savestate-api = { path = "crates/savestate-api" }
+
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"

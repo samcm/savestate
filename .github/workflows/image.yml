@@ -1,0 +1,89 @@
+# Container image ghcr.io/samcm/savestate from build.yml's artifacts (same run).
+# ci.yml builds and smoke-tests it; publish.yml pushes :main and :sha-<short> from
+# main, release.yml pushes :vX.Y.Z and :latest from tags.
+name: image
+
+on:
+  workflow_call:
+    inputs:
+      push:
+        type: boolean
+        required: true
+      artifact:
+        description: Upload the amd64 image (docker save) as artifact image-amd64.
+        type: boolean
+        default: false
+
+# Permissions come from the caller; only publish.yml and release.yml grant packages: write.
+
+jobs:
+  image:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      IMAGE: ghcr.io/${{ github.repository }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: savestate-*
+          path: artifacts
+      - name: Arrange build context
+        run: |
+          install -D artifacts/savestate-x86_64-unknown-linux-musl/savestate context/amd64/savestate
+          install -D artifacts/savestate-aarch64-unknown-linux-musl/savestate context/arm64/savestate
+      - id: meta
+        name: Tags
+        run: |
+          case "$GITHUB_REF" in
+            refs/tags/v*) tags="$IMAGE:$GITHUB_REF_NAME,$IMAGE:latest" ;;
+            refs/heads/main) tags="$IMAGE:main,$IMAGE:sha-${GITHUB_SHA::7}" ;;
+            *) tags= ;;
+          esac
+          echo "tags=$tags" >>"$GITHUB_OUTPUT"
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+        with:
+          platforms: arm64
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Build amd64 for the smoke test
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: context
+          file: Dockerfile
+          platforms: linux/amd64
+          load: true
+          tags: savestate:smoke
+          cache-from: type=gha
+      - name: Smoke test
+        run: |
+          docker run --rm savestate:smoke --version
+          docker run --rm --entrypoint sh savestate:smoke -c \
+            'qemu-system-x86_64 --version && qemu-img --version && ip -V && nft --version'
+      - if: inputs.artifact
+        run: docker save savestate:smoke | zstd -T0 -q -o image-amd64.tar.zst
+      - if: inputs.artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: image-amd64
+          path: image-amd64.tar.zst
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 3
+      - if: inputs.push
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Build linux/amd64 and linux/arm64
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: context
+          file: Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: ${{ inputs.push }}
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

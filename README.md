@@ -42,13 +42,15 @@ the same static `savestate` binary.
 │ TTL, transfers     │           ┌────────────┴─────────────┐
 └────────────────────┘           │ savestate node           │
                                  │ (DaemonSet): layer store,│
-                                 │ images, GC, transfers    │
+                                 │ images, GC, transfers,   │
+                                 │ device plugin, seccomp   │
                                  └────────────┬─────────────┘
                                    unix socket│
 ┌─────────────────────────────────────────────▼──────────────┐
-│ VM pod (Guaranteed): savestate launcher → qemu (QMP)       │
-│ no service-account token · /dev/kvm, /dev/net/tun,         │
-│ /dev/vhost-vsock                                           │
+│ VM pod (Guaranteed, not privileged): savestate launcher →  │
+│ qemu (QMP) · no service-account token · /dev/kvm,          │
+│ /dev/net/tun, /dev/vhost-vsock from the node agent's       │
+│ device plugin · seccomp profile savestate/vm.json          │
 │ tap + nftables NAT inside the pod's network namespace      │
 │        └─ vsock ─▶ savestate-guest (exec, files, fixups)    │
 └────────────────────────────────────────────────────────────┘

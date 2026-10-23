@@ -22,6 +22,7 @@ on:
   pull_request:
     paths:
       - "spike/**"
+      - "!spike/RESULTS.md"
       - ".github/workflows/spike.yml"
 
 permissions:

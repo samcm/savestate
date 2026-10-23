@@ -52,7 +52,9 @@ KERNEL_ERRORS='dmesg --level=emerg,alert,crit,err | wc -l'
 
 inner_setup() {
   dir=$1
-  export WORK=$dir/work OUT=$dir/out EXP=$2 PREFIX=xc-none-
+  # A NIC with a live peer: on an empty hub the guest's transmit queue stalls and the
+  # kernel logs watchdog errors that have nothing to do with the restore.
+  export WORK=$dir/work OUT=$dir/out EXP=$2 PREFIX=xc-none- NET=tap
   # shellcheck source=spike/lib.sh
   source "$dir/lib.sh"
   trap 'for p in "$WORK"/vm/*/pid; do [ -f "$p" ] && kill -9 "$(cat "$p")" 2>/dev/null; done; true' EXIT

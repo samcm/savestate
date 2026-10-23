@@ -17,6 +17,7 @@ pub mod cli;
 pub mod controller;
 pub mod launcher;
 pub mod node;
+pub mod telemetry;
 
 use std::path::Path;
 

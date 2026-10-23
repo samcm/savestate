@@ -108,6 +108,9 @@ async fn crds_accept_what_works_and_refuse_what_cannot() {
     let status = CheckpointStatus {
         phase: CheckpointPhase::Ready,
         nodes: vec!["node-a".into(), "node-b".into()],
+        vcpus: Some(4),
+        memory: Some(quantity("8Gi")),
+        disk: Some(quantity("60Gi")),
         memory_bytes: Some(8 << 30),
         disk_bytes: Some(1 << 30),
         guest_time: Some(Time("2026-01-02T03:04:05Z".parse().unwrap())),

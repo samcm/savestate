@@ -1,5 +1,4 @@
-use std::io::Write;
-use std::path::PathBuf;
+use std::{io::Write, net::SocketAddr, path::PathBuf};
 
 use clap::{Args, Parser, Subcommand};
 
@@ -17,7 +16,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Run the controller (one replica per cluster).
-    Controller(ConfigPath),
+    Controller(Controller),
     /// Run the node agent (one per node, as a `DaemonSet`).
     Node(ConfigPath),
     /// Run the launcher for one VM (inside its pod; started by the controller).
@@ -39,10 +38,23 @@ struct ConfigPath {
     config: PathBuf,
 }
 
-fn main() -> anyhow::Result<()> {
+#[derive(Args)]
+struct Controller {
+    #[command(flatten)]
+    config: ConfigPath,
+    /// Address serving Prometheus metrics at `/metrics`.
+    #[arg(long, env = "SAVESTATE_METRICS_LISTEN", default_value = "0.0.0.0:9090")]
+    metrics_listen: SocketAddr,
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
     match Cli::parse().command {
         Command::Controller(args) => {
-            savestate::controller::run(savestate::load_config(&args.config)?)
+            let config = savestate::load_config(&args.config.config)?;
+            savestate::telemetry::init_logging();
+            savestate::telemetry::init_metrics(args.metrics_listen)?;
+            savestate::controller::run(config).await
         }
         Command::Node(args) => savestate::node::run(savestate::load_config(&args.config)?),
         Command::Launcher => savestate::launcher::run(),

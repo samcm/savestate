@@ -274,6 +274,10 @@ spec:
             description: Written by the node agent holding the checkpoint.
             nullable: true
             properties:
+              disk:
+                description: Disk size of the checkpointed VM; sandboxes started from it get the same.
+                nullable: true
+                x-kubernetes-int-or-string: true
               diskBytes:
                 description: |-
                   Bytes of the disk layer this checkpoint adds; layers it shares with its
@@ -313,6 +317,10 @@ spec:
                 format: date-time
                 nullable: true
                 type: string
+              memory:
+                description: Guest RAM of the checkpointed VM; sandboxes started from it get the same.
+                nullable: true
+                x-kubernetes-int-or-string: true
               memoryBytes:
                 description: Bytes the RAM file occupies on disk (it is sparse).
                 format: int64
@@ -340,6 +348,12 @@ spec:
                 - Ready
                 - Failed
                 type: string
+              vcpus:
+                description: Virtual CPUs of the checkpointed VM; sandboxes started from it get the same.
+                format: int32
+                minimum: 0.0
+                nullable: true
+                type: integer
             type: object
         required:
         - spec

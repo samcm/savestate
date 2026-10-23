@@ -1,4 +1,4 @@
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
+use k8s_openapi::apimachinery::pkg::{api::resource::Quantity, apis::meta::v1::Time};
 use kube::{CustomResource, KubeSchema};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -77,6 +77,19 @@ pub struct CheckpointStatus {
     /// Every node holding a complete copy.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub nodes: Vec<String>,
+
+    /// Virtual CPUs of the checkpointed VM; sandboxes started from it get the same.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("format" = "int32"))]
+    pub vcpus: Option<u32>,
+
+    /// Guest RAM of the checkpointed VM; sandboxes started from it get the same.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<Quantity>,
+
+    /// Disk size of the checkpointed VM; sandboxes started from it get the same.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk: Option<Quantity>,
 
     /// Bytes the RAM file occupies on disk (it is sparse).
     #[serde(default, skip_serializing_if = "Option::is_none")]

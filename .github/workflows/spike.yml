@@ -1,0 +1,83 @@
+name: spike
+
+# Phase 0: measure the QEMU mechanics in docs/design.md on real KVM. GitHub-hosted
+# runners are VMs with /dev/kvm (nested). QEMU runs in a Debian 13 container; see
+# spike/RESULTS.md. Results land in the job summary and the spike-results artifact.
+on:
+  workflow_dispatch:
+    inputs:
+      experiments:
+        description: "Experiments to run, space separated (empty: all)"
+        required: false
+        default: ""
+      exp1_mem:
+        description: "Guest RAM for experiment 1"
+        required: false
+        default: "8G"
+      clock_wait:
+        description: "Seconds between save and restore in experiment 4"
+        required: false
+        default: "60"
+  pull_request:
+    paths:
+      - "spike/**"
+      - ".github/workflows/spike.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: spike-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  spike:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      EXPERIMENTS: ${{ inputs.experiments }}
+      EXP1_MEM: ${{ inputs.exp1_mem || '8G' }}
+      CLOCK_WAIT: ${{ inputs.clock_wait || '60' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Enable /dev/kvm
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          sudo udevadm settle
+          ls -l /dev/kvm || { echo "::error::This runner has no /dev/kvm"; exit 1; }
+      - name: Scratch space
+        # The RAM files for an 8 GiB guest need about 20 GB; use the larger of / and /mnt.
+        run: |
+          df -hT / /mnt || true
+          root=$(df --output=avail -B1 / | tail -1)
+          mnt=$(df --output=avail -B1 /mnt 2>/dev/null | tail -1 || echo 0)
+          if [ "${mnt:-0}" -gt "$root" ]; then dir=/mnt/spike; else dir=$RUNNER_TEMP/spike; fi
+          sudo mkdir -p "$dir"
+          echo "SCRATCH=$dir" >>"$GITHUB_ENV"
+          lscpu | grep -E 'Model name|^CPU\(s\)|Virtualization'
+          free -g
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: guest-image
+          key: spike-guest-${{ hashFiles('spike/prepare-guest.sh') }}
+      - name: Run the experiments
+        run: |
+          mkdir -p guest-image
+          docker run --rm --privileged -v "$PWD:/repo" -v "$SCRATCH:/work" -w /repo \
+            -e GUEST_IMAGE=/repo/guest-image/base.qcow2 -e EXP1_MEM -e CLOCK_WAIT -e EXPERIMENTS \
+            debian:trixie@sha256:4c25275446ca371766b8b093c696782eabce06263fccacb8d5d813b3dc44b308 \
+            bash -c 'spike/install-qemu.sh && spike/run-all.sh /work /repo/spike-out $EXPERIMENTS'
+      - name: Summary
+        if: always()
+        run: |
+          cat spike-out/results.md >>"$GITHUB_STEP_SUMMARY" || true
+          sudo chown -R "$(id -u)" spike-out guest-image || true
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: spike-results
+          path: spike-out

@@ -238,6 +238,12 @@ Transfers are not created yet (phase 4).
 `ttl.<kind>.default`, capped at `ttl.<kind>.max` (which also applies to objects with
 no TTL). An `Expired` event records it.
 
+**Checkpoints that cannot start.** A `Pending` checkpoint whose sandbox does not
+exist, is being deleted or is not `Running` (read fresh from the API server) is
+marked `Failed` with a message and a `Failed` event; the apply carries the
+checkpoint's resource version, so it loses to a node agent that has taken the
+checkpoint meanwhile. The node agent on the sandbox's node takes the rest.
+
 **Checkpoint finalizer.** Every Checkpoint carries the finalizer
 `savestate.dev/in-use`. While it is being deleted, the controller removes the
 finalizer only once no Sandbox has `spec.from.checkpoint` naming it or a checkpoint
@@ -249,7 +255,7 @@ node agent removes the checkpoint's files.
 
 | Who | Writes |
 | --- | --- |
-| Controller | VM pods; Sandbox `status` (all of it); TTL deletions; the Checkpoint finalizer; later Transfers |
+| Controller | VM pods; Sandbox `status` (all of it); TTL deletions; the Checkpoint finalizer; `Failed` on Checkpoints that cannot start; later Transfers |
 | Node agent | Checkpoint `status` (`phase`, `nodes`, `vcpus`, `memory`, `disk`, sizes, `guestTime`, `parent`, `fingerprint`, `message`); Transfer `status`; files under `stateDir`; removes run directories of sandboxes that are gone |
 | Launcher | listens on `/run/savestate/launcher.sock` in its pod (the run directory on the host); creates `/run/savestate/ready` once the VM runs and never removes it while the VM lives. A readiness probe (`test -e /run/savestate/ready`, every 2 s) turns that into the pod's Ready condition, which the controller reads. It exits non-zero when QEMU fails. |
 

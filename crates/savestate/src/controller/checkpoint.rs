@@ -1,11 +1,11 @@
-//! Checkpoint TTLs, and the finalizer that keeps a checkpoint while a sandbox's
-//! disk still builds on it.
+//! Checkpoint TTLs, checkpoints that cannot start, and the finalizer that keeps a
+//! checkpoint while a sandbox's disk still builds on it.
 
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
 use kube::{
     Api, ResourceExt,
-    api::ListParams,
+    api::{ListParams, Patch, PatchParams},
     runtime::{
         Controller,
         controller::Action,
@@ -15,7 +15,8 @@ use kube::{
         watcher,
     },
 };
-use savestate_api::{Checkpoint, Sandbox};
+use savestate_api::{Checkpoint, CheckpointPhase, Sandbox, SandboxPhase};
+use serde_json::json;
 
 use super::{Context, Error};
 
@@ -30,15 +31,20 @@ pub(super) async fn run(ctx: Arc<Context>, namespace: String) {
         watcher::Config::default(),
     );
     let checkpoints = controller.store();
-    // A sandbox going away may release checkpoints waiting to be deleted.
+    // A sandbox going away may release checkpoints waiting to be deleted, and a
+    // sandbox that is gone or stops running fails the checkpoints still waiting for it.
     let controller = controller.watches(
         Api::<Sandbox>::namespaced(client, &namespace),
         watcher::Config::default(),
-        move |_| {
+        move |sandbox| {
+            let name = sandbox.name_any();
             checkpoints
                 .state()
                 .into_iter()
-                .filter(|checkpoint| checkpoint.metadata.deletion_timestamp.is_some())
+                .filter(|checkpoint| {
+                    checkpoint.metadata.deletion_timestamp.is_some()
+                        || (pending(checkpoint) && checkpoint.spec.sandbox == name)
+                })
                 .map(|checkpoint| ObjectRef::from_obj(&*checkpoint))
                 .collect::<Vec<_>>()
         },
@@ -78,7 +84,77 @@ async fn expire(
         super::expire(ctx, checkpoints, checkpoint, "checkpoint").await?;
         return Ok(Action::await_change());
     }
+    if pending(checkpoint) {
+        refuse(ctx, checkpoints, checkpoint).await?;
+    }
     Ok(super::requeue(left))
+}
+
+/// Not yet taken up by a node agent.
+fn pending(checkpoint: &Checkpoint) -> bool {
+    checkpoint
+        .status
+        .as_ref()
+        .is_none_or(|status| status.phase == CheckpointPhase::Pending)
+}
+
+/// Fails a pending checkpoint whose sandbox is missing, being deleted or not
+/// `Running`: no node agent will ever take it. The node agent of a running
+/// sandbox's node takes the others.
+async fn refuse(
+    ctx: &Context,
+    checkpoints: &Api<Checkpoint>,
+    checkpoint: &Checkpoint,
+) -> Result<(), Error> {
+    let name = &checkpoint.spec.sandbox;
+    let namespace = checkpoint.namespace().unwrap_or_default();
+    // Fresh from the API: a stale cache could fail a checkpoint of a sandbox that has
+    // just started running.
+    let sandbox = Api::<Sandbox>::namespaced(ctx.client.clone(), &namespace)
+        .get_opt(name)
+        .await?;
+    let message = match sandbox {
+        None => format!("sandbox {name} does not exist"),
+        Some(sandbox) if sandbox.metadata.deletion_timestamp.is_some() => {
+            format!("sandbox {name} is being deleted")
+        }
+        Some(sandbox) => match sandbox.status.map(|status| status.phase) {
+            Some(SandboxPhase::Running) => return Ok(()),
+            phase => format!(
+                "sandbox {name} is {:?}, not Running",
+                phase.unwrap_or_default()
+            ),
+        },
+    };
+    // Only while still Pending: the resource version fails the patch if a node agent
+    // has taken the checkpoint meanwhile.
+    let patch = json!({
+        "apiVersion": "savestate.dev/v1alpha1",
+        "kind": "Checkpoint",
+        "metadata": {"resourceVersion": checkpoint.metadata.resource_version},
+        "status": {"phase": "Failed", "message": message},
+    });
+    match checkpoints
+        .patch_status(
+            &checkpoint.name_any(),
+            &PatchParams::apply(super::MANAGER).force(),
+            &Patch::Apply(patch),
+        )
+        .await
+    {
+        Ok(_) => {}
+        // Changed meanwhile; the change is reconciled next.
+        Err(kube::Error::Api(status)) if status.code == 409 => return Ok(()),
+        Err(error) => return Err(error.into()),
+    }
+    tracing::info!(
+        namespace,
+        name = checkpoint.name_any(),
+        message,
+        "checkpoint failed"
+    );
+    super::publish(ctx, checkpoint, EventType::Warning, "Failed", message).await;
+    Ok(())
 }
 
 /// Succeeds, letting the deletion finish, once no sandbox starts from this

@@ -50,7 +50,7 @@ k8s-openapi = { version = "0.28", features = ["v1_36", "schemars"] }
 kube = { version = "4.2", default-features = false }
 schemars = "1"
 serde = { version = "1", features = ["derive"] }
-serde-saphyr = "0.0.29" # the version kube-client uses, so the binary has one YAML library
+serde-saphyr = "2.0.0" # the version kube-client uses, so the binary has one YAML library
 serde_json = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

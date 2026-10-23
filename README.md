@@ -71,12 +71,15 @@ the same static `savestate` binary.
   it. Every running sandbox costs its full memory size.
 
 ```sh
-savestate create web-1 --image ghcr.io/example/base@sha256:…
+savestate create web-1 --image ghcr.io/example/base@sha256:… \
+  --vcpus 4 --memory 8Gi --disk 60Gi --label team=a   # waits until it runs
 savestate exec web-1 -- make build
 savestate fork web-1 -n 3        # one checkpoint, three new sandboxes
-savestate checkpoint web-1 --name web-1-parked
+savestate list sandboxes -l team=a
+savestate checkpoint web-1 --name web-1-parked       # keeps web-1's labels
 savestate delete sandbox web-1
-savestate create web-1 --from web-1-parked
+savestate create web-1 --from web-1-parked           # and so does the sandbox
+savestate get web-1 -o json
 ```
 
 ## Build

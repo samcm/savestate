@@ -57,7 +57,7 @@ Keep these from the base:
 
 ## Host contract
 
-QEMU boots the kernel with `-kernel bzImage -append "console=ttyS0 root=/dev/vda rw"`
+QEMU boots the kernel with `-kernel bzImage -append "console=ttyS0 root=/dev/vda rw net.ifnames=0"`
 (add `systemd.hostname=<name>` to name a fresh sandbox) and these guest devices:
 
 | Device | Why |

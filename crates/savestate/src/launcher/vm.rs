@@ -38,8 +38,10 @@ const QEMU: &str = "qemu-system-x86_64";
 /// `vm.cpuModel` that gives guests the node's own CPU.
 const HOST_CPU: &str = "host";
 const QEMU_IMG: &str = "qemu-img";
-/// The guest kernel's command line (the guest contract in `guest/README.md`).
-const KERNEL_CMDLINE: &str = "console=ttyS0 root=/dev/vda rw";
+/// The guest kernel's command line (the guest contract in `guest/README.md`). No
+/// interface renaming: udev renaming the NIC while the launcher configures it fails
+/// the boot.
+const KERNEL_CMDLINE: &str = "console=ttyS0 root=/dev/vda rw net.ifnames=0";
 /// multifd channels writing and reading the memory file.
 const MULTIFD_CHANNELS: u8 = 8;
 /// Migration bandwidth limit for saves, bytes/s: far above any disk's write rate.

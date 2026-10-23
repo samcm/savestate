@@ -1,0 +1,8 @@
+# The controller and the node agents. The node agent mounts the state directory
+# from the host, which only the privileged Pod Security level allows.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: savestate-system
+  labels:
+    pod-security.kubernetes.io/enforce: privileged

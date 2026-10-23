@@ -1,0 +1,29 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+# The savestate install with placeholder values. Use it from an overlay that
+# supplies your installation's values; see deploy/README.md.
+resources:
+  - ../crds
+  - namespace.yaml
+  - rbac.yaml
+  - controller.yaml
+  - node.yaml
+  - sandboxes.yaml
+
+configMapGenerator:
+  - name: savestate-config
+    namespace: savestate-system
+    files:
+      - config.yaml
+
+labels:
+  - pairs:
+      app.kubernetes.io/name: savestate
+      app.kubernetes.io/part-of: savestate
+    includeSelectors: false
+
+images:
+  # Pin by digest in your overlay: checkpoints record the launcher image they were
+  # taken with and restore only on it.
+  - name: ghcr.io/samcm/savestate
+    newTag: main

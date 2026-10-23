@@ -1,0 +1,128 @@
+# Least privilege per role. Everything about sandboxes is granted per sandbox
+# namespace through RoleBindings (see sandboxes.yaml); the only cluster-wide grant is
+# the controller reading nodes for placement.
+#
+#   controller  writes Sandbox status, creates VM pods and Transfers, enforces TTLs
+#               and finalizers.
+#   node agent  reads everything about the sandboxes on its node and writes
+#               Checkpoint and Transfer status.
+#   VM pods     no service-account token and no permissions at all.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: savestate-controller
+  namespace: savestate-system
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: savestate-node
+  namespace: savestate-system
+---
+# Bound in each sandbox namespace.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: savestate-controller
+rules:
+  - apiGroups: [savestate.dev]
+    resources: [sandboxes, checkpoints]
+    verbs: [get, list, watch, update, patch, delete]
+  - apiGroups: [savestate.dev]
+    resources: [transfers]
+    verbs: [get, list, watch, create, update, patch, delete]
+  - apiGroups: [savestate.dev]
+    resources: [sandboxes/status, checkpoints/status, transfers/status]
+    verbs: [get, update, patch]
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [get, list, watch, create, delete]
+  - apiGroups: [events.k8s.io]
+    resources: [events]
+    verbs: [create, patch]
+---
+# Cluster-wide: which nodes exist and what fits on them.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: savestate-controller-nodes
+rules:
+  - apiGroups: [""]
+    resources: [nodes]
+    verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: savestate-controller-nodes
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: savestate-controller-nodes
+subjects:
+  - kind: ServiceAccount
+    name: savestate-controller
+    namespace: savestate-system
+---
+# The controller reads its own pod to learn the image digest it runs, the default
+# launcher image.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: savestate-controller
+  namespace: savestate-system
+rules:
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: savestate-controller
+  namespace: savestate-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: savestate-controller
+subjects:
+  - kind: ServiceAccount
+    name: savestate-controller
+    namespace: savestate-system
+---
+# Bound in each sandbox namespace.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: savestate-node
+rules:
+  - apiGroups: [savestate.dev]
+    resources: [sandboxes, checkpoints, transfers]
+    verbs: [get, list, watch]
+  - apiGroups: [savestate.dev]
+    resources: [checkpoints/status, transfers/status]
+    verbs: [get, update, patch]
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [get, list, watch]
+  - apiGroups: [events.k8s.io]
+    resources: [events]
+    verbs: [create, patch]
+---
+# For people and tools using sandboxes; bind it in sandbox namespaces to whoever
+# your installation chooses. It deliberately grants no pod creation: sandbox
+# namespaces allow privileged pods.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: savestate-user
+rules:
+  - apiGroups: [savestate.dev]
+    resources: [sandboxes, checkpoints, transfers]
+    verbs: [get, list, watch, create, update, patch, delete]
+  - apiGroups: [""]
+    resources: [pods, pods/log]
+    verbs: [get, list, watch]
+  - apiGroups: [""]
+    resources: [pods/exec]
+    verbs: [get, create]

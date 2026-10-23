@@ -68,6 +68,45 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo test --workspace --locked
+      - name: deploy/crds is what `savestate crds` generates
+        run: |
+          cargo run -q -p savestate --locked -- crds >"$RUNNER_TEMP/crds.yaml"
+          diff -u deploy/crds/savestate.dev.yaml "$RUNNER_TEMP/crds.yaml" || {
+            echo "::error::deploy/crds/savestate.dev.yaml is stale: cargo run -p savestate -- crds > deploy/crds/savestate.dev.yaml"
+            exit 1
+          }
+
+  # The CRDs and the install manifests on a real API server (kind), on the oldest
+  # and the newest Kubernetes savestate supports. The CRD test is #[ignore]d
+  # locally because it needs a cluster.
+  api:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        node:
+          - kindest/node:v1.34.11@sha256:44e222ee2132dab25ff87301682f89eb82c7880ea3a1bf543bfe9708fd08d67d
+          - kindest/node:v1.37.0@sha256:a1ed56cfb0e7b93589bdf97c8cd566405a265939e3620fc4f5de89adff580ae5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install stable --profile minimal && rustup default stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: api
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo test -p savestate-api --locked --test apiserver --no-run
+      - name: Start a kind cluster
+        run: |
+          curl -fsSLo kind https://github.com/kubernetes-sigs/kind/releases/download/v0.33.0/kind-linux-amd64
+          echo "aee6151561422756b764a4ae28e7f44cda5af5a9eead3cc9985112b1de8d8e0d  kind" | sha256sum -c
+          sudo install kind /usr/local/bin/kind
+          kind create cluster --image "${{ matrix.node }}" --wait 2m
+      - name: The kustomize base applies
+        run: kubectl apply -k deploy/base
+      - run: cargo test -p savestate-api --locked --test apiserver -- --ignored
 
   build:
     uses: ./.github/workflows/build.yml
@@ -81,7 +120,8 @@ jobs:
 
   # Real VMs on GitHub-hosted runners: ephemeral VMs with /dev/kvm and no secrets, so
   # pull requests run here too. Every test marked #[ignore] (the ones that need
-  # /dev/kvm) runs inside the image built above, so it tests the shipped QEMU.
+  # /dev/kvm; not the API server test, which the api job runs) runs inside the image
+  # built above, so it tests the shipped QEMU.
   kvm:
     needs: [build, image]
     runs-on: ubuntu-24.04
@@ -124,7 +164,7 @@ jobs:
           CARGO_PROFILE_DEV_DEBUG: "0"
         run: |
           cargo test --workspace --locked --target x86_64-unknown-linux-musl --no-run --message-format=json |
-            jq -r 'select(.profile.test == true and .executable != null) | .executable' >tests.txt
+            jq -r 'select(.profile.test == true and .executable != null and .target.name != "apiserver") | .executable' >tests.txt
           cat tests.txt
       - name: Run the ignored tests in the image
         run: |
@@ -134,11 +174,11 @@ jobs:
   # Single required status check for branch rules and auto-merge.
   ci-ok:
     if: always()
-    needs: [fmt, deny, clippy, test, build, image, kvm]
+    needs: [fmt, deny, clippy, test, api, build, image, kvm]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
       - name: All CI jobs succeeded
         run: test "$RESULTS" = "success"
         env:
-          RESULTS: ${{ join(needs.*.result, ' ') == 'success success success success success success success' && 'success' || 'failure' }}
+          RESULTS: ${{ join(needs.*.result, ' ') == 'success success success success success success success success' && 'success' || 'failure' }}

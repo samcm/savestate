@@ -11,3 +11,5 @@ publish.workspace = true
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+savestate-api.workspace = true
+serde-saphyr.workspace = true

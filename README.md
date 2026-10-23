@@ -8,7 +8,8 @@ Save a running VM, then start as many copies of that exact moment as you like, o
 Kubernetes.
 
 > **Early: not usable yet.** The binary parses its commands and stops there. The
-> design is in [docs/design.md](docs/design.md), which is the detailed reference.
+> design is in [docs/design.md](docs/design.md), which is the detailed reference; the
+> CRDs and install manifests are in [deploy/](deploy).
 
 ## Why
 

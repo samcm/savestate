@@ -5,6 +5,6 @@
 //! only component on a node that holds API credentials.
 
 /// Run the node agent until shutdown.
-pub fn run() -> anyhow::Result<()> {
+pub fn run(_config: savestate_api::Config) -> anyhow::Result<()> {
     Err(crate::not_implemented("node"))
 }

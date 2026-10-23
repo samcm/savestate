@@ -30,16 +30,17 @@ pub struct Create {
     /// Checkpoint to start from; image, vCPUs, memory and disk come from it.
     #[arg(long)]
     pub from: Option<String>,
-    #[arg(long)]
+    /// Virtual CPUs (with `--image`).
+    #[arg(long, required_unless_present = "from", conflicts_with = "from")]
     pub vcpus: Option<u32>,
-    /// Guest memory, e.g. `8Gi`.
-    #[arg(long)]
+    /// Guest memory, e.g. `8Gi` (with `--image`).
+    #[arg(long, required_unless_present = "from", conflicts_with = "from")]
     pub memory: Option<String>,
-    /// Disk size, e.g. `60Gi`.
-    #[arg(long)]
+    /// Disk size, e.g. `60Gi` (with `--image`).
+    #[arg(long, required_unless_present = "from", conflicts_with = "from")]
     pub disk: Option<String>,
     /// Guest clock after starting from a checkpoint (with `--from`) [default: frozen].
-    #[arg(long, value_enum)]
+    #[arg(long, value_enum, requires = "from")]
     pub clock: Option<Clock>,
     /// Delete the sandbox after this long, e.g. `7d`.
     #[arg(long)]

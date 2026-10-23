@@ -1,0 +1,57 @@
+# One sandbox namespace, `sandboxes`. Repeat this file for each namespace listed
+# in the installation config's `namespaces`.
+#
+# VM pods need /dev/kvm and /dev/net/tun, NET_ADMIN inside their own network
+# namespace for the tap device and nftables, and the state directory from the host.
+# That is the privileged Pod Security level, so keep sandbox namespaces for sandboxes
+# only and give people the savestate-user role there, never pod creation. The
+# controller builds every VM pod with no service-account token, QEMU as non-root
+# with its seccomp sandbox on, and a Guaranteed memory request.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: sandboxes
+  labels:
+    pod-security.kubernetes.io/enforce: privileged
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: savestate-controller
+  namespace: sandboxes
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: savestate-controller
+subjects:
+  - kind: ServiceAccount
+    name: savestate-controller
+    namespace: savestate-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: savestate-node
+  namespace: sandboxes
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: savestate-node
+subjects:
+  - kind: ServiceAccount
+    name: savestate-node
+    namespace: savestate-system
+---
+# Nothing connects to a VM pod over the network: exec and file copy go through
+# the kubelet, and the node agent drives the launcher over a unix socket. Guest
+# egress is filtered by nftables inside the pod.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: savestate-vm-no-ingress
+  namespace: sandboxes
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: vm
+  policyTypes: [Ingress]

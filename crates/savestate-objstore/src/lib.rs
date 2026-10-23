@@ -7,6 +7,7 @@
 //! <prefix>/files/<path>/index.json    size, data extents, chunk digests; written last
 //! <prefix>/exports/<id>.json          an export in progress: the files it references
 //! <prefix>/manifests/<id>.json        the checkpoint's manifest and files; written last
+//! <prefix>/collections/<pass>.json    a garbage collection that may be deleting
 //! ```
 //!
 //! `<path>` is a file's path relative to the state directory, which names one
@@ -43,11 +44,16 @@ pub const CHUNK: u64 = 16 << 20;
 /// Chunks moving at once per export or download.
 const PARALLEL: usize = 16;
 
-/// How long after writing its export record an export trusts that objects already
-/// in the store stay there. Longer than [`COLLECT_DEADLINE`] plus a request's
-/// timeout: a collection that listed the records before this one existed has
-/// stopped deleting by then.
+/// The longest an export waits, after writing its export record, for collections
+/// that were running then to finish before it trusts objects already in the store.
+/// Longer than [`COLLECT_DEADLINE`] plus a request's timeout: a collection that
+/// listed the records before the export's existed has stopped deleting by then,
+/// even one that never removes its marker.
 pub const SETTLE: Duration = Duration::from_secs(30);
+
+/// A collection's marker written this many seconds, by the store's clock, before a
+/// new collection's is left over from one that failed, and is removed.
+const STALE_COLLECTION_SECS: i64 = 600;
 
 /// How long after it starts listing records a collection may still delete files.
 pub const COLLECT_DEADLINE: Duration = Duration::from_secs(10);
@@ -287,8 +293,9 @@ impl Remote {
             },
         )
         .await?;
-        // Until now a collection may still be deleting what this export would reuse.
-        tokio::time::sleep(SETTLE).await;
+        // A collection running now may have listed the records before this one and
+        // still be deleting what this export would reuse; later ones see it.
+        self.wait_for_collections().await?;
 
         for (path, (file, layout)) in files.iter().zip(local) {
             let file_moved = self
@@ -309,6 +316,29 @@ impl Remote {
         .await?;
         self.data.delete(&record).await?;
         Ok(moved)
+    }
+
+    /// Waits until the collections whose markers are in the store now have finished
+    /// (removed their markers), at most [`SETTLE`].
+    async fn wait_for_collections(&self) -> Result<(), Error> {
+        let started = Instant::now();
+        let mut running = self.collections(&*self.data).await?;
+        while !running.is_empty() && started.elapsed() < SETTLE {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let now = self.collections(&*self.data).await?;
+            running.retain(|key, _| now.contains_key(key));
+        }
+        Ok(())
+    }
+
+    /// The markers of collections that may be running, with when they were written
+    /// (Unix seconds, the store's clock).
+    async fn collections(&self, store: &dyn ObjectStore) -> Result<HashMap<Path, i64>, Error> {
+        Ok(store
+            .list(Some(&self.key("collections")))
+            .map_ok(|meta| (meta.location, meta.last_modified.timestamp()))
+            .try_collect()
+            .await?)
     }
 
     /// Uploads one file of an export, unless the store has it: the chunks it lacks,
@@ -502,6 +532,11 @@ impl Remote {
     /// records) is gone, then files no remaining record names, until
     /// [`COLLECT_DEADLINE`] after it started listing the records. `cache` keeps the
     /// files of records between collections (records do not change).
+    ///
+    /// While it runs, its marker in `collections/` tells exports to wait for it
+    /// before they reuse what is in the store. A collection that fails leaves its
+    /// marker, and exports then wait out [`SETTLE`], until a later collection
+    /// removes it as stale.
     pub async fn collect<F, Fut>(
         &self,
         live: F,
@@ -512,6 +547,41 @@ impl Remote {
         Fut: Future<Output = Result<BTreeSet<String>, Box<dyn std::error::Error + Send + Sync>>>,
     {
         let store = &*self.collector;
+        let pass = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let marker = self.key(&format!(
+            "collections/{pass:x}-{:x}.json",
+            std::process::id()
+        ));
+        // Before anything is listed: an export that does not see it has written its
+        // record before this lists the records.
+        store.put(&marker, PutPayload::from_static(b"{}")).await?;
+        let markers = self.collections(store).await?;
+        if let Some(&now) = markers.get(&marker) {
+            for (key, at) in markers {
+                if now.saturating_sub(at) > STALE_COLLECTION_SECS {
+                    tracing::info!(%key, "removing the marker of a collection that failed");
+                    delete(store, &key).await?;
+                }
+            }
+        }
+        let collected = self.collect_pass(store, live, cache).await?;
+        delete(store, &marker).await?;
+        Ok(collected)
+    }
+
+    async fn collect_pass<F, Fut>(
+        &self,
+        store: &dyn ObjectStore,
+        live: F,
+        cache: &mut HashMap<String, Vec<String>>,
+    ) -> Result<Collected, Error>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<BTreeSet<String>, Box<dyn std::error::Error + Send + Sync>>>,
+    {
         // Files first: one uploaded after this listing is not considered.
         let mut files: BTreeMap<String, Vec<Path>> = BTreeMap::new();
         let mut listing = store.list(Some(&self.key("files")));
@@ -550,10 +620,7 @@ impl Remote {
             records.into_iter().partition(|(id, _)| live.contains(id));
         for (id, key) in gone {
             tracing::info!(checkpoint = id, %key, "deleting the record of a checkpoint that is gone");
-            match store.delete(&key).await {
-                Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
-                Err(error) => return Err(error.into()),
-            }
+            delete(store, &key).await?;
             cache.remove(key.as_ref());
             collected.records += 1;
         }
@@ -640,6 +707,14 @@ impl Remote {
             }
         }
         Ok(referenced)
+    }
+}
+
+/// Deletes `key`; one already gone is fine.
+async fn delete(store: &dyn ObjectStore, key: &Path) -> Result<(), Error> {
+    match store.delete(key).await {
+        Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
+        Err(error) => Err(error.into()),
     }
 }
 

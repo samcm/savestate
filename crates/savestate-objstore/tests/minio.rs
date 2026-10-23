@@ -2,7 +2,8 @@
 //! MinIO): an interrupted export leaves no readable checkpoint and is resumed
 //! without uploading again what it had; a download is the original bit for bit and
 //! as sparse; a corrupted chunk is refused; a child checkpoint uploads only its own
-//! files; and garbage collection removes exactly what no live checkpoint uses.
+//! files, reusing what is in the store only once a running garbage collection has
+//! finished; and garbage collection removes exactly what no live checkpoint uses.
 //!
 //! Needs `SAVESTATE_TEST_S3_ENDPOINT`, `SAVESTATE_TEST_S3_BUCKET` (existing),
 //! `SAVESTATE_TEST_S3_REGION`, `SAVESTATE_TEST_S3_ACCESS_KEY_ID` and
@@ -147,15 +148,23 @@ async fn export_resume_download_and_collect() {
         "layers/s1-0.qcow2",
         "images/base.qcow2",
     ]);
-    let moved = remote
-        .export(
-            "c2",
-            root,
-            &c2,
-            &serde_json::json!({"name": "c2"}),
-            &Progress::default(),
-        )
+    // It reuses them only once a collection running when it starts has finished:
+    // one that listed the records before c2's could be deleting them.
+    let running = object_store::path::Path::from(format!("{prefix}/collections/running.json"));
+    raw.put(&running, PutPayload::from_static(b"{}"))
         .await
+        .unwrap();
+    let (c2_manifest, progress) = (serde_json::json!({"name": "c2"}), Progress::default());
+    let export = remote.export("c2", root, &c2, &c2_manifest, &progress);
+    tokio::pin!(export);
+    tokio::select! {
+        result = &mut export => panic!("exported during a collection: {result:?}"),
+        () = tokio::time::sleep(Duration::from_secs(3)) => {}
+    }
+    raw.delete(&running).await.unwrap();
+    let moved = tokio::time::timeout(Duration::from_secs(10), export)
+        .await
+        .expect("the export waits on after the collection finished")
         .unwrap();
     assert_eq!(
         moved,

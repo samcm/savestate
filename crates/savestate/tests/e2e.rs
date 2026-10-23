@@ -54,7 +54,20 @@ async fn checkpoint_fork_and_resume_exactly() {
     // A sandbox from the base image.
     let started = Instant::now();
     savestate(&[
-        "create", "web", "--image", &image, "--vcpus", "1", "--memory", "1Gi", "--disk", "4Gi",
+        "create",
+        "web",
+        "--image",
+        &image,
+        "--vcpus",
+        "1",
+        "--memory",
+        "1Gi",
+        "--disk",
+        "4Gi",
+        "--label",
+        "app=web",
+        "--label",
+        "tier=test",
     ]);
     report(&format!(
         "boot: create to Running in {:.1} s",
@@ -134,9 +147,37 @@ async fn checkpoint_fork_and_resume_exactly() {
         .get(pod.spec.unwrap().node_name.as_deref().unwrap())
         .await
         .unwrap();
+    let node_name = node.metadata.name.clone().unwrap();
     let allocatable = &node.status.unwrap().allocatable.unwrap()["cpu"].0;
     report(&format!("node allocatable CPU: {allocatable}"));
     savestate(&["delete", "sandbox", "burst"]);
+
+    // A sandbox that fails (a shape the installation does not offer): create waits
+    // for it and exits non-zero with its message.
+    let failed = cli()
+        .args([
+            "create",
+            "unoffered",
+            "--image",
+            &image,
+            "--vcpus",
+            "2",
+            "--memory",
+            "1Gi",
+            "--disk",
+            "4Gi",
+            "--timeout",
+            "2m",
+        ])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&failed.stderr);
+    assert!(!failed.status.success(), "{}", describe(&failed));
+    assert!(
+        stderr.contains("sandbox unoffered failed") && stderr.contains("not offered"),
+        "{stderr}"
+    );
+    savestate(&["delete", "sandbox", "unoffered"]);
 
     // Egress: the allowlisted address is reachable, other private ones are not.
     let (ip, port) = allowed.split_once(':').unwrap();
@@ -174,7 +215,14 @@ async fn checkpoint_fork_and_resume_exactly() {
 
     // Checkpoint while it runs, then change the original.
     let started = Instant::now();
-    savestate(&["checkpoint", "web", "--name", "web-1"]);
+    savestate(&[
+        "checkpoint",
+        "web",
+        "--name",
+        "web-1",
+        "--label",
+        "tier=parked",
+    ]);
     report(&format!(
         "checkpoint: create to Ready in {:.1} s; {}",
         secs(started),
@@ -185,6 +233,11 @@ async fn checkpoint_fork_and_resume_exactly() {
     assert_eq!(ready.vcpus, Some(1));
     assert_eq!(ready.memory.unwrap().0, "1Gi");
     assert_eq!(ready.parent, None);
+    // The sandbox's labels, overridden where the checkpoint says otherwise.
+    assert_eq!(
+        labels(&json(&["get", "web-1", "-o", "json"])),
+        [("app", "web"), ("tier", "parked")]
+    );
     let (same_pid, after) = counter("web");
     assert_eq!(
         same_pid, pid,
@@ -205,6 +258,7 @@ async fn checkpoint_fork_and_resume_exactly() {
         .map(|(name, clock)| {
             let child = cli()
                 .args(["create", name, "--from", "web-1", "--clock", clock])
+                .args(["--label", &format!("clock={clock}")])
                 .spawn()
                 .unwrap();
             (name, child)
@@ -266,6 +320,51 @@ async fn checkpoint_fork_and_resume_exactly() {
         unix_now() - stepped
     ));
 
+    // Labels: sandboxes from a checkpoint carry its labels; list selects by them.
+    assert_eq!(
+        labels(&json(&["get", "web-frozen", "-o", "json"])),
+        [("app", "web"), ("clock", "frozen"), ("tier", "parked")]
+    );
+    assert_eq!(
+        names(&json(&["list", "sandboxes", "-l", "app=web", "-o", "json"])),
+        ["web", "web-frozen", "web-stepped"]
+    );
+    assert_eq!(
+        names(&json(&[
+            "list",
+            "sandboxes",
+            "-l",
+            "tier=parked,clock!=frozen",
+            "-o",
+            "json"
+        ])),
+        ["web-stepped"]
+    );
+    assert_eq!(
+        names(&json(&[
+            "list",
+            "checkpoints",
+            "-l",
+            "app=web",
+            "-o",
+            "json"
+        ])),
+        ["web-1"]
+    );
+    let table = savestate(&["list", "sandboxes", "-l", "clock=frozen"]);
+    let rows: Vec<Vec<&str>> = table
+        .lines()
+        .map(|l| l.split_whitespace().collect())
+        .collect();
+    assert_eq!(rows[0], ["NAME", "PHASE", "NODE", "FROM", "AGE"], "{table}");
+    assert_eq!(rows.len(), 2, "{table}");
+    assert_eq!(
+        rows[1][..4],
+        ["web-frozen", "Running", node_name.as_str(), "web-1"]
+    );
+    let shown = savestate(&["get", "web-frozen"]);
+    assert!(shown.contains("1 vCPU, 1Gi memory, 4Gi disk"), "{shown}");
+
     // Independent: a write in one fork is seen nowhere else; the original keeps its own.
     sh("web-frozen", "echo frozen >/root/mine && sync");
     for other in ["web-stepped", "web"] {
@@ -289,15 +388,35 @@ async fn checkpoint_fork_and_resume_exactly() {
     // Fork a restored sandbox: its checkpoint descends from web-1 and the new sandbox
     // carries both the original process and the fork's own write.
     savestate(&["delete", "sandbox", "web-stepped"]);
-    let out = savestate(&["fork", "web-frozen", "-n", "1"]);
-    let grandchild = out
-        .lines()
-        .find_map(|line| line.strip_prefix("sandbox ")?.split(' ').next())
-        .expect("fork names its sandbox")
-        .to_owned();
-    let checkpoint = grandchild.rsplit_once('-').unwrap().0;
+    let forked = json(&[
+        "fork",
+        "web-frozen",
+        "-n",
+        "1",
+        "--label",
+        "generation=2",
+        "-o",
+        "json",
+    ]);
+    let grandchild = names(&forked["sandboxes"]).remove(0);
+    let checkpoint = forked["checkpoint"]["metadata"]["name"].as_str().unwrap();
+    assert_eq!(forked["sandboxes"][0]["status"]["phase"], "Running");
     let status = checkpoints.get(checkpoint).await.unwrap().status.unwrap();
     assert_eq!(status.parent.as_deref(), Some("web-1"));
+    // The checkpoint has its sandbox's labels; the new sandbox those and its own.
+    assert_eq!(
+        labels(&forked["checkpoint"]),
+        [("app", "web"), ("clock", "frozen"), ("tier", "parked")]
+    );
+    assert_eq!(
+        labels(&forked["sandboxes"][0]),
+        [
+            ("app", "web"),
+            ("clock", "frozen"),
+            ("generation", "2"),
+            ("tier", "parked")
+        ]
+    );
     assert_eq!(
         sh(&grandchild, "cat /root/mine /root/state"),
         "frozen\nbefore\n"
@@ -527,6 +646,31 @@ fn savestate(args: &[&str]) -> String {
         stdout.trim_end()
     ));
     stdout
+}
+
+/// Runs a verb with `-o json`; its output.
+fn json(args: &[&str]) -> serde_json::Value {
+    serde_json::from_str(&savestate(args)).unwrap()
+}
+
+/// The names of a JSON list of objects, in order.
+fn names(objects: &serde_json::Value) -> Vec<String> {
+    objects
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|object| object["metadata"]["name"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+/// An object's labels, in key order.
+fn labels(object: &serde_json::Value) -> Vec<(&str, &str)> {
+    object["metadata"]["labels"]
+        .as_object()
+        .unwrap()
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_str().unwrap()))
+        .collect()
 }
 
 /// `sh -c script` in a sandbox.

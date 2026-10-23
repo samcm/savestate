@@ -164,12 +164,43 @@ status:
 - Later, a `Migration` kind may move a running sandbox between nodes with QEMU live
   migration (for draining nodes). Not part of the MVP.
 
-The CLI is shorthand over these objects: `savestate create` (`--port PORT[/udp]`,
-`--service`), `checkpoint` (`--export STORE` also waits for the export), `fork NAME
--n 3` (one checkpoint plus three sandboxes, each with the forked sandbox's `ports`
-and `service`), `exec NAME -- CMD`, `cp`, `expose NAME PORT[/udp]... [--service]`
-(adds ports to `spec.ports`), `port-forward NAME LOCAL:GUEST...` (`kubectl
-port-forward` to the VM pod, which reaches any TCP port of the guest), `delete`.
+## CLI
+
+`savestate` with a verb is shorthand over the objects above and, for `exec` and
+`cp`, the guest agent. It keeps no state of its own: everything it shows is in the
+objects, and everything it does can also be done with `kubectl`. It uses the current
+kubeconfig context and namespace (`--namespace`, else `SAVESTATE_NAMESPACE`).
+
+| Verb | What it does |
+| --- | --- |
+| `create NAME --image IMAGE --vcpus N --memory Q --disk Q [--port PORT[/udp]]… [--service]` | creates a sandbox from an image (with `spec.ports` and `spec.service`) and waits until it is `Running` |
+| `create NAME --from CHECKPOINT [--clock stepped]` | creates a sandbox from a checkpoint and waits until it is `Running` |
+| `checkpoint SANDBOX [--name NAME] [--export STORE]` | waits until the sandbox runs, creates a checkpoint of it (named `<sandbox>-<random>` without `--name`) and waits until it is `Ready`, and with `--export` until the store holds it |
+| `fork SANDBOX [-n N]` | one checkpoint as above, then `N` sandboxes from it named `<checkpoint>-1` to `<checkpoint>-N`, each with the forked sandbox's `ports` and `service`, and waits until they run |
+| `list sandboxes\|checkpoints [-l SELECTOR]` | a table: name, phase, node and source of each sandbox; name, phase, sandbox, parent, nodes, stores and sizes of each checkpoint |
+| `get NAME [--kind sandbox\|checkpoint]` | one sandbox (phase, node, source, shape, TTL, labels, message) or checkpoint (phase, sandbox, parent, nodes, stores, shape, sizes, guest time, TTL, labels, message) |
+| `exec NAME [-i] -- CMD…` | runs a command in the guest with its stdin, stdout and stderr; exits with its exit code |
+| `cp SRC DST` | copies a file in or out; one side is `NAME:PATH` |
+| `expose NAME PORT[/udp]… [--service]` | adds ports to the sandbox's `spec.ports` |
+| `port-forward NAME LOCAL:GUEST…` | `kubectl port-forward` to the VM pod, which reaches any TCP port of the guest |
+| `delete sandbox\|checkpoint NAME` | deletes the object |
+
+- **Waiting.** `create`, `checkpoint` and `fork` wait as above, for at most
+  `--timeout` in all (default `10m`). An object that becomes `Failed` ends the wait
+  with a non-zero exit and its status message; a timeout says the phase and message
+  the object was left in. `--no-wait` returns once the objects are created (a
+  checkpoint still waits for its sandbox to run, since only a running sandbox can be
+  checkpointed).
+- **Labels.** `create`, `checkpoint` and `fork` take `--label KEY=VALUE`
+  (repeatable). A checkpoint gets its sandbox's labels; a sandbox from a checkpoint
+  (`create --from`, and the sandboxes of a fork) gets the checkpoint's labels, so a
+  parked and resumed sandbox keeps its labels. `--label` adds to or overrides the
+  inherited ones; a fork's `--label`s go on its new sandboxes. `list -l` takes a
+  Kubernetes label selector (`app=web,tier!=test`).
+- **Output.** Text for people by default. `-o json` on `create`, `checkpoint`,
+  `fork`, `list` and `get` prints the objects instead (without `managedFields`), once
+  any waiting is over: the object, an array for `list`, and `{"checkpoint": …,
+  "sandboxes": […]}` for `fork`.
 
 ## Architecture
 

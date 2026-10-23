@@ -2,10 +2,14 @@
 //! objects (see "API" in `docs/design.md`); `exec` and `cp` run `savestate guest` in
 //! the sandbox's VM pod through `pods/exec`. They use the current kubeconfig context.
 
+mod show;
+
 use std::{
+    collections::BTreeMap,
     io::Write as _,
     os::unix::fs::PermissionsExt as _,
     process::ExitCode,
+    str::FromStr as _,
     time::{Duration, Instant},
 };
 
@@ -13,10 +17,13 @@ use anyhow::{Context as _, bail};
 use clap::{Args, Subcommand, ValueEnum};
 use k8s_openapi::api::core::v1::Pod;
 use kube::{
-    Api, Client, ResourceExt,
+    Api, Client, Resource, ResourceExt,
     api::{AttachParams, DeleteParams, ListParams, PostParams},
 };
-use savestate_api::{Checkpoint, CheckpointPhase, Sandbox, SandboxPhase, Transfer, TransferPhase};
+use savestate_api::{
+    Checkpoint, CheckpointPhase, Sandbox, SandboxPhase, Transfer, TransferPhase, Ttl,
+};
+use serde::{Serialize, de::DeserializeOwned};
 use serde_json::json;
 
 #[derive(Subcommand)]
@@ -32,6 +39,10 @@ pub enum Verb {
     Exec(Exec),
     /// Copy a file into or out of a sandbox (`NAME:PATH` names a path in a sandbox).
     Cp(Cp),
+    /// List sandboxes or checkpoints.
+    List(List),
+    /// Show a sandbox or a checkpoint: phase, node, message, shape, sizes and parent.
+    Get(Get),
     /// Delete a sandbox or a checkpoint.
     Delete(Delete),
 }
@@ -41,9 +52,30 @@ pub struct Common {
     /// Namespace [default: the kubeconfig context's].
     #[arg(long, env = "SAVESTATE_NAMESPACE")]
     pub namespace: Option<String>,
-    /// How long to wait for sandboxes to run and checkpoints to be ready, in seconds.
-    #[arg(long, default_value_t = 600)]
-    pub timeout: u64,
+}
+
+#[derive(Args)]
+pub struct Wait {
+    /// Return once the objects are created, without waiting for sandboxes to run or
+    /// checkpoints to be ready.
+    #[arg(long)]
+    pub no_wait: bool,
+    /// How long to wait in all, e.g. `90s` or `10m`; past it, exit non-zero.
+    #[arg(long, default_value = "10m", value_parser = parse_duration)]
+    pub timeout: Duration,
+}
+
+#[derive(Args)]
+pub struct Output {
+    /// Output format: text for people, or the objects as JSON.
+    #[arg(short = 'o', long = "output", value_enum, default_value_t = Format::Text)]
+    pub format: Format,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum Format {
+    Text,
+    Json,
 }
 
 #[derive(Args)]
@@ -53,7 +85,7 @@ pub struct Create {
     /// Disk image to boot, e.g. `ghcr.io/example/base@sha256:…`.
     #[arg(long, required_unless_present = "from", conflicts_with = "from")]
     pub image: Option<String>,
-    /// Checkpoint to start from; image, vCPUs, memory and disk come from it.
+    /// Checkpoint to start from; image, vCPUs, memory, disk and labels come from it.
     #[arg(long)]
     pub from: Option<String>,
     /// Virtual CPUs (with `--image`).
@@ -71,6 +103,13 @@ pub struct Create {
     /// Delete the sandbox after this long, e.g. `7d`.
     #[arg(long)]
     pub ttl: Option<String>,
+    /// A label, `KEY=VALUE`, on top of the checkpoint's (with `--from`); repeatable.
+    #[arg(long = "label", value_name = "KEY=VALUE", value_parser = parse_label)]
+    pub labels: Vec<(String, String)>,
+    #[command(flatten)]
+    pub wait: Wait,
+    #[command(flatten)]
+    pub output: Output,
     #[command(flatten)]
     pub common: Common,
 }
@@ -94,7 +133,7 @@ impl Clock {
 
 #[derive(Args)]
 pub struct CheckpointArgs {
-    /// Sandbox to checkpoint.
+    /// Sandbox to checkpoint; once it runs.
     pub sandbox: String,
     /// Checkpoint name [default: generated from the sandbox name].
     #[arg(long)]
@@ -106,13 +145,20 @@ pub struct CheckpointArgs {
     /// until it is there too.
     #[arg(long)]
     pub export: Option<String>,
+    /// A label, `KEY=VALUE`, on top of the sandbox's; repeatable.
+    #[arg(long = "label", value_name = "KEY=VALUE", value_parser = parse_label)]
+    pub labels: Vec<(String, String)>,
+    #[command(flatten)]
+    pub wait: Wait,
+    #[command(flatten)]
+    pub output: Output,
     #[command(flatten)]
     pub common: Common,
 }
 
 #[derive(Args)]
 pub struct Fork {
-    /// Sandbox to fork.
+    /// Sandbox to fork; once it runs. The checkpoint gets its labels.
     pub sandbox: String,
     /// Number of new sandboxes, named `<checkpoint>-1` to `<checkpoint>-N`.
     #[arg(short = 'n', long, default_value_t = 1)]
@@ -120,6 +166,14 @@ pub struct Fork {
     /// Guest clock of the new sandboxes [default: frozen].
     #[arg(long, value_enum)]
     pub clock: Option<Clock>,
+    /// A label, `KEY=VALUE`, for the new sandboxes on top of the checkpoint's;
+    /// repeatable.
+    #[arg(long = "label", value_name = "KEY=VALUE", value_parser = parse_label)]
+    pub labels: Vec<(String, String)>,
+    #[command(flatten)]
+    pub wait: Wait,
+    #[command(flatten)]
+    pub output: Output,
     #[command(flatten)]
     pub common: Common,
 }
@@ -149,6 +203,31 @@ pub struct Cp {
 }
 
 #[derive(Args)]
+pub struct List {
+    pub kind: Kind,
+    /// Only objects whose labels match this selector, e.g. `app=web,tier!=test`.
+    #[arg(short = 'l', long)]
+    pub selector: Option<String>,
+    #[command(flatten)]
+    pub output: Output,
+    #[command(flatten)]
+    pub common: Common,
+}
+
+#[derive(Args)]
+pub struct Get {
+    /// Name of a sandbox or a checkpoint.
+    pub name: String,
+    /// Which, when a sandbox and a checkpoint have the same name.
+    #[arg(long, value_enum)]
+    pub kind: Option<Kind>,
+    #[command(flatten)]
+    pub output: Output,
+    #[command(flatten)]
+    pub common: Common,
+}
+
+#[derive(Args)]
 pub struct Delete {
     pub kind: Kind,
     pub name: String,
@@ -156,10 +235,25 @@ pub struct Delete {
     pub common: Common,
 }
 
-#[derive(Clone, Copy, ValueEnum)]
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum Kind {
+    #[value(alias = "sandboxes", alias = "sbx")]
     Sandbox,
+    #[value(alias = "checkpoints", alias = "ckpt")]
     Checkpoint,
+}
+
+fn parse_label(label: &str) -> Result<(String, String), String> {
+    match label.split_once('=') {
+        Some((key, value)) if !key.is_empty() => Ok((key.to_owned(), value.to_owned())),
+        _ => Err(format!("expected KEY=VALUE, got {label:?}")),
+    }
+}
+
+fn parse_duration(text: &str) -> Result<Duration, String> {
+    Ttl::from_str(text)
+        .map(|ttl| ttl.duration())
+        .map_err(|_| format!("expected a duration such as 90s, 10m or 1h30m, got {text:?}"))
 }
 
 /// Run one verb against the cluster in the current kubeconfig context; the process's
@@ -184,50 +278,9 @@ pub async fn run(verb: Verb) -> anyhow::Result<ExitCode> {
         .await
         .context("connecting to the cluster in the current kubeconfig context")?;
     match verb {
-        Verb::Create(args) => {
-            let ns = namespace(&client, &args.common);
-            let spec = if let Some(from) = &args.from {
-                json!({"from": {"checkpoint": from}, "clock": args.clock.map(Clock::as_str), "ttl": args.ttl})
-            } else {
-                json!({"image": args.image, "vcpus": args.vcpus, "memory": args.memory, "disk": args.disk, "ttl": args.ttl})
-            };
-            create_sandbox(&client, &ns, &args.name, spec).await?;
-            let started = Instant::now();
-            let node = wait_running(&client, &ns, &args.name, args.common.timeout).await?;
-            say(&format!(
-                "sandbox {} is Running on node {node} ({:.1} s)",
-                args.name,
-                started.elapsed().as_secs_f64()
-            ))?;
-        }
-        Verb::Checkpoint(args) => {
-            let ns = namespace(&client, &args.common);
-            let started = Instant::now();
-            let name = checkpoint(
-                &client,
-                &ns,
-                &args.sandbox,
-                args.name.as_deref(),
-                args.ttl.as_deref(),
-                args.export.as_deref(),
-                args.common.timeout,
-            )
-            .await?;
-            say(&format!(
-                "checkpoint {name} of {} is Ready ({:.1} s)",
-                args.sandbox,
-                started.elapsed().as_secs_f64()
-            ))?;
-            if let Some(store) = &args.export {
-                let started = Instant::now();
-                wait_exported(&client, &ns, &name, store, args.common.timeout).await?;
-                say(&format!(
-                    "checkpoint {name} is in store {store} ({:.1} s)",
-                    started.elapsed().as_secs_f64()
-                ))?;
-            }
-        }
-        Verb::Fork(args) => fork(&client, &args).await?,
+        Verb::Create(args) => create(&client, args).await?,
+        Verb::Checkpoint(args) => take_checkpoint(&client, args).await?,
+        Verb::Fork(args) => fork(&client, args).await?,
         Verb::Exec(args) => {
             let ns = namespace(&client, &args.common);
             let mut command = vec![
@@ -252,6 +305,40 @@ pub async fn run(verb: Verb) -> anyhow::Result<ExitCode> {
             let ns = namespace(&client, &args.common);
             return cp(&client, &ns, &args.source, &args.destination).await;
         }
+        Verb::List(args) => {
+            let ns = namespace(&client, &args.common);
+            let mut params = ListParams::default();
+            if let Some(selector) = &args.selector {
+                params = params.labels(selector);
+            }
+            match args.kind {
+                Kind::Sandbox => {
+                    let items = Api::<Sandbox>::namespaced(client, &ns)
+                        .list(&params)
+                        .await?
+                        .items;
+                    match args.output.format {
+                        Format::Text => show::sandboxes(&items)?,
+                        Format::Json => {
+                            print_json(&items.into_iter().map(bare).collect::<Vec<_>>())?;
+                        }
+                    }
+                }
+                Kind::Checkpoint => {
+                    let items = Api::<Checkpoint>::namespaced(client, &ns)
+                        .list(&params)
+                        .await?
+                        .items;
+                    match args.output.format {
+                        Format::Text => show::checkpoints(&items)?,
+                        Format::Json => {
+                            print_json(&items.into_iter().map(bare).collect::<Vec<_>>())?;
+                        }
+                    }
+                }
+            }
+        }
+        Verb::Get(args) => get(&client, &args).await?,
         Verb::Delete(args) => {
             let ns = namespace(&client, &args.common);
             match args.kind {
@@ -272,37 +359,209 @@ pub async fn run(verb: Verb) -> anyhow::Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// One checkpoint of `args.sandbox`, then `args.count` sandboxes from it.
-async fn fork(client: &Client, args: &Fork) -> anyhow::Result<()> {
+async fn create(client: &Client, args: Create) -> anyhow::Result<()> {
     let ns = namespace(client, &args.common);
     let started = Instant::now();
-    let name = checkpoint(
+    let mut labels = BTreeMap::new();
+    let spec = if let Some(from) = &args.from {
+        // A sandbox from a checkpoint carries the checkpoint's labels, so parking and
+        // resuming keeps them. The controller waits for a checkpoint that does not
+        // exist yet; it has no labels to give.
+        if let Some(checkpoint) = Api::<Checkpoint>::namespaced(client.clone(), &ns)
+            .get_opt(from)
+            .await?
+        {
+            labels.clone_from(checkpoint.labels());
+        }
+        json!({"from": {"checkpoint": from}, "clock": args.clock.map(Clock::as_str), "ttl": args.ttl})
+    } else {
+        json!({"image": args.image, "vcpus": args.vcpus, "memory": args.memory, "disk": args.disk, "ttl": args.ttl})
+    };
+    labels.extend(args.labels);
+    let sandbox = create_sandbox(client, &ns, &args.name, &labels, spec).await?;
+    if args.wait.no_wait {
+        return finish(
+            args.output.format,
+            &sandbox,
+            &format!("created sandbox {}", args.name),
+        );
+    }
+    let sandboxes = Api::<Sandbox>::namespaced(client.clone(), &ns);
+    let sandbox = wait_running(&sandboxes, &args.name, started + args.wait.timeout).await?;
+    finish(
+        args.output.format,
+        &sandbox,
+        &format!(
+            "sandbox {} is Running on node {} ({:.1} s)",
+            args.name,
+            node(&sandbox),
+            started.elapsed().as_secs_f64()
+        ),
+    )
+}
+
+/// `savestate checkpoint`.
+async fn take_checkpoint(client: &Client, args: CheckpointArgs) -> anyhow::Result<()> {
+    let ns = namespace(client, &args.common);
+    let started = Instant::now();
+    let deadline = started + args.wait.timeout;
+    let mut checkpoint = checkpoint(
+        client,
+        &ns,
+        &args.sandbox,
+        args.name.as_deref(),
+        args.ttl.as_deref(),
+        args.export.as_deref(),
+        args.labels,
+        deadline,
+        !args.wait.no_wait,
+    )
+    .await?;
+    let name = checkpoint.name_any();
+    if args.wait.no_wait {
+        return finish(
+            args.output.format,
+            &checkpoint,
+            &format!("created checkpoint {name}"),
+        );
+    }
+    text(
+        args.output.format,
+        &format!(
+            "checkpoint {name} of {} is Ready ({:.1} s)",
+            args.sandbox,
+            started.elapsed().as_secs_f64()
+        ),
+    )?;
+    if let Some(store) = &args.export {
+        let started = Instant::now();
+        checkpoint = wait_exported(client, &ns, &name, store, deadline).await?;
+        text(
+            args.output.format,
+            &format!(
+                "checkpoint {name} is in store {store} ({:.1} s)",
+                started.elapsed().as_secs_f64()
+            ),
+        )?;
+    }
+    json_out(args.output.format, &bare(checkpoint))
+}
+
+/// One checkpoint of `args.sandbox`, then `args.count` sandboxes from it.
+async fn fork(client: &Client, args: Fork) -> anyhow::Result<()> {
+    let ns = namespace(client, &args.common);
+    let format = args.output.format;
+    let started = Instant::now();
+    let deadline = started + args.wait.timeout;
+    let wait = !args.wait.no_wait;
+    let checkpoint = checkpoint(
         client,
         &ns,
         &args.sandbox,
         None,
         None,
         None,
-        args.common.timeout,
+        Vec::new(),
+        deadline,
+        wait,
     )
     .await?;
-    say(&format!("checkpoint {name} of {} is Ready", args.sandbox))?;
+    let name = checkpoint.name_any();
+    if wait {
+        text(
+            format,
+            &format!("checkpoint {name} of {} is Ready", args.sandbox),
+        )?;
+    }
+    let mut labels = checkpoint.labels().clone();
+    labels.extend(args.labels);
     let names: Vec<String> = (1..=args.count).map(|i| format!("{name}-{i}")).collect();
+    let mut sandboxes = Vec::new();
     for sandbox in &names {
         let spec = json!({"from": {"checkpoint": name}, "clock": args.clock.map(Clock::as_str)});
-        create_sandbox(client, &ns, sandbox, spec).await?;
+        sandboxes.push(create_sandbox(client, &ns, sandbox, &labels, spec).await?);
     }
-    for sandbox in &names {
-        let node = wait_running(client, &ns, sandbox, args.common.timeout).await?;
-        say(&format!("sandbox {sandbox} is Running on node {node}"))?;
+    if wait {
+        let api = Api::<Sandbox>::namespaced(client.clone(), &ns);
+        for sandbox in &mut sandboxes {
+            *sandbox = wait_running(&api, &sandbox.name_any(), deadline).await?;
+            text(
+                format,
+                &format!(
+                    "sandbox {} is Running on node {}",
+                    sandbox.name_any(),
+                    node(sandbox)
+                ),
+            )?;
+        }
+        text(
+            format,
+            &format!(
+                "forked {} into {} sandboxes ({:.1} s)",
+                args.sandbox,
+                names.len(),
+                started.elapsed().as_secs_f64()
+            ),
+        )?;
+    } else {
+        text(
+            format,
+            &format!(
+                "created checkpoint {name} and sandboxes {}",
+                names.join(" ")
+            ),
+        )?;
     }
-    say(&format!(
-        "forked {} into {} sandboxes ({:.1} s)",
-        args.sandbox,
-        names.len(),
-        started.elapsed().as_secs_f64()
-    ))?;
-    Ok(())
+    json_out(
+        format,
+        &json!({"checkpoint": bare(checkpoint), "sandboxes": sandboxes.into_iter().map(bare).collect::<Vec<_>>()}),
+    )
+}
+
+/// `savestate get`: the sandbox or checkpoint named `args.name`.
+async fn get(client: &Client, args: &Get) -> anyhow::Result<()> {
+    let ns = namespace(client, &args.common);
+    let sandboxes = Api::<Sandbox>::namespaced(client.clone(), &ns);
+    let checkpoints = Api::<Checkpoint>::namespaced(client.clone(), &ns);
+    let sandbox = if args.kind == Some(Kind::Checkpoint) {
+        None
+    } else {
+        sandboxes.get_opt(&args.name).await?
+    };
+    let checkpoint = if args.kind == Some(Kind::Sandbox) {
+        None
+    } else {
+        checkpoints.get_opt(&args.name).await?
+    };
+    match (sandbox, checkpoint) {
+        (Some(_), Some(_)) => bail!(
+            "a sandbox and a checkpoint are both named {}; say which with --kind",
+            args.name
+        ),
+        (Some(sandbox), None) => match args.output.format {
+            Format::Json => print_json(&bare(sandbox)),
+            Format::Text => {
+                // A sandbox from a checkpoint has the checkpoint's shape.
+                let from = match sandbox.spec.from.as_ref() {
+                    Some(from) => checkpoints.get_opt(&from.checkpoint).await?,
+                    None => None,
+                };
+                show::sandbox(&sandbox, from.as_ref())
+            }
+        },
+        (None, Some(checkpoint)) => match args.output.format {
+            Format::Json => print_json(&bare(checkpoint)),
+            Format::Text => show::checkpoint(&checkpoint),
+        },
+        (None, None) => {
+            let what = match args.kind {
+                Some(Kind::Sandbox) => "sandbox",
+                Some(Kind::Checkpoint) => "checkpoint",
+                None => "sandbox or checkpoint",
+            };
+            bail!("no {what} named {} in namespace {ns}", args.name)
+        }
+    }
 }
 
 fn namespace(client: &Client, common: &Common) -> String {
@@ -317,52 +576,96 @@ fn say(line: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `line` with text output.
+fn text(format: Format, line: &str) -> anyhow::Result<()> {
+    match format {
+        Format::Text => say(line),
+        Format::Json => Ok(()),
+    }
+}
+
+/// `value` with JSON output.
+fn json_out(format: Format, value: &impl Serialize) -> anyhow::Result<()> {
+    match format {
+        Format::Text => Ok(()),
+        Format::Json => print_json(value),
+    }
+}
+
+/// `line` with text output, `object` with JSON output.
+fn finish<K: Resource + Serialize + Clone>(
+    format: Format,
+    object: &K,
+    line: &str,
+) -> anyhow::Result<()> {
+    text(format, line)?;
+    json_out(format, &bare(object.clone()))
+}
+
+/// `object` without its managed fields, which only the API server's bookkeeping needs.
+fn bare<K: Resource>(mut object: K) -> K {
+    object.meta_mut().managed_fields = None;
+    object
+}
+
+fn print_json(value: &impl Serialize) -> anyhow::Result<()> {
+    let mut out = std::io::stdout().lock();
+    serde_json::to_writer_pretty(&mut out, value)?;
+    writeln!(out)?;
+    Ok(())
+}
+
+fn node(sandbox: &Sandbox) -> &str {
+    sandbox
+        .status
+        .as_ref()
+        .and_then(|status| status.node.as_deref())
+        .unwrap_or_default()
+}
+
 async fn create_sandbox(
     client: &Client,
     ns: &str,
     name: &str,
+    labels: &BTreeMap<String, String>,
     mut spec: serde_json::Value,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Sandbox> {
     if let Some(spec) = spec.as_object_mut() {
         spec.retain(|_, value| !value.is_null());
     }
     let sandbox: Sandbox = serde_json::from_value(json!({
         "apiVersion": "savestate.dev/v1alpha1",
         "kind": "Sandbox",
-        "metadata": {"name": name},
+        "metadata": {"name": name, "labels": labels},
         "spec": spec,
     }))?;
     Api::<Sandbox>::namespaced(client.clone(), ns)
         .create(&PostParams::default(), &sandbox)
         .await
-        .with_context(|| format!("creating sandbox {name}"))?;
-    Ok(())
+        .with_context(|| format!("creating sandbox {name}"))
 }
 
-/// Waits until the sandbox runs; returns its node.
+/// Waits until the sandbox runs; fails with its message if it fails.
 async fn wait_running(
-    client: &Client,
-    ns: &str,
+    sandboxes: &Api<Sandbox>,
     name: &str,
-    timeout: u64,
-) -> anyhow::Result<String> {
-    let sandboxes = Api::<Sandbox>::namespaced(client.clone(), ns);
-    poll(timeout, &format!("sandbox {name} to run"), || async {
-        let status = sandboxes.get(name).await?.status.unwrap_or_default();
+    deadline: Instant,
+) -> anyhow::Result<Sandbox> {
+    wait_for(sandboxes, name, deadline, "to run", |sandbox: &Sandbox| {
+        let status = sandbox.status.clone().unwrap_or_default();
         match status.phase {
-            SandboxPhase::Running => Ok(Some(status.node.unwrap_or_default())),
-            SandboxPhase::Failed => bail!(
-                "sandbox {name} failed: {}",
-                status.message.unwrap_or_default()
-            ),
-            _ => Ok(None),
+            SandboxPhase::Running => Progress::Done,
+            SandboxPhase::Failed => Progress::Failed(status.message),
+            phase => Progress::Waiting(format!("{phase:?}"), status.message),
         }
     })
     .await
 }
 
 /// Creates a checkpoint of `sandbox` (named, or generated from the sandbox's name)
-/// once the sandbox runs, and waits until it is ready; returns its name.
+/// once the sandbox runs, with the sandbox's labels and `labels` on top; with
+/// `ready`, waits until the checkpoint is ready.
+#[expect(clippy::too_many_arguments, reason = "the checkpoint verb's options")]
 async fn checkpoint(
     client: &Client,
     ns: &str,
@@ -370,13 +673,20 @@ async fn checkpoint(
     name: Option<&str>,
     ttl: Option<&str>,
     export: Option<&str>,
-    timeout: u64,
-) -> anyhow::Result<String> {
-    wait_running(client, ns, sandbox, timeout).await?;
-    let metadata = match name {
+    labels: Vec<(String, String)>,
+    deadline: Instant,
+    ready: bool,
+) -> anyhow::Result<Checkpoint> {
+    // Only a running sandbox can be checkpointed: wait for it, also without `ready`.
+    let sandboxes = Api::<Sandbox>::namespaced(client.clone(), ns);
+    let running = wait_running(&sandboxes, sandbox, deadline).await?;
+    let mut all = running.labels().clone();
+    all.extend(labels);
+    let mut metadata = match name {
         Some(name) => json!({"name": name}),
         None => json!({"generateName": format!("{sandbox}-")}),
     };
+    metadata["labels"] = json!(all);
     let mut spec = json!({"sandbox": sandbox});
     if let Some(ttl) = ttl {
         spec["ttl"] = json!(ttl);
@@ -391,28 +701,28 @@ async fn checkpoint(
         "spec": spec,
     }))?;
     let checkpoints = Api::<Checkpoint>::namespaced(client.clone(), ns);
-    let name = checkpoints
+    let checkpoint = checkpoints
         .create(&PostParams::default(), &checkpoint)
         .await
-        .context("creating the checkpoint")?
-        .name_any();
-    poll(
-        timeout,
-        &format!("checkpoint {name} to be ready"),
-        || async {
-            let status = checkpoints.get(&name).await?.status.unwrap_or_default();
+        .context("creating the checkpoint")?;
+    if !ready {
+        return Ok(checkpoint);
+    }
+    wait_for(
+        &checkpoints,
+        &checkpoint.name_any(),
+        deadline,
+        "to be ready",
+        |checkpoint: &Checkpoint| {
+            let status = checkpoint.status.clone().unwrap_or_default();
             match status.phase {
-                CheckpointPhase::Ready => Ok(Some(())),
-                CheckpointPhase::Failed => bail!(
-                    "checkpoint {name} failed: {}",
-                    status.message.unwrap_or_default()
-                ),
-                _ => Ok(None),
+                CheckpointPhase::Ready => Progress::Done,
+                CheckpointPhase::Failed => Progress::Failed(status.message),
+                phase => Progress::Waiting(format!("{phase:?}"), status.message),
             }
         },
     )
-    .await?;
-    Ok(name)
+    .await
 }
 
 /// Waits until checkpoint `name` is in `store`; fails with its export's message if
@@ -422,50 +732,80 @@ async fn wait_exported(
     ns: &str,
     name: &str,
     store: &str,
-    timeout: u64,
-) -> anyhow::Result<()> {
+    deadline: Instant,
+) -> anyhow::Result<Checkpoint> {
     let checkpoints = Api::<Checkpoint>::namespaced(client.clone(), ns);
     let transfers = Api::<Transfer>::namespaced(client.clone(), ns);
-    poll(
-        timeout,
-        &format!("checkpoint {name} to be in store {store}"),
-        || async {
-            let status = checkpoints.get(name).await?.status.unwrap_or_default();
-            if status.stores.iter().any(|held| held == store) {
-                return Ok(Some(()));
-            }
-            let exports = ListParams::default().fields(&format!("spec.checkpoint={name}"));
-            let export = transfers
-                .list(&exports)
-                .await?
-                .items
-                .into_iter()
-                .find(|transfer| transfer.spec.to.store.as_deref() == Some(store));
-            match export.and_then(|transfer| transfer.status) {
-                Some(status) if status.phase == TransferPhase::Failed => bail!(
-                    "exporting checkpoint {name} to store {store} failed: {}",
-                    status.message.unwrap_or_default()
-                ),
-                _ => Ok(None),
-            }
-        },
-    )
-    .await
-}
-
-async fn poll<T, F>(timeout: u64, what: &str, check: impl Fn() -> F) -> anyhow::Result<T>
-where
-    F: Future<Output = anyhow::Result<Option<T>>>,
-{
-    let deadline = Instant::now() + Duration::from_secs(timeout);
     loop {
-        if let Some(value) = check().await? {
-            return Ok(value);
+        let checkpoint = checkpoints.get(name).await?;
+        let status = checkpoint.status.clone().unwrap_or_default();
+        if status.stores.iter().any(|held| held == store) {
+            return Ok(checkpoint);
+        }
+        let exports = ListParams::default().fields(&format!("spec.checkpoint={name}"));
+        let export = transfers
+            .list(&exports)
+            .await?
+            .items
+            .into_iter()
+            .find(|transfer| transfer.spec.to.store.as_deref() == Some(store));
+        if let Some(status) = export.and_then(|transfer| transfer.status)
+            && status.phase == TransferPhase::Failed
+        {
+            bail!(
+                "exporting checkpoint {name} to store {store} failed: {}",
+                status.message.unwrap_or_default()
+            );
         }
         if Instant::now() >= deadline {
-            bail!("timed out waiting for {what}");
+            bail!("timed out waiting for checkpoint {name} to be in store {store}");
         }
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        tokio::time::sleep(POLL).await;
+    }
+}
+
+const POLL: Duration = Duration::from_millis(500);
+
+/// Where an object stands, for [`wait_for`].
+enum Progress {
+    Done,
+    /// Failed, with its status message.
+    Failed(Option<String>),
+    /// Still on its way: its phase and status message.
+    Waiting(String, Option<String>),
+}
+
+/// Polls the object `name` until `progress` says it is done, failing when it has
+/// failed or the deadline passes; the object once done. `goal` completes "waiting for
+/// sandbox web …".
+async fn wait_for<K>(
+    api: &Api<K>,
+    name: &str,
+    deadline: Instant,
+    goal: &str,
+    progress: impl Fn(&K) -> Progress,
+) -> anyhow::Result<K>
+where
+    K: Resource<DynamicType = ()> + Clone + DeserializeOwned + std::fmt::Debug,
+{
+    let kind = K::kind(&()).to_lowercase();
+    loop {
+        let object = api
+            .get(name)
+            .await
+            .with_context(|| format!("reading {kind} {name}"))?;
+        let (phase, message) = match progress(&object) {
+            Progress::Done => return Ok(object),
+            Progress::Failed(message) => {
+                bail!("{kind} {name} failed: {}", message.unwrap_or_default())
+            }
+            Progress::Waiting(phase, message) => (phase, message),
+        };
+        if Instant::now() >= deadline {
+            let message = message.map(|m| format!(": {m}")).unwrap_or_default();
+            bail!("timed out waiting for {kind} {name} {goal}; it is {phase}{message}");
+        }
+        tokio::time::sleep(POLL).await;
     }
 }
 

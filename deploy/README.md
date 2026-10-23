@@ -134,3 +134,129 @@ A `LoadBalancer` Service of your own works the same way: select the VM pod with
 source ranges (or `0.0.0.0/0`) to `exposeFrom` as an `ipBlock`. Each fork of a
 sandbox is its own sandbox, with its own pod and Service, so route to each one
 separately.
+
+## Running on an autoscaled cluster
+
+savestate works with the upstream Kubernetes cluster autoscaler: pending VM pods add
+nodes, and nodes without VMs and without the only copy of a checkpoint are removed.
+
+**What the autoscaler must honour.** Upstream defaults do all of this; check that a
+managed autoscaler does too.
+
+- `cluster-autoscaler.kubernetes.io/safe-to-evict: "false"` on VM pods: evicting
+  one destroys its VM, so a node running any VM is never scaled down. VM pods also
+  mount `hostPath` volumes, which `--skip-nodes-with-local-storage` (default `true`)
+  treats the same way. Node-agent pods are DaemonSet pods and never block. Keep any
+  other non-DaemonSet pod you add to `savestate-system` off `hostPath` and disk
+  `emptyDir`s, or it will hold its node.
+- `cluster-autoscaler.kubernetes.io/scale-down-disabled: "true"` on nodes: the node
+  agent sets it while its node holds a `Ready` checkpoint no store has, and removes it
+  once every local checkpoint is in a store or gone. Set `export` so that lasts only
+  as long as an export takes.
+- Startup taints (prefix `startup-taint.cluster-autoscaler.kubernetes.io/`), if you
+  use the one below.
+
+**At least one node per VM pool.** VM pods request `savestate.dev/vm`, the node
+agent's device-plugin resource. To decide whether a new node would fit a pending
+pod, the autoscaler copies a node already in the pool, which carries the resource.
+From zero nodes it asks the cloud provider for a template instead, and templates that
+hold only CPU, memory, pods, labels and taints lack the resource, so no pod that
+needs it triggers a scale-up. Keep the pool's minimum at 1. (The autoscaler caches
+the last real node of a group, so scale-up from zero can work until the autoscaler
+restarts; do not rely on it.) Where your provider takes node-template hints for
+extended resources and labels, advertise `savestate.dev/vm: <vm.slotsPerNode>`
+and, with a named CPU model, the label `savestate.dev/cpu: <first 16 hex digits of
+sha256(vm.cpuModel)>` (`printf %s EPYC-Rome-v4 | sha256sum | cut -c1-16`), and a
+pool can start at zero. CDI does not remove the need: Kubernetes hands a container
+CDI devices only through a device plugin's allocation or through DRA, and both are
+node resources a template must carry.
+
+**Export by default.** Set `stores` and `export`. A checkpoint is then in a store
+seconds after it is `Ready` (the upload, plus the time a running store garbage
+collection still needs, usually none), after which:
+
+- its node is free to be scaled down once its VMs are gone;
+- a sandbox from it may start on any node whose guests get the checkpoint's CPU
+  (`savestate.dev/cpu`), not only on the nodes holding it. Nodes holding it are
+  preferred; when none has room the pod stays `Pending`, the autoscaler adds a node,
+  the controller imports the checkpoint there (`WaitingForTransfer`), and the VM
+  restores. A pod created before the export finished, pinned to the holders, is
+  replaced once the export lands (event `Replaced`).
+
+A sandbox from a checkpoint that lands on a new node takes about: autoscaler
+reaction (its scan interval, 10 s by default, plus the provider's response) + node
+boot and join + node-agent start (pulling the savestate image, the CPU probe) +
+import + restore. On one managed cluster with 64 GiB nodes that was 163 s from
+`Pending` to `Running`: the autoscaler asked for a node after 61 s and the node was
+Ready 139 s after the pod went pending; the import of 467 MiB took 4.5 s and the
+restore 3.3 s. Node boot dominates; the import grows with the checkpoint's memory
+file and new layers (a base image the node lacks comes from the store too).
+
+**CPU model.** Use a named `vm.cpuModel` that every machine type the pool may get
+runs (for example `EPYC-Rome-v4` across Zen 2 and Zen 3, or a `Skylake-Server`
+variant on Intel; check with the node agent's `probe-cpu` container on each). With
+`host`, a checkpoint restores only on nodes with an identical CPU, so a new node of
+another CPU generation cannot take a fork. With a named model every node that passes
+the probe gets the same `savestate.dev/cpu` label, and any of them can import any
+checkpoint.
+
+**CPU requests.** Memory is never overcommitted, so on memory-sized nodes memory
+should decide how many VMs fit. Set each shape's `cpuRequest` (or
+`vm.cpuRequestPerVcpu`) so CPU does not bind first: at most the node's allocatable
+CPU divided by the number of VMs its allocatable memory holds. On a node with 8 CPUs
+and 64 GiB (about 7.9 CPUs and 60 GiB allocatable) six 8 GiB VMs fit by memory
+(8 GiB + `vm.memoryOverhead` each), so request at most 1.3 CPUs per VM, whatever
+its vCPU count; whole CPUs per vCPU would fit one 4-vCPU VM. VMs then share the
+node's CPU (see "CPU requests below the vCPU count" in
+[docs/design.md](../docs/design.md)).
+
+**Node size.** A node is removed only once its last VM is gone, so smaller nodes
+empty sooner and larger ones pack better. Size nodes to hold a handful of your
+common shape (for 8 GiB VMs, 32–64 GiB nodes hold 3–7) and leave headroom for the
+node's reserved memory, which grows with node size. VM pods prefer nodes that
+already run VMs, so new VMs fill busy nodes first and idle ones drain. Give each
+node's `stateDir` disk room for the base images, the layers of its sandboxes and the
+memory files of its local checkpoints (about each guest's used RAM); exported copies
+are dropped first when it fills (`cache.minFreePercent`).
+
+**Faster node join.**
+
+- `images.prefetch`: the base images your sandboxes boot from, by digest. Each new
+  node pulls them as soon as its agent starts, so the first boot there does not wait
+  for a multi-GiB pull. The node takes VMs meanwhile; only a boot from an image still
+  being pulled waits for it.
+- A startup taint `startup-taint.cluster-autoscaler.kubernetes.io/savestate=true:NoSchedule`
+  on the VM pool (applied when a node registers). The node agent removes it once its
+  node advertises VM slots, and again whenever it reappears, for example when an
+  edit of the pool copies the pool's taints onto existing nodes. Until then the
+  autoscaler counts the node as still starting. Without the taint there are a few
+  seconds (14 s in one measurement) in which the autoscaler sees a Ready node the
+  pending VM pods cannot use yet; with many pods pending it may add another node,
+  which it removes again after its scale-down delay. Use this prefix rather than a
+  taint of your own: the autoscaler leaves startup taints out of the node templates
+  it copies from existing nodes, while any other taint on them keeps it from
+  scaling the pool for pods that do not tolerate it.
+
+An autoscaled installation's config, beyond the basics above:
+
+```yaml
+vm:
+  cpuModel: EPYC-Rome-v4            # a named model every node type in the pool runs
+  shapes:
+    - {vcpus: 4, memory: 8Gi, disk: 60Gi, cpuRequest: 1300m}
+  nodeSelector:
+    savestate.dev/node: "true"
+images:
+  prefetch: [ghcr.io/example/base@sha256:...]
+stores:
+  archive:
+    endpoint: https://s3.example.com
+    bucket: example-checkpoints
+    region: example-region-1
+    prefix: savestate
+    credentialsSecret: savestate-store-archive
+export: archive
+```
+
+and a VM pool with a minimum of one node, the label `savestate.dev/node=true` and,
+where it applies, the startup taint.

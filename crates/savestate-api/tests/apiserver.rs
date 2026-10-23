@@ -4,6 +4,9 @@
 //! Needs a disposable cluster in `KUBECONFIG` (CI uses kind). It installs the CRDs
 //! and works in a namespace of its own.
 
+// clippy.toml allows these in `#[test]` functions only, not in a test file's helpers.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 use std::time::Duration;
 
 use k8s_openapi::{
@@ -28,6 +31,7 @@ const IMAGE: &str =
 
 #[tokio::test]
 #[ignore = "needs a disposable Kubernetes cluster in KUBECONFIG (CI uses kind)"]
+#[expect(clippy::too_many_lines, reason = "one scenario, read top to bottom")]
 async fn crds_accept_what_works_and_refuse_what_cannot() {
     let client = Client::try_default().await.expect("KUBECONFIG");
     install_crds(&client).await;
@@ -155,7 +159,7 @@ async fn crds_accept_what_works_and_refuse_what_cannot() {
             "set exactly one of image and from",
         ),
         (
-            merged(&image_spec, json!({"from": {"checkpoint": "c"}})),
+            merged(&image_spec, &json!({"from": {"checkpoint": "c"}})),
             "set exactly one of image and from",
         ),
         (
@@ -167,22 +171,25 @@ async fn crds_accept_what_works_and_refuse_what_cannot() {
             "inherits vcpus, memory and disk",
         ),
         (
-            merged(&image_spec, json!({"clock": "frozen"})),
+            merged(&image_spec, &json!({"clock": "frozen"})),
             "clock applies only to a sandbox started from a checkpoint",
         ),
         (
-            merged(&image_spec, json!({"image": "ghcr.io/example/base:latest"})),
+            merged(
+                &image_spec,
+                &json!({"image": "ghcr.io/example/base:latest"}),
+            ),
             "spec.image",
         ),
         (
-            merged(&image_spec, json!({"memory": "0"})),
+            merged(&image_spec, &json!({"memory": "0"})),
             "memory must be a positive quantity",
         ),
         (
-            merged(&image_spec, json!({"disk": -1})),
+            merged(&image_spec, &json!({"disk": -1})),
             "disk must be a positive quantity",
         ),
-        (merged(&image_spec, json!({"ttl": "7 days"})), "spec.ttl"),
+        (merged(&image_spec, &json!({"ttl": "7 days"})), "spec.ttl"),
         (
             json!({"from": {"checkpoint": "c"}, "clock": "sometimes"}),
             "spec.clock",
@@ -315,7 +322,7 @@ fn assert_refused(error: Option<kube::Error>, reason: &str, what: &Value) {
     }
 }
 
-fn merged(base: &Value, overrides: Value) -> Value {
+fn merged(base: &Value, overrides: &Value) -> Value {
     let mut merged = base.clone();
     for (key, value) in overrides.as_object().unwrap() {
         merged[key] = value.clone();

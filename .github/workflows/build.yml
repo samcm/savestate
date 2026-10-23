@@ -26,7 +26,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - run: rustup toolchain install stable --profile minimal --target ${{ matrix.target }} && rustup default stable
+      # rust-toolchain.toml pins the version, components and both musl targets.
+      - run: rustup toolchain install
       # Zig is the C cross toolchain for any C code in dependencies.
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:

@@ -5,7 +5,7 @@
 //! "Architecture" in `docs/design.md`):
 //!
 //! - [`controller`]: the cluster-wide operator (Deployment, one replica).
-//! - [`node`]: the per-node agent (DaemonSet) that owns `/var/lib/savestate`.
+//! - [`node`]: the per-node agent (`DaemonSet`) that owns `/var/lib/savestate`.
 //! - [`launcher`]: one per VM pod; starts and supervises QEMU over QMP.
 //! - [`cli`]: the user-facing verbs, shorthand over the `Sandbox` and `Checkpoint`
 //!   objects.
@@ -30,7 +30,7 @@ pub fn load_config(path: &Path) -> anyhow::Result<Config> {
     Config::from_yaml(&yaml).with_context(|| format!("in {}", path.display()))
 }
 
-/// Every CustomResourceDefinition as one multi-document YAML stream; this is
+/// Every `CustomResourceDefinition` as one multi-document YAML stream; this is
 /// `deploy/crds/savestate.dev.yaml`.
 pub fn crds_yaml() -> anyhow::Result<String> {
     let mut out =

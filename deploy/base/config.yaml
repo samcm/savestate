@@ -15,9 +15,12 @@ namespaces: [sandboxes]
 # launcherImage: ghcr.io/example/savestate@sha256:...
 
 vm:
-  # QEMU CPU model for every guest (required): a named model every VM node can
-  # run, never host or max, so checkpoints can move between nodes.
-  cpuModel: EPYC-Rome-v4
+  # QEMU CPU model for every guest (required). `host` gives guests the node's own
+  # CPU: the simple choice while checkpoints stay on the node that took them. A
+  # named model every VM node can run (e.g. EPYC-Rome-v4, run with `enforce` and
+  # checked by the node agent at start-up) is what lets checkpoints move between
+  # nodes later.
+  cpuModel: host
 
   # Added to each sandbox's memory for its pod's memory request, to cover QEMU.
   # memoryOverhead: 512Mi
@@ -52,6 +55,8 @@ images:
   # Docker config.json with registry credentials, mounted into the node agent.
   # Default: none (anonymous pulls).
   # auth: /etc/savestate/registry/config.json
+  # Registries (host[:port]) reached over plain HTTP. Default: [] (HTTPS only).
+  # plainHttp: [registry.example.internal:5000]
 
 # transfers:
 #   perNode: 1

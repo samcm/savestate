@@ -41,14 +41,31 @@ pub(super) fn build(sandbox: &Sandbox, vm: &Vm, config: &Config) -> Result<Pod, 
     for (name, quantity) in &config.vm.devices {
         resources[name] = json!(quantity);
     }
-    // Without a device plugin for /dev/kvm and /dev/net/tun the container reaches
-    // them as privileged; with one it needs only NET_ADMIN for its tap device and
-    // nftables, inside its own network namespace.
+    // Without a device plugin for /dev/kvm, /dev/net/tun and /dev/vhost-vsock the
+    // container reaches them as privileged. With one it gets exactly what the launcher
+    // uses as root before it drops to the QEMU user for good: NET_ADMIN for the tap
+    // device, forwarding and nftables in its own network namespace; CHOWN to hand its
+    // run directory to the QEMU user; SETUID and SETGID to become it. The runtime's
+    // default seccomp profile refuses AF_VSOCK sockets, the guest agent's channel, so
+    // the container is unconfined and QEMU applies its own filter (`-sandbox on`).
     let security = if config.vm.devices.is_empty() {
-        json!({"privileged": true})
+        json!({"privileged": true, "readOnlyRootFilesystem": true})
     } else {
-        json!({"capabilities": {"add": ["NET_ADMIN"]}})
+        json!({
+            "runAsUser": 0,
+            "allowPrivilegeEscalation": false,
+            "readOnlyRootFilesystem": true,
+            "capabilities": {"drop": ["ALL"], "add": ["NET_ADMIN", "CHOWN", "SETUID", "SETGID"]},
+            "seccompProfile": {"type": "Unconfined"},
+        })
     };
+    let mut args = vec!["launcher".to_owned()];
+    for net in &config.network.egress_allow {
+        args.extend(["--egress-allow".into(), net.to_string()]);
+    }
+    for ip in &config.network.dns {
+        args.extend(["--dns".into(), ip.to_string()]);
+    }
     let affinity = vm.nodes.as_ref().map(|nodes| {
         json!({"nodeAffinity": {"requiredDuringSchedulingIgnoredDuringExecution": {
             "nodeSelectorTerms": [{"matchFields": [
@@ -82,7 +99,11 @@ pub(super) fn build(sandbox: &Sandbox, vm: &Vm, config: &Config) -> Result<Pod, 
             "containers": [{
                 "name": "launcher",
                 "image": vm.image,
-                "args": ["launcher"],
+                "args": args,
+                // The node's addresses, which the guest may not reach.
+                "env": [{"name": "SAVESTATE_HOST_IPS", "valueFrom": {"fieldRef": {"fieldPath": "status.hostIPs"}}}],
+                // The launcher writes why the VM stopped to its termination log.
+                "terminationMessagePolicy": "FallbackToLogsOnError",
                 "resources": {"requests": resources, "limits": resources},
                 "securityContext": security,
                 // The launcher creates `ready` once the VM runs; the pod's Ready

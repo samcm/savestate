@@ -13,22 +13,47 @@ workspace = true
 
 [dependencies]
 anyhow.workspace = true
+base64.workspace = true
 clap.workspace = true
+flate2.workspace = true
 futures.workspace = true
+hex.workspace = true
+ipnet.workspace = true
+hyper-util.workspace = true
 jiff.workspace = true
 k8s-openapi.workspace = true
-kube = { workspace = true, features = ["client", "runtime", "rustls-tls", "ring"] }
+kube = { workspace = true, features = ["client", "runtime", "rustls-tls", "ring", "ws"] }
 kube_quantity.workspace = true
 metrics.workspace = true
 metrics-exporter-prometheus.workspace = true
+nftables.workspace = true
+nix = { workspace = true, features = ["user"] }
+oci-client.workspace = true
+orbd-qemu.workspace = true
+orbd-vm.workspace = true
+prost.workspace = true
+rtnetlink.workspace = true
+rustls.workspace = true
 savestate-api.workspace = true
+savestate-guest-proto = { workspace = true, features = ["client"] }
 serde.workspace = true
 serde-saphyr.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
+tar.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["signal", "time"] }
+tokio = { workspace = true, features = ["fs", "io-std", "io-util", "net", "process", "signal", "sync", "time"] }
+tokio-stream.workspace = true
+tonic.workspace = true
+tonic-prost.workspace = true
+tower.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
+[build-dependencies]
+prost-build.workspace = true
+protoc-bin-vendored.workspace = true
+tonic-prost-build.workspace = true
+
 [dev-dependencies]
-kube = { workspace = true, features = ["ws"] }
+tempfile.workspace = true

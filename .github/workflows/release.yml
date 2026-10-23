@@ -11,6 +11,9 @@ jobs:
   build:
     uses: ./.github/workflows/build.yml
 
+  guest-kernel:
+    uses: ./.github/workflows/guest-kernel.yml
+
   publish:
     needs: [build]
     runs-on: ubuntu-24.04
@@ -43,7 +46,7 @@ jobs:
         run: gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes
 
   image:
-    needs: [build, publish]
+    needs: [build, guest-kernel, publish]
     uses: ./.github/workflows/image.yml
     permissions:
       contents: read

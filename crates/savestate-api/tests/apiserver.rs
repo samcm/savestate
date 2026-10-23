@@ -120,6 +120,7 @@ async fn crds_accept_what_works_and_refuse_what_cannot() {
             qemu: "11.1.2".into(),
             machine_type: "pc-q35-11.1".into(),
             cpu_model: "EPYC-Rome-v4".into(),
+            host_cpu: None,
             devices: "sha256:0123".into(),
         }),
         message: None,

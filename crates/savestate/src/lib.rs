@@ -9,6 +9,8 @@
 //! - [`launcher`]: one per VM pod; starts and supervises QEMU over QMP.
 //! - [`cli`]: the user-facing verbs, shorthand over the `Sandbox` and `Checkpoint`
 //!   objects.
+//! - [`store`]: the layout of a node's state directory, shared by the node agent and
+//!   the launcher.
 //!
 //! The CRD types and the installation config live in the `savestate-api` crate.
 //! QEMU, QMP and guest-agent code comes from orbd's shared crates.
@@ -17,6 +19,7 @@ pub mod cli;
 pub mod controller;
 pub mod launcher;
 pub mod node;
+pub mod store;
 pub mod telemetry;
 
 use std::path::Path;
@@ -41,9 +44,4 @@ pub fn crds_yaml() -> anyhow::Result<String> {
         out.push_str(&serde_saphyr::to_string(&crd)?);
     }
     Ok(out)
-}
-
-/// The error every role and verb returns until it is built.
-fn not_implemented(what: &str) -> anyhow::Error {
-    anyhow::anyhow!("`savestate {what}` is not implemented yet")
 }

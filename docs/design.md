@@ -6,9 +6,10 @@ VMs from a checkpoint. It is a Kubernetes operator written in Rust that drives s
 QEMU over QMP. It shares its QEMU, QMP and guest-agent code with
 [orbd](https://github.com/samcm/orbd).
 
-Status: design agreed, implementation starting. This document is the contract every
-part of the implementation follows; change it in the same pull request as any change
-to the behaviour it describes.
+Status: the engine runs: controller, node agent, launcher and CLI boot, checkpoint
+and restore sandboxes end to end (transfers are phase 4). This document is the
+contract every part of the implementation follows; change it in the same pull request
+as any change to the behaviour it describes.
 
 ## User contract
 
@@ -84,7 +85,8 @@ status:
     launcherImage: …     # by digest
     qemu: …              # QEMU version
     machineType: pc-q35-11.1
-    cpuModel: …
+    cpuModel: …          # host, or a named model
+    hostCpu: …           # with host: the node CPU (model, flags digest)
     devices: …           # digest of the device configuration
   message: …
 ---
@@ -162,12 +164,15 @@ and the CLI); `savestate-guest` runs inside the VM.
   still in use. VM pods run the launcher image from the installation config, by
   default the controller's own image at the digest its pod runs.
 - **Node agent** (DaemonSet): owns `/var/lib/savestate` on its node; caches base images
-  by digest; tells launchers on its node to checkpoint or restore; garbage-collects
-  layers and checkpoints whose objects are gone; serves and fetches transfers;
-  reports disk use. Only it holds API credentials on the node.
-- **Launcher** (one per VM pod): starts and supervises QEMU, talks QMP, relays exec and
-  file traffic to the guest over vsock, streams the serial console to the pod log.
-  It has no Kubernetes credentials; the node agent drives it over a unix socket.
+  by digest; tells launchers on its node to boot, restore or checkpoint; garbage-collects
+  layers, checkpoints and run directories whose objects are gone; serves and fetches
+  transfers; reports disk use. Only it holds API credentials on the node.
+- **Launcher** (one per VM pod): starts and supervises QEMU, talks QMP, does the
+  guest-agent work around boots, restores and checkpoints, streams the serial console
+  to the pod log. It has no Kubernetes credentials; the node agent drives it over a
+  unix socket (gRPC, `proto/savestate/launcher/v1/launcher.proto`). Exec and file copy
+  reach the guest through `savestate guest`, which the CLI runs in the VM pod with
+  `pods/exec` and which talks to the guest agent over vsock.
 - **Guest agent** (`savestate-guest`, inside the VM, built on orbd's guest library):
   exec, file copy, the pre-checkpoint hook, and post-restore fixups (clock, entropy,
   machine-id, hostname, SSH host keys, user hooks in `/etc/savestate/after-restore.d/`).
@@ -188,8 +193,10 @@ through RoleBindings; cluster-wide, the controller only reads nodes.
 Capacity accounting is plain Kubernetes: each VM is a Guaranteed pod whose memory
 request is guest RAM plus the installation's memory overhead (`vm.memoryOverhead`,
 default 512 MiB), so the scheduler and ResourceQuota work unchanged. The spike
-measured QEMU's own resident memory outside guest RAM at 30–60 MiB; the margin also
-covers KVM kernel memory and the launcher, which phase 1 measures in the pod's cgroup.
+measured QEMU's own resident memory outside guest RAM at 30–60 MiB. In the end-to-end
+test the VM pod's cgroup peak (QEMU, the launcher and KVM's kernel memory) was about
+250 MiB for a 1 GiB guest whose memory file held about 170 MiB, so everything outside
+the guest's RAM stayed under 100 MiB; the default keeps a wide margin.
 
 ## Controller
 
@@ -211,8 +218,16 @@ owned by it (deleting the sandbox deletes the pod) and labelled
   guest memory plus `vm.memoryOverhead`; `vm.devices` are requested and limited too.
   For a sandbox from a checkpoint, shape comes from the checkpoint's status.
 - `automountServiceAccountToken: false`, `enableServiceLinks: false`,
-  `restartPolicy: Never`, `vm.nodeSelector` and `vm.tolerations`. Without
-  `vm.devices` the container is privileged; with them it gets `NET_ADMIN` only.
+  `restartPolicy: Never`, `vm.nodeSelector` and `vm.tolerations`. The container's
+  root filesystem is read-only. Without `vm.devices` (a device plugin for `/dev/kvm`,
+  `/dev/net/tun` and `/dev/vhost-vsock`) it is privileged; with them it runs as root
+  with `allowPrivilegeEscalation: false`, the `RuntimeDefault` seccomp profile, and
+  all capabilities dropped but what the launcher needs before it drops to the QEMU
+  user (see "Network and security"): `NET_ADMIN`, `CHOWN`, `SETUID` and `SETGID`.
+- arguments `--egress-allow` and `--dns` from `network`, the node's addresses
+  (`status.hostIPs`) in `SAVESTATE_HOST_IPS`, and `terminationMessagePolicy:
+  FallbackToLogsOnError` (the launcher writes why its VM stopped to its termination
+  log).
 - for a sandbox from a checkpoint, required node affinity on `metadata.name` in the
   checkpoint's `status.nodes`.
 - host paths: `stateDir` at the same path, and the sandbox's run directory
@@ -262,11 +277,59 @@ node agent removes the checkpoint's files.
 | --- | --- |
 | Controller | VM pods; Sandbox `status` (all of it); TTL deletions; the Checkpoint finalizer; `Failed` on Checkpoints that cannot start; later Transfers |
 | Node agent | Checkpoint `status` (`phase`, `nodes`, `vcpus`, `memory`, `disk`, sizes, `guestTime`, `parent`, `fingerprint`, `message`); Transfer `status`; files under `stateDir`; removes run directories of sandboxes that are gone |
-| Launcher | listens on `/run/savestate/launcher.sock` in its pod (the run directory on the host); creates `/run/savestate/ready` once the VM runs and never removes it while the VM lives. A readiness probe (`test -e /run/savestate/ready`, every 2 s) turns that into the pod's Ready condition, which the controller reads. It exits non-zero when QEMU fails. |
+| Launcher | listens on `/run/savestate/launcher.sock` in its pod (the run directory on the host); creates `/run/savestate/ready` once the VM runs and never removes it while the VM lives. A readiness probe (`test -e /run/savestate/ready`, every 2 s) turns that into the pod's Ready condition, which the controller reads. It exits non-zero when QEMU exits or the VM cannot start, and zero when its pod is deleted. |
 
 The node agent finds a sandbox's launcher at
 `/run/savestate/<namespace>/<sandbox>/<sandbox UID>/launcher.sock` on its node, and a
 VM pod's image (for a checkpoint's `fingerprint.launcherImage`) in the pod spec.
+
+## Node agent and launcher
+
+**Starting a VM.** The node agent watches the VM pods on its node. Once a pod's
+launcher listens and waits, it allocates the VM's vsock context id (context ids are
+global on a host: the lowest free one from 100000, kept in the run directory as
+`vsock-cid`, so it lives exactly as long as the sandbox; a restore gets its own), makes
+sure the base image or checkpoint is on the node, and sends `Start`: boot an image
+with the sandbox's shape and `vm.cpuModel`, or restore a checkpoint with its clock.
+Starts that cannot happen (an image that cannot be pulled, a checkpoint not on this
+node) are sent as `Fail`, and the launcher exits with that message, so the sandbox
+fails with it. A booted guest gets its address, route, DNS and hostname from the
+launcher through the guest agent; a restored one keeps what its checkpoint had and
+gets the post-restore fixups.
+
+**Base images.** A sandbox's `image` is a container image whose filesystem holds
+`/rootfs.qcow2` (the `disk` stage of `guest/rootfs/Dockerfile`, or an installation's
+equivalent). The node agent pulls it by digest (credentials from `images.auth`, plain
+HTTP for `images.plainHttp`), checks the manifests against their digests, extracts the
+disk, refuses one with a backing file, and publishes it read-only by rename.
+
+**Taking a checkpoint.** The node agent takes `Pending` checkpoints of sandboxes
+`Running` on its node: it creates `checkpoints/<UID>.tmp/`, then sets the phase to
+`Saving` with the checkpoint's resource version (so it never overrides the
+controller's `Failed`), so every `Saving` checkpoint has a directory on its node. The
+launcher runs the checkpoint steps below, writing the memory file and
+`manifest.json` into that directory; the node agent publishes it by rename and writes
+`Ready` with the manifest's shape, sizes, guest time, parent and fingerprint (the
+launcher image is the VM pod's), and a `Saved` event with the pause. A save that fails
+(including because its sandbox is deleted meanwhile) is discarded and `Failed`.
+After a node agent restart, a `Saving` checkpoint with a directory on the node is
+finished from disk: published, or complete (manifest written) and published now, is
+`Ready`; anything else is discarded and `Failed`.
+
+**Garbage collection.** Every minute the node agent lists its files, then the
+Sandboxes and Checkpoints of its namespaces (fresh), and removes checkpoints (and
+saves) whose object is gone, layers no existing sandbox owns and no remaining
+checkpoint's chain (including a complete save's) uses, images no sandbox boots and no
+chain uses, and run directories of sandboxes that are gone. Files are listed first, so
+a file created meanwhile is never taken for garbage. It reports bytes per kind and
+free bytes as metrics (`savestate_node_disk_bytes`, `savestate_node_disk_free_bytes`)
+on `--metrics-listen` (default `0.0.0.0:9090`).
+
+**CPU model.** With a named `vm.cpuModel`, an init container of the node agent's pod
+(privileged, for `/dev/kvm`) starts QEMU once with `-cpu <vm.cpuModel>,enforce`; on a
+node that cannot run the model it fails with the features the node lacks as its
+termination message, and the node agent does not run there. With `host` it only
+records that guests get the node's CPU.
 
 The controller serves Prometheus metrics (`--metrics-listen`, default
 `0.0.0.0:9090`, at `/metrics`): reconcile counts, errors and durations per kind,
@@ -277,12 +340,18 @@ sandbox phase transitions and TTL deletions. Logs are JSON lines from `tracing`.
 Pinned by the launcher image: stock QEMU 11.1 on Debian 13 (built from the upstream
 release until Debian 13 backports ships 11.1 for amd64) and an explicit
 versioned machine type (`pc-q35-11.1`). The guest CPU model is installation
-configuration: a named model that every node in the cluster can run (for example
-`EPYC-Rome-v4` where Zen 2 and Zen 3 hosts mix), never `-cpu host`, and without
-`invtsc`, so checkpoints can later move between nodes. The launcher always passes
-`-cpu <model>,enforce`, so a host that lacks a feature refuses to start rather than
-silently weakening the model; the node agent probes the configured model that way at
-start-up and reports a node that cannot run it. (Nested hosts often hide speculation
+configuration (`vm.cpuModel`), one of:
+
+- `host`: guests get the node's own CPU. The simple choice while checkpoints stay
+  on the node that took them, as they do until transfers exist. The checkpoint's
+  fingerprint records the node's CPU (`hostCpu`: model name and a digest of its
+  feature flags), and a restore on a node whose CPU differs is refused.
+- a named model that every node in the cluster can run (for example `EPYC-Rome-v4`
+  where Zen 2 and Zen 3 hosts mix), without `invtsc`: what lets checkpoints move
+  between nodes later. The launcher passes `-cpu <model>,enforce`, so a host that
+  lacks a feature refuses to start rather than silently weakening the model; the
+  node agent probes the configured model that way at start-up and reports a node
+  that cannot run it. (Nested hosts often hide speculation
 control features: on nested Zen 3 and Zen 4 hosts `EPYC-Rome-v4` is refused.) The
 launcher image digest and the CPU model are part of every checkpoint's fingerprint,
 and restores run that exact image. Measured numbers are in `spike/RESULTS.md`.
@@ -335,27 +404,44 @@ destination, in QEMU master after 11.1).
 
 ```text
 /var/lib/savestate/
-  images/<digest>.qcow2           base images, read-only
-  layers/<id>.qcow2               disk layers; sandboxes and checkpoints reference chains
-  checkpoints/<id>/manifest.json  fingerprint, layer chain, guest time, sizes, lineage
-  checkpoints/<id>/memory         mapped-ram file (sparse)
-  checkpoints/<id>.tmp/           save in progress, discarded on recovery
-  trash/                          delete-by-rename
+  images/<hex>.qcow2                 base images by manifest digest, read-only
+  layers/<sandbox UID>-<n>.qcow2     disk layers: a sandbox's nth, frozen (read-only)
+                                     once a checkpoint takes it
+  checkpoints/<UID>/manifest.json    shape, layer chain, machine arguments, guest time,
+                                     sizes, parent, fingerprint
+  checkpoints/<UID>/memory           mapped-ram file (sparse)
+  checkpoints/<UID>.tmp/             save in progress; complete once manifest.json exists
+  trash/                             delete-by-rename
 ```
 
-Every publication is build-then-rename and fsynced; every component reconciles what
-is on disk at start-up, so a crash at any point converges (the orbd pattern). Layer
-chains are capped in depth and flattened in the background.
+Checkpoint directories are named by the Checkpoint's UID. A layer names its backing
+file relative to its own directory (`<id>.qcow2`, `../images/<hex>.qcow2`), and a
+manifest lists its chain relative to the state directory. Every publication is
+build-then-rename and fsynced; the node agent reconciles what is on disk at start-up
+(a complete save is published, an incomplete one discarded, interrupted image pulls
+removed), so a crash at any point converges (the orbd pattern). The node agent owns
+the directory; `layers/` and each save's `.tmp` directory belong to the QEMU user, who
+writes them. Chains grow by one layer per checkpoint; capping their depth and
+flattening them in the background is phase 3.
 
 ## Network and security
 
-- Each VM pod is its own network namespace: QEMU attaches a tap device; nftables in the
-  pod masquerades guest traffic and drops traffic to cluster, node, link-local and
-  private ranges except an allowlist. Every sandbox sees the same guest address.
-- QEMU runs as non-root with `-sandbox on`; the launcher has no service-account token;
-  devices come from a device plugin rather than a privileged container where the
-  cluster allows it.
+- Each VM pod is its own network namespace: QEMU attaches a tap device (`tap0`,
+  `10.0.2.2/24`); nftables in the pod (table `inet savestate`) masquerades guest
+  traffic, drops traffic to private, shared, loopback, link-local, multicast and
+  reserved ranges and to the node's own addresses, except `network.egressAllow` and
+  port 53 of the guest's DNS servers, drops IPv6, and lets nothing reach the guest or
+  the pod from it unsolicited. Every sandbox sees the same guest address
+  (`10.0.2.15/24` via `10.0.2.2`, MAC `52:54:00:12:34:56`); DNS is `network.dns`, else
+  the VM pod's own resolvers. Forwarding is enabled per interface through netlink.
+- The launcher builds that network as root, hands its run directory to the QEMU user
+  (uid and gid 65532), and then drops to that user for good, keeping only the groups
+  that own `/dev/kvm`, `/dev/net/tun` and `/dev/vhost-vsock`. QEMU runs as that user
+  with `-sandbox on`; the launcher has no service-account token; devices come from a
+  device plugin rather than a privileged container where the cluster allows it.
 - Exec and file copy use Kubernetes `pods/exec` RBAC; there is no separate API server.
+  `savestate exec` and `cp` run `savestate guest` in the VM pod, which reaches the
+  guest agent over vsock.
 - VM pods need host devices, `NET_ADMIN` in their own network namespace and the
   node's state directory, which is the privileged Pod Security level. Sandbox
   namespaces therefore hold only sandboxes; users get the `savestate-user` role

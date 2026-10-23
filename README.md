@@ -73,7 +73,10 @@ the same static `savestate` binary.
 ```sh
 savestate create web-1 --image ghcr.io/example/base@sha256:… \
   --vcpus 4 --memory 8Gi --disk 60Gi --label team=a   # waits until it runs
-savestate exec web-1 -- make build
+savestate exec web-1 --cwd /src -e CI=1 -- make build
+savestate exec web-1 --detach -- ./serve      # prints an id; survives the exec
+savestate logs web-1 <id> -f
+savestate cp ./conf.d web-1:/etc/app/conf.d   # directories too; parents are created
 savestate fork web-1 -n 3        # one checkpoint, three new sandboxes
 savestate list sandboxes -l team=a
 savestate checkpoint web-1 --name web-1-parked       # keeps web-1's labels

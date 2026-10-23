@@ -45,6 +45,7 @@ tar.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["fs", "io-std", "io-util", "net", "process", "signal", "sync", "time"] }
 tokio-stream.workspace = true
+tokio-util.workspace = true
 tonic.workspace = true
 tonic-prost.workspace = true
 tower.workspace = true

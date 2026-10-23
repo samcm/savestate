@@ -2,12 +2,12 @@
 //! objects (see "API" in `docs/design.md`); `exec` and `cp` run `savestate guest` in
 //! the sandbox's VM pod through `pods/exec`. They use the current kubeconfig context.
 
+mod guest;
 mod show;
 
 use std::{
     collections::BTreeMap,
     io::Write as _,
-    os::unix::fs::PermissionsExt as _,
     process::ExitCode,
     str::FromStr as _,
     time::{Duration, Instant},
@@ -15,10 +15,10 @@ use std::{
 
 use anyhow::{Context as _, bail};
 use clap::{Args, Subcommand, ValueEnum};
-use k8s_openapi::api::core::v1::{Pod, Service};
+use k8s_openapi::api::core::v1::Service;
 use kube::{
     Api, Client, Resource, ResourceExt,
-    api::{AttachParams, DeleteParams, ListParams, Patch, PatchParams, PostParams},
+    api::{DeleteParams, ListParams, Patch, PatchParams, PostParams},
 };
 use savestate_api::{
     Checkpoint, CheckpointPhase, Port, Protocol, Sandbox, SandboxPhase, Transfer, TransferPhase,
@@ -36,9 +36,15 @@ pub enum Verb {
     Checkpoint(CheckpointArgs),
     /// Checkpoint a sandbox and start sandboxes from that checkpoint.
     Fork(Fork),
-    /// Run a command in a sandbox; exits with its exit code.
+    /// Run a command in a sandbox; exits with its exit code. With `--detach`, start
+    /// it in the background and print its id for `ps` and `logs`.
     Exec(Exec),
-    /// Copy a file into or out of a sandbox (`NAME:PATH` names a path in a sandbox).
+    /// Show the detached processes in a sandbox: running, or how they exited.
+    Ps(Ps),
+    /// Print the output of a detached process.
+    Logs(Logs),
+    /// Copy a file or directory into or out of a sandbox (`NAME:PATH` names a path in
+    /// a sandbox).
     Cp(Cp),
     /// Expose guest ports of a sandbox on its pod's address (adds to `spec.ports`).
     Expose(Expose),
@@ -224,8 +230,18 @@ pub struct Exec {
     /// Sandbox to run the command in.
     pub sandbox: String,
     /// Pass this process's stdin to the command.
-    #[arg(short = 'i', long)]
+    #[arg(short = 'i', long, conflicts_with = "detach")]
     pub stdin: bool,
+    /// An environment variable, `NAME=VALUE`, for the command; repeatable.
+    #[arg(short = 'e', long = "env", value_name = "NAME=VALUE", value_parser = crate::launcher::guest::parse_env)]
+    pub env: Vec<(String, String)>,
+    /// Working directory in the guest [default: /].
+    #[arg(long)]
+    pub cwd: Option<String>,
+    /// Run the command as a systemd unit in the guest, which outlives this exec and
+    /// the guest agent, with its output kept in the guest; print its id and return.
+    #[arg(short = 'd', long)]
+    pub detach: bool,
     /// Command and arguments.
     #[arg(last = true, required = true)]
     pub command: Vec<String>,
@@ -234,11 +250,40 @@ pub struct Exec {
 }
 
 #[derive(Args)]
+pub struct Ps {
+    /// Sandbox.
+    pub sandbox: String,
+    /// Only the process with this id.
+    pub id: Option<String>,
+    #[command(flatten)]
+    pub output: Output,
+    #[command(flatten)]
+    pub common: Common,
+}
+
+#[derive(Args)]
+pub struct Logs {
+    /// Sandbox.
+    pub sandbox: String,
+    /// Id of the detached process (from `exec --detach`).
+    pub id: String,
+    /// Keep printing output until the process exits, then exit with its exit code.
+    #[arg(short = 'f', long)]
+    pub follow: bool,
+    #[command(flatten)]
+    pub common: Common,
+}
+
+#[derive(Args)]
 pub struct Cp {
-    /// Source: a local file or `NAME:PATH`.
+    /// Source: a local file or directory, or `NAME:PATH`.
     pub source: String,
-    /// Destination: a local file or `NAME:PATH`.
+    /// Destination: a local path or `NAME:PATH`; missing parent directories are
+    /// created, and a directory's contents go into this directory.
     pub destination: String,
+    /// Permission bits of a copied file, octal, e.g. `600` [default: the source's].
+    #[arg(long, value_parser = parse_mode)]
+    pub mode: Option<u32>,
     #[command(flatten)]
     pub common: Common,
 }
@@ -291,6 +336,13 @@ fn parse_label(label: &str) -> Result<(String, String), String> {
     }
 }
 
+fn parse_mode(mode: &str) -> Result<u32, String> {
+    u32::from_str_radix(mode, 8)
+        .ok()
+        .filter(|mode| *mode <= 0o7777)
+        .ok_or_else(|| format!("expected octal permission bits such as 644, got {mode:?}"))
+}
+
 fn parse_duration(text: &str) -> Result<Duration, String> {
     Ttl::from_str(text)
         .map(|ttl| ttl.duration())
@@ -324,27 +376,19 @@ pub async fn run(verb: Verb) -> anyhow::Result<ExitCode> {
         Verb::Fork(args) => fork(&client, args).await?,
         Verb::Exec(args) => {
             let ns = namespace(&client, &args.common);
-            let mut command = vec![
-                "savestate".to_owned(),
-                "guest".into(),
-                "exec".into(),
-                "--".into(),
-            ];
-            command.extend(args.command);
-            let stdin = args.stdin.then(tokio::io::stdin);
-            return exec(
-                &client,
-                &ns,
-                &args.sandbox,
-                command,
-                stdin,
-                tokio::io::stdout(),
-            )
-            .await;
+            return guest::exec(&client, &ns, args).await;
+        }
+        Verb::Ps(args) => {
+            let ns = namespace(&client, &args.common);
+            guest::ps(&client, &ns, &args).await?;
+        }
+        Verb::Logs(args) => {
+            let ns = namespace(&client, &args.common);
+            return guest::logs(&client, &ns, &args).await;
         }
         Verb::Cp(args) => {
             let ns = namespace(&client, &args.common);
-            return cp(&client, &ns, &args.source, &args.destination).await;
+            return guest::cp(&client, &ns, &args).await;
         }
         Verb::List(args) => {
             let ns = namespace(&client, &args.common);
@@ -946,119 +990,4 @@ where
         }
         tokio::time::sleep(POLL).await;
     }
-}
-
-/// Runs `command` in the sandbox's VM pod, copying `stdin` in and its output to
-/// `stdout` and stderr; its exit code.
-async fn exec(
-    client: &Client,
-    ns: &str,
-    sandbox: &str,
-    command: Vec<String>,
-    stdin: Option<impl tokio::io::AsyncRead + Unpin>,
-    mut stdout: impl tokio::io::AsyncWrite + Unpin,
-) -> anyhow::Result<ExitCode> {
-    let pods = Api::<Pod>::namespaced(client.clone(), ns);
-    let params = AttachParams::default()
-        .container("launcher")
-        .stdin(stdin.is_some())
-        .stdout(true)
-        .stderr(true);
-    let mut process = pods
-        .exec(sandbox, command, &params)
-        .await
-        .with_context(|| format!("exec in sandbox {sandbox}"))?;
-    let status = process.take_status().context("exec status")?;
-    let mut remote_out = process.stdout().context("exec stdout")?;
-    let mut remote_err = process.stderr().context("exec stderr")?;
-    let input = async {
-        if let (Some(mut local), Some(mut remote)) = (stdin, process.stdin()) {
-            tokio::io::copy(&mut local, &mut remote).await?;
-            // Dropping `remote` closes the command's stdin.
-        }
-        Ok::<_, std::io::Error>(())
-    };
-    let output = async {
-        tokio::io::copy(&mut remote_out, &mut stdout).await?;
-        tokio::io::AsyncWriteExt::flush(&mut stdout).await
-    };
-    let mut local_err = tokio::io::stderr();
-    let errors = tokio::io::copy(&mut remote_err, &mut local_err);
-    let (input, output, errors) = tokio::join!(input, output, errors);
-    input?;
-    output?;
-    errors?;
-    let status = status.await.context("the exec ended without a status")?;
-    if status.status.as_deref() == Some("Success") {
-        return Ok(ExitCode::SUCCESS);
-    }
-    let code = status
-        .details
-        .as_ref()
-        .and_then(|details| details.causes.as_ref())
-        .and_then(|causes| {
-            causes
-                .iter()
-                .find(|c| c.reason.as_deref() == Some("ExitCode"))
-        })
-        .and_then(|cause| cause.message.as_ref()?.parse::<u8>().ok());
-    match code {
-        Some(code) => Ok(ExitCode::from(code)),
-        None => bail!(
-            "exec in sandbox {sandbox}: {}",
-            status.message.unwrap_or_default()
-        ),
-    }
-}
-
-/// Copies one file into or out of a sandbox.
-async fn cp(
-    client: &Client,
-    ns: &str,
-    source: &str,
-    destination: &str,
-) -> anyhow::Result<ExitCode> {
-    match (remote(source), remote(destination)) {
-        (Some((sandbox, path)), None) => {
-            let file = tokio::fs::File::create(destination)
-                .await
-                .with_context(|| format!("creating {destination}"))?;
-            let command = ["savestate", "guest", "read", path]
-                .map(String::from)
-                .into();
-            exec(client, ns, sandbox, command, None::<tokio::io::Empty>, file).await
-        }
-        (None, Some((sandbox, path))) => {
-            let file = tokio::fs::File::open(source)
-                .await
-                .with_context(|| format!("opening {source}"))?;
-            let mode = file.metadata().await?.permissions().mode() & 0o7777;
-            let command = [
-                "savestate",
-                "guest",
-                "write",
-                path,
-                "--mode",
-                &format!("{mode:o}"),
-            ]
-            .map(String::from)
-            .into();
-            exec(
-                client,
-                ns,
-                sandbox,
-                command,
-                Some(file),
-                tokio::io::stdout(),
-            )
-            .await
-        }
-        _ => bail!("name exactly one of the source and destination as SANDBOX:PATH"),
-    }
-}
-
-/// `NAME:PATH` as (`NAME`, `PATH`); a local path otherwise (`./a:b` is local).
-fn remote(arg: &str) -> Option<(&str, &str)> {
-    let (name, path) = arg.split_once(':')?;
-    (!name.is_empty() && !name.contains('/') && path.starts_with('/')).then_some((name, path))
 }

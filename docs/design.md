@@ -182,8 +182,11 @@ kubeconfig context and namespace (`--namespace`, else `SAVESTATE_NAMESPACE`).
 | `fork SANDBOX [-n N]` | one checkpoint as above, then `N` sandboxes from it named `<checkpoint>-1` to `<checkpoint>-N`, each with the forked sandbox's `ports` and `service`, and waits until they run |
 | `list sandboxes\|checkpoints [-l SELECTOR]` | a table: name, phase, node and source of each sandbox; name, phase, sandbox, parent, nodes, stores and sizes of each checkpoint |
 | `get NAME [--kind sandbox\|checkpoint]` | one sandbox (phase, node, source, shape, TTL, labels, message) or checkpoint (phase, sandbox, parent, nodes, stores, shape, sizes, guest time, TTL, labels, message) |
-| `exec NAME [-i] -- CMD…` | runs a command in the guest with its stdin, stdout and stderr; exits with its exit code |
-| `cp SRC DST` | copies a file in or out; one side is `NAME:PATH` |
+| `exec NAME [-i] [-e NAME=VALUE]… [--cwd DIR] -- CMD…` | runs a command in the guest with its stdin, stdout and stderr; exits with its exit code (128 + the signal if it was killed) |
+| `exec NAME --detach [-e …] [--cwd DIR] -- CMD…` | starts the command in the background and prints its id |
+| `ps NAME [ID]` | the detached processes: id, running or exit code (or signal), command |
+| `logs NAME ID [-f]` | a detached process's stdout and stderr so far; with `-f` until it exits, then exits with its exit code |
+| `cp SRC DST [--mode MODE]` | copies a file or a directory in or out; one side is `NAME:PATH` |
 | `expose NAME PORT[/udp]… [--service]` | adds ports to the sandbox's `spec.ports` (and sets `spec.service`, then prints the Service's address) |
 | `port-forward NAME LOCAL:GUEST…` | `kubectl port-forward` to the VM pod, which reaches any TCP port of the guest |
 | `delete sandbox\|checkpoint NAME` | deletes the object |
@@ -200,10 +203,28 @@ kubeconfig context and namespace (`--namespace`, else `SAVESTATE_NAMESPACE`).
   parked and resumed sandbox keeps its labels. `--label` adds to or overrides the
   inherited ones; a fork's `--label`s go on its new sandboxes. `list -l` takes a
   Kubernetes label selector (`app=web,tier!=test`).
+- **Exec.** An attached command runs in the guest agent's cgroup with the agent's
+  environment (`HOME=/root`) plus `--env`, in `--cwd` (default `/`); if the
+  connection drops it keeps running with stdin closed, until it ends or the agent
+  restarts. A detached command (`--detach`) runs as the transient systemd unit
+  `savestate-exec-<id>.service`, outside the agent, so it outlives the exec, the
+  launcher's relay and a restart of the agent, and goes on in sandboxes started from
+  a checkpoint taken while it runs. Its stdin is `/dev/null`, its environment
+  `HOME=/root` plus `--env`, and its stdout and stderr are kept in
+  `/var/log/savestate/exec/<id>.stdout` and `.stderr`; systemd keeps the unit and its
+  exit status after it exits, so `ps` and `logs` work until the sandbox is deleted.
+  `systemctl stop savestate-exec-<id>` stops one.
+- **Copies.** `cp` into a sandbox creates missing parent directories (mode 0755) and
+  replaces a file atomically, with the source's permission bits or `--mode`; out of
+  a sandbox it writes the guest's permission bits or `--mode`. A directory is copied
+  as a tar stream: its contents go into the destination directory, created if
+  missing, with their modes and modification times, owned by root in the guest and by
+  the caller locally.
 - **Output.** Text for people by default. `-o json` on `create`, `checkpoint`,
-  `fork`, `list` and `get` prints the objects instead (without `managedFields`), once
-  any waiting is over: the object, an array for `list`, and `{"checkpoint": …,
-  "sandboxes": […]}` for `fork`.
+  `fork`, `list`, `get` and `ps` prints the objects instead (without `managedFields`), once
+  any waiting is over: the object, an array for `list`, `{"checkpoint": …,
+  "sandboxes": […]}` for `fork`, and for `ps` an array of `{"id", "command",
+  "state": "running" | "exited", "exitCode" | "signal"}`.
 
 ## Architecture
 
@@ -250,11 +271,12 @@ and the CLI); `savestate-guest` runs inside the VM.
 - **Launcher** (one per VM pod): starts and supervises QEMU, talks QMP, does the
   guest-agent work around boots, restores and checkpoints, streams the serial console
   to the pod log. It has no Kubernetes credentials; the node agent drives it over a
-  unix socket (gRPC, `proto/savestate/launcher/v1/launcher.proto`). Exec and file copy
-  reach the guest through `savestate guest`, which the CLI runs in the VM pod with
+  unix socket (gRPC, `proto/savestate/launcher/v1/launcher.proto`). Exec, detached
+  processes and file copy reach the guest through `savestate guest`, which the CLI runs in the VM pod with
   `pods/exec` and which talks to the guest agent over vsock.
 - **Guest agent** (`savestate-guest`, inside the VM, built on orbd's guest library):
-  exec, file copy, the pre-checkpoint hook, and post-restore fixups (clock, entropy,
+  exec (attached, or detached as transient systemd units), file and directory copy,
+  the pre-checkpoint hook, and post-restore fixups (clock, entropy,
   machine-id, hostname, SSH host keys, user hooks in `/etc/savestate/after-restore.d/`).
   It speaks savestate's own guest protocol (`proto/savestate/guest/v1/guest.proto`) on
   vsock port 1024, one operation per connection; the launcher uses its host-side client
@@ -838,8 +860,8 @@ checkpoint of its own cluster.
   run directory to the QEMU user), `SETUID` and `SETGID` (becoming it), under
   savestate's seccomp profile.
 - Exec, file copy and port-forward use Kubernetes `pods/exec` and `pods/portforward`
-  RBAC; there is no separate API server. `savestate exec` and `cp` run `savestate
-  guest` in the VM pod, which reaches the guest agent over vsock.
+  RBAC; there is no separate API server. `savestate exec`, `ps`, `logs` and `cp` run
+  `savestate guest` in the VM pod, which reaches the guest agent over vsock.
 - VM pods need `NET_ADMIN` in their own network namespace and `hostPath` volumes
   (the node's state directory and their run directory). The baseline Pod Security
   level forbids both (a Localhost seccomp profile and device-plugin devices would

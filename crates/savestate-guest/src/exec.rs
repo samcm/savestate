@@ -1,7 +1,7 @@
 //! `Exec`: runs a program with its stdin fed from the host and its output streamed
 //! back. The program outlives the connection: if the host goes away (including when
 //! this VM is a restored copy and the connection was reset), its stdin is closed and
-//! its output discarded.
+//! its output discarded. Detached programs are [`crate::detached`]'s.
 
 use crate::conn::Conn;
 use savestate_guest_proto::CHUNK;
@@ -14,6 +14,9 @@ use std::process::{ChildStdin, Command, Stdio};
 use std::sync::Arc;
 
 pub fn run(conn: &Arc<Conn>, exec: &Exec) -> Result<(), String> {
+    if exec.detach {
+        return crate::detached::start(conn, exec);
+    }
     let (program, args) = exec.argv.split_first().ok_or("exec: empty argv")?;
     let mut child = Command::new(program)
         .args(args)

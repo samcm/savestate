@@ -4,9 +4,9 @@
 // length followed by that many bytes of protobuf, at most 1 MiB.
 //
 // One operation per connection: the host connects and sends one request (`Hello`,
-// `Exec`, `ReadFile`, `WriteFile`, `PrepareCheckpoint` or `Restore`), followed by its
-// stream (`Stdin` for `Exec`, `Chunk`s for `WriteFile`); the guest answers and closes
-// the connection. Restoring a VM resets every connection that was open at the
+// `Exec`, `Processes`, `Logs`, `ReadFile`, `WriteFile`, `PrepareCheckpoint` or
+// `Restore`), followed by its stream (`Stdin` for `Exec`, `Chunk`s for `WriteFile`);
+// the guest answers and closes the connection. Restoring a VM resets every connection that was open at the
 // checkpoint; the guest keeps listening, so the host simply connects again.
 syntax = "proto3";
 
@@ -22,6 +22,8 @@ message HostMessage {
     Chunk chunk = 6;
     PrepareCheckpoint prepare_checkpoint = 7;
     Restore restore = 8;
+    Processes processes = 9;
+    Logs logs = 10;
   }
 }
 
@@ -33,6 +35,9 @@ message GuestMessage {
     Chunk chunk = 4;
     Done done = 5;
     Error error = 6;
+    Detached detached = 7;
+    ProcessList process_list = 8;
+    FileInfo file_info = 9;
   }
 }
 
@@ -54,13 +59,53 @@ message EnvVar {
 // Runs a program as root, in the agent's environment plus `env`. The host then streams
 // `Stdin` (ending with `eof`); the guest streams `Output` and ends with `Exited`, or
 // `Error` if the program could not start. If the host goes away the program keeps
-// running with stdin closed and its output discarded.
+// running with stdin closed and its output discarded; it is in the agent's cgroup and
+// ends if the agent restarts.
+//
+// With `detach`, the program runs as the transient systemd unit
+// `savestate-exec-<id>.service` instead, outside the agent: it outlives the connection
+// and the agent, with stdin from /dev/null, its environment HOME=/root plus `env`, and
+// stdout and stderr in /var/log/savestate/exec/<id>.stdout and .stderr. The guest
+// answers `Detached` once it has started, or `Error`, and reads no `Stdin`.
 message Exec {
   // Program (looked up in PATH) and arguments; must not be empty.
   repeated string argv = 1;
   repeated EnvVar env = 2;
-  // Working directory; empty means /.
+  // Working directory (absolute); empty means /.
   string cwd = 3;
+  bool detach = 4;
+}
+
+message Detached {
+  // Names the process in `Processes` and `Logs`: 16 lowercase hex digits.
+  string id = 1;
+}
+
+// The detached processes: the one with `id`, or all of them (oldest first) when it is
+// empty. Answered with `ProcessList`, or `Error` for an `id` there is no process of.
+message Processes {
+  string id = 1;
+}
+
+message ProcessList {
+  repeated Process processes = 1;
+}
+
+message Process {
+  string id = 1;
+  // The command line, arguments joined by spaces.
+  string command = 2;
+  // Unset while it runs.
+  Exited exited = 3;
+}
+
+// The output of the detached process `id` so far, as `Output`: stdout, then stderr.
+// Then `Exited` if it has exited, else `Done`. With `follow`, the guest keeps sending
+// output as it is written, both streams as they come, until the process exits and its
+// output is complete; then `Exited`.
+message Logs {
+  string id = 1;
+  bool follow = 2;
 }
 
 message Stdin {
@@ -87,20 +132,33 @@ message Exited {
   }
 }
 
-// The guest streams the file's contents as `Chunk`s, the last one with `eof`, or answers
-// `Error` (possibly after some chunks).
+// The guest answers `FileInfo`, then streams the contents as `Chunk`s, the last one
+// with `eof`, or answers `Error` (possibly after some chunks). A regular file's
+// contents are its bytes; a directory's are a tar stream (POSIX ustar with GNU long
+// names) of everything in it, with paths relative to it, modes and modification times.
 message ReadFile {
   string path = 1;
 }
 
-// Replaces the file at `path` (absolute; the directory must exist) with the `Chunk`s
-// that follow, atomically once the `eof` chunk arrives: written next to it, fsynced and
-// renamed into place. Answered with `Done` or `Error` after the `eof` chunk. A
-// connection that ends before `eof` leaves the file untouched.
+message FileInfo {
+  bool directory = 1;
+  // Permission bits.
+  uint32 mode = 2;
+}
+
+// Replaces the file at `path` (absolute) with the `Chunk`s that follow, atomically once
+// the `eof` chunk arrives: written next to it, fsynced and renamed into place. Missing
+// parent directories are created (mode 0755). Answered with `Done` or `Error` after the
+// `eof` chunk. A connection that ends before `eof` leaves the file untouched.
+//
+// With `directory`, the chunks are a tar stream (as `ReadFile` sends) unpacked into the
+// directory `path`, created with its parents if missing; files in it are replaced one
+// by one, not atomically, and entries that would land outside it are refused.
 message WriteFile {
   string path = 1;
-  // Permission bits; 0 means 0644. Owner root.
+  // Permission bits of a file; 0 means 0644. Owner root.
   uint32 mode = 2;
+  bool directory = 3;
 }
 
 message Chunk {

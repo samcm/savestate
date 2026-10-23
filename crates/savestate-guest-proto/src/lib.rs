@@ -1,7 +1,8 @@
 //! The savestate guest protocol (`savestate.guest.v1`, see
 //! `proto/savestate/guest/v1/guest.proto`): what the host asks of `savestate-guest`
-//! inside a VM (exec, file copy, the pre-checkpoint hook and the post-restore fixups),
-//! its framing, and with feature `client` (on by default) the host side, [`Client`].
+//! inside a VM (exec, detached processes, file copy, the pre-checkpoint hook and the
+//! post-restore fixups), its framing, and with feature `client` (on by default) the
+//! host side, [`Client`].
 
 #[expect(clippy::doc_markdown, reason = "prost writes these doc comments")]
 pub mod proto {
@@ -11,7 +12,7 @@ pub mod proto {
 #[cfg(feature = "client")]
 mod client;
 #[cfg(feature = "client")]
-pub use client::{Client, Error, ExitStatus};
+pub use client::{Client, Download, Error, ExitStatus};
 
 /// The guest agent's vsock port.
 pub const PORT: u32 = 1024;

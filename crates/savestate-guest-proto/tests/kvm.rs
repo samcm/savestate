@@ -73,7 +73,12 @@ async fn exec_files_and_restore_fixups() {
         .unwrap();
     assert_eq!(written, HOOK.len() as u64);
     let mut read = Vec::new();
-    a.client.read_file(hook, &mut read).await.unwrap();
+    let download = a.client.read_file(hook).await.unwrap();
+    assert_eq!(
+        (download.info.directory, download.info.mode),
+        (false, 0o755)
+    );
+    download.copy_to(&mut read).await.unwrap();
     assert_eq!(String::from_utf8(read).unwrap(), HOOK);
     let (_, machine_id, _) = sh(&a.client, "cat /etc/machine-id", b"").await;
 

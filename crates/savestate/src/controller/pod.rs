@@ -1,7 +1,7 @@
 //! The VM pod for one sandbox (see "VM pods" in `docs/design.md`).
 
 use k8s_openapi::{api::core::v1::Pod, apimachinery::pkg::api::resource::Quantity};
-use kube::{Resource, ResourceExt};
+use kube::{Resource as _, ResourceExt};
 use kube_quantity::ParsedQuantity;
 use savestate_api::{Config, Sandbox};
 use serde_json::json;
@@ -19,13 +19,24 @@ pub(super) const LABELS: &str = "app.kubernetes.io/name=savestate,app.kubernetes
 pub(super) const RUN_DIR: &str = "/run/savestate";
 
 /// What the pod runs: the launcher image, the VM's size and the CPU its pod
-/// requests, and for a sandbox from a checkpoint the nodes it may run on.
+/// requests, and where it may run.
 pub(super) struct Vm {
     pub image: String,
     pub vcpus: u32,
     pub cpu: Quantity,
     pub memory: Quantity,
-    pub nodes: Option<Vec<String>>,
+    pub placement: Placement,
+}
+
+/// Nodes a VM pod may run on, beyond `vm.nodeSelector`.
+pub(super) enum Placement {
+    /// Any (a sandbox from an image).
+    Any,
+    /// Only these: the nodes holding a checkpoint no store has.
+    Nodes(Vec<String>),
+    /// Nodes whose guests get the checkpoint's CPU (`CPU_LABEL` equal to this),
+    /// preferring these, which hold it: a checkpoint in a store.
+    Cpu { label: String, prefer: Vec<String> },
 }
 
 /// The VM pod for `sandbox`, named after it and owned by it.
@@ -68,13 +79,7 @@ pub(super) fn build(sandbox: &Sandbox, vm: &Vm, config: &Config) -> Result<Pod, 
     for ip in &config.network.dns {
         args.extend(["--dns".into(), ip.to_string()]);
     }
-    let affinity = vm.nodes.as_ref().map(|nodes| {
-        json!({"nodeAffinity": {"requiredDuringSchedulingIgnoredDuringExecution": {
-            "nodeSelectorTerms": [{"matchFields": [
-                {"key": "metadata.name", "operator": "In", "values": nodes}
-            ]}]
-        }}})
-    });
+    let affinity = affinity(&vm.placement);
     let state_dir = config.state_dir.display().to_string();
 
     let pod = json!({
@@ -87,6 +92,8 @@ pub(super) fn build(sandbox: &Sandbox, vm: &Vm, config: &Config) -> Result<Pod, 
                 "app.kubernetes.io/name": "savestate",
                 "app.kubernetes.io/component": "vm",
             },
+            // Evicting a VM pod destroys its VM.
+            "annotations": {"cluster-autoscaler.kubernetes.io/safe-to-evict": "false"},
             "ownerReferences": [owner],
         },
         "spec": {
@@ -131,13 +138,32 @@ pub(super) fn build(sandbox: &Sandbox, vm: &Vm, config: &Config) -> Result<Pod, 
     serde_json::from_value(pod).map_err(|error| Error::PodSpec(error.to_string()))
 }
 
-/// Whether `pod` belongs to this `sandbox` (and not to an earlier sandbox of the
-/// same name).
-pub(super) fn owned_by(pod: &Pod, sandbox: &Sandbox) -> bool {
-    let uid = sandbox.meta().uid.as_deref();
-    pod.owner_references()
-        .iter()
-        .any(|owner| Some(owner.uid.as_str()) == uid)
+/// Node affinity for `placement`.
+fn affinity(placement: &Placement) -> Option<serde_json::Value> {
+    match placement {
+        Placement::Any => None,
+        Placement::Nodes(nodes) => Some(json!({"nodeAffinity": {
+            "requiredDuringSchedulingIgnoredDuringExecution": {"nodeSelectorTerms": [{"matchFields": [
+                {"key": "metadata.name", "operator": "In", "values": nodes}
+            ]}]},
+        }})),
+        Placement::Cpu { label, prefer } => {
+            let mut affinity = json!({"nodeAffinity": {
+                "requiredDuringSchedulingIgnoredDuringExecution": {"nodeSelectorTerms": [{"matchExpressions": [
+                    {"key": crate::CPU_LABEL, "operator": "In", "values": [label]}
+                ]}]},
+            }});
+            if !prefer.is_empty() {
+                affinity["nodeAffinity"]["preferredDuringSchedulingIgnoredDuringExecution"] = json!([{
+                    "weight": 100,
+                    "preference": {"matchFields": [
+                        {"key": "metadata.name", "operator": "In", "values": prefer}
+                    ]},
+                }]);
+            }
+            Some(affinity)
+        }
+    }
 }
 
 pub(super) fn parse(quantity: &Quantity, what: &str) -> Result<ParsedQuantity, Error> {

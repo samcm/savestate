@@ -14,9 +14,9 @@ use clap::{Args, Subcommand, ValueEnum};
 use k8s_openapi::api::core::v1::Pod;
 use kube::{
     Api, Client, ResourceExt,
-    api::{AttachParams, DeleteParams, PostParams},
+    api::{AttachParams, DeleteParams, ListParams, PostParams},
 };
-use savestate_api::{Checkpoint, CheckpointPhase, Sandbox, SandboxPhase};
+use savestate_api::{Checkpoint, CheckpointPhase, Sandbox, SandboxPhase, Transfer, TransferPhase};
 use serde_json::json;
 
 #[derive(Subcommand)]
@@ -102,6 +102,10 @@ pub struct CheckpointArgs {
     /// Delete the checkpoint after this long, e.g. `48h`.
     #[arg(long)]
     pub ttl: Option<String>,
+    /// Export it to this object store (from the installation config), and wait
+    /// until it is there too.
+    #[arg(long)]
+    pub export: Option<String>,
     #[command(flatten)]
     pub common: Common,
 }
@@ -205,6 +209,7 @@ pub async fn run(verb: Verb) -> anyhow::Result<ExitCode> {
                 &args.sandbox,
                 args.name.as_deref(),
                 args.ttl.as_deref(),
+                args.export.as_deref(),
                 args.common.timeout,
             )
             .await?;
@@ -213,6 +218,14 @@ pub async fn run(verb: Verb) -> anyhow::Result<ExitCode> {
                 args.sandbox,
                 started.elapsed().as_secs_f64()
             ))?;
+            if let Some(store) = &args.export {
+                let started = Instant::now();
+                wait_exported(&client, &ns, &name, store, args.common.timeout).await?;
+                say(&format!(
+                    "checkpoint {name} is in store {store} ({:.1} s)",
+                    started.elapsed().as_secs_f64()
+                ))?;
+            }
         }
         Verb::Fork(args) => fork(&client, &args).await?,
         Verb::Exec(args) => {
@@ -263,7 +276,16 @@ pub async fn run(verb: Verb) -> anyhow::Result<ExitCode> {
 async fn fork(client: &Client, args: &Fork) -> anyhow::Result<()> {
     let ns = namespace(client, &args.common);
     let started = Instant::now();
-    let name = checkpoint(client, &ns, &args.sandbox, None, None, args.common.timeout).await?;
+    let name = checkpoint(
+        client,
+        &ns,
+        &args.sandbox,
+        None,
+        None,
+        None,
+        args.common.timeout,
+    )
+    .await?;
     say(&format!("checkpoint {name} of {} is Ready", args.sandbox))?;
     let names: Vec<String> = (1..=args.count).map(|i| format!("{name}-{i}")).collect();
     for sandbox in &names {
@@ -347,6 +369,7 @@ async fn checkpoint(
     sandbox: &str,
     name: Option<&str>,
     ttl: Option<&str>,
+    export: Option<&str>,
     timeout: u64,
 ) -> anyhow::Result<String> {
     wait_running(client, ns, sandbox, timeout).await?;
@@ -357,6 +380,9 @@ async fn checkpoint(
     let mut spec = json!({"sandbox": sandbox});
     if let Some(ttl) = ttl {
         spec["ttl"] = json!(ttl);
+    }
+    if let Some(store) = export {
+        spec["export"] = json!(store);
     }
     let checkpoint: Checkpoint = serde_json::from_value(json!({
         "apiVersion": "savestate.dev/v1alpha1",
@@ -387,6 +413,44 @@ async fn checkpoint(
     )
     .await?;
     Ok(name)
+}
+
+/// Waits until checkpoint `name` is in `store`; fails with its export's message if
+/// the export fails.
+async fn wait_exported(
+    client: &Client,
+    ns: &str,
+    name: &str,
+    store: &str,
+    timeout: u64,
+) -> anyhow::Result<()> {
+    let checkpoints = Api::<Checkpoint>::namespaced(client.clone(), ns);
+    let transfers = Api::<Transfer>::namespaced(client.clone(), ns);
+    poll(
+        timeout,
+        &format!("checkpoint {name} to be in store {store}"),
+        || async {
+            let status = checkpoints.get(name).await?.status.unwrap_or_default();
+            if status.stores.iter().any(|held| held == store) {
+                return Ok(Some(()));
+            }
+            let exports = ListParams::default().fields(&format!("spec.checkpoint={name}"));
+            let export = transfers
+                .list(&exports)
+                .await?
+                .items
+                .into_iter()
+                .find(|transfer| transfer.spec.to.store.as_deref() == Some(store));
+            match export.and_then(|transfer| transfer.status) {
+                Some(status) if status.phase == TransferPhase::Failed => bail!(
+                    "exporting checkpoint {name} to store {store} failed: {}",
+                    status.message.unwrap_or_default()
+                ),
+                _ => Ok(None),
+            }
+        },
+    )
+    .await
 }
 
 async fn poll<T, F>(timeout: u64, what: &str, check: impl Fn() -> F) -> anyhow::Result<T>

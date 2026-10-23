@@ -577,7 +577,8 @@ for it. An installation may give new VM nodes the startup taint
 agent tolerates it): the cluster autoscaler counts a node with that taint as still
 starting, rather than as a node the pending VM pods cannot use, and so adds no
 second node for them while the first comes up. The node agent removes the taint once
-its node's allocatable shows `savestate.dev/vm`.
+its node's allocatable shows `savestate.dev/vm`, and again within 30 s whenever it
+reappears (a platform may copy an edited pool's taints onto its nodes).
 
 **Devices and seccomp.** The node agent is a kubelet device plugin (device plugin API
 v1beta1, `proto/kubelet/deviceplugin/v1beta1/api.proto`, copied from Kubernetes). At

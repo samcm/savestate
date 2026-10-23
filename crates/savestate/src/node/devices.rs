@@ -74,16 +74,21 @@ const VERSION: &str = "v1beta1";
 /// node advertises VM slots.
 pub const STARTUP_TAINT: &str = "startup-taint.cluster-autoscaler.kubernetes.io/savestate";
 
-/// Removes [`STARTUP_TAINT`] from this node once the node advertises VM slots.
+/// Removes [`STARTUP_TAINT`] from this node once the node advertises VM slots, and
+/// again whenever it comes back (a platform may copy a pool's taints onto its
+/// existing nodes when they are edited).
 pub(super) async fn untaint(ctx: Arc<Context>) {
     let nodes = Api::<Node>::all(ctx.client.clone());
     loop {
-        match untaint_once(&nodes, &ctx.node).await {
-            Ok(true) => return,
-            Ok(false) => {}
-            Err(error) => tracing::warn!(%error, "removing the startup taint"),
-        }
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        let wait = match untaint_once(&nodes, &ctx.node).await {
+            Ok(true) => Duration::from_secs(30),
+            Ok(false) => Duration::from_secs(2),
+            Err(error) => {
+                tracing::warn!(%error, "removing the startup taint");
+                Duration::from_secs(2)
+            }
+        };
+        tokio::time::sleep(wait).await;
     }
 }
 

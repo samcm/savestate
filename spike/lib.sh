@@ -7,6 +7,8 @@
 #   CPU_MODEL         guest CPU model (default: $WORK/cpu-model, written by select-cpu.sh)
 #   MACHINE           machine type (default pc-q35-11.1)
 #   MULTIFD_CHANNELS  multifd channels for save and restore (default 4)
+#   MAX_BANDWIDTH     migration max-bandwidth in bytes/s (default 100 GiB/s; QEMU's own
+#                     default of 128 MiB/s throttles saves to file)
 #   ACCEL             accelerator (default kvm; tcg only for dry runs of the QMP flows)
 set -euo pipefail
 
@@ -15,6 +17,7 @@ SPIKE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 MACHINE=${MACHINE:-pc-q35-11.1}
 CPU_MODEL=${CPU_MODEL:-$(cat "$WORK/cpu-model" 2>/dev/null || echo EPYC-Rome-v4)}
 CHANNELS=${MULTIFD_CHANNELS:-4}
+MAX_BANDWIDTH=${MAX_BANDWIDTH:-107374182400}
 # Every disk layer lives in one directory and names its backing file by bare file
 # name, so a checkpoint's layer chain can be copied elsewhere as a directory. The guest
 # kernel and initrd (base.vmlinuz, base.initrd) live there too.
@@ -121,10 +124,11 @@ vm_rss() {
 }
 
 # set_migration NAME DIRECT_IO: the capabilities and parameters save and restore share.
+# max-bandwidth only matters on the saving side.
 set_migration() {
   qmp "$1" migrate-set-capabilities \
     '{"capabilities":[{"capability":"multifd","state":true},{"capability":"mapped-ram","state":true}]}' >/dev/null
-  qmp "$1" migrate-set-parameters "{\"multifd-channels\":$CHANNELS,\"direct-io\":$2}" >/dev/null
+  qmp "$1" migrate-set-parameters "{\"multifd-channels\":$CHANNELS,\"direct-io\":$2,\"max-bandwidth\":$MAX_BANDWIDTH}" >/dev/null
 }
 
 drop_host_caches() {

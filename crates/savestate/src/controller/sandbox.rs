@@ -6,7 +6,7 @@ use std::{sync::Arc, time::Duration};
 use k8s_openapi::{api::core::v1::Pod, apimachinery::pkg::api::resource::Quantity};
 use kube::{
     Api, Resource as _, ResourceExt,
-    api::{Patch, PatchParams, PostParams},
+    api::{DeleteParams, Patch, PatchParams, PostParams, Preconditions},
     runtime::{Controller, controller::Action, events::EventType, reflector::ObjectRef, watcher},
 };
 use savestate_api::{
@@ -98,6 +98,10 @@ async fn reconcile(sandbox: Arc<Sandbox>, ctx: Arc<Context>) -> Result<Action, E
                 &sandbox,
                 format!("waiting for the VM pod of an earlier sandbox named {name} to go away"),
             )
+        }
+        Some(pod) if let Some(message) = replace_pinned(&ctx, &sandbox, &pod).await? => {
+            retry = Some(Duration::from_secs(1));
+            waiting(&sandbox, message)
         }
         Some(pod) => {
             let mut status = observe(&sandbox, &pod, &old);
@@ -280,6 +284,103 @@ async fn plan(sandbox: &Sandbox, ctx: &Context) -> Result<Plan, Error> {
         memory,
         placement,
     }))
+}
+
+/// Deletes the sandbox's VM pod if it is pinned to the nodes holding its checkpoint
+/// (created while no store had it), none of them can take it, and a store has the
+/// checkpoint now: its replacement may then run on any node that runs the
+/// checkpoint's CPU, including one the cluster autoscaler adds. The pod has started
+/// nothing, and the API server removes an unscheduled pod at once. Returns why, once
+/// deleted.
+async fn replace_pinned(
+    ctx: &Context,
+    sandbox: &Sandbox,
+    pod: &Pod,
+) -> Result<Option<String>, Error> {
+    let (Some(name), Some(spec)) = (checkpoint_of(sandbox), pod.spec.as_ref()) else {
+        return Ok(None);
+    };
+    let pinned = spec
+        .affinity
+        .as_ref()
+        .and_then(|a| {
+            a.node_affinity
+                .as_ref()?
+                .required_during_scheduling_ignored_during_execution
+                .as_ref()
+        })
+        .is_some_and(|required| {
+            required.node_selector_terms.iter().any(|term| {
+                term.match_fields
+                    .iter()
+                    .flatten()
+                    .any(|field| field.key == "metadata.name")
+            })
+        });
+    let unschedulable = pod
+        .status
+        .as_ref()
+        .and_then(|status| status.conditions.as_ref())
+        .into_iter()
+        .flatten()
+        .any(|c| {
+            c.type_ == "PodScheduled"
+                && c.status == "False"
+                && c.reason.as_deref() == Some("Unschedulable")
+        });
+    if !pinned
+        || !unschedulable
+        || spec.node_name.is_some()
+        || pod.metadata.deletion_timestamp.is_some()
+    {
+        return Ok(None);
+    }
+    let namespace = sandbox.namespace().unwrap_or_default();
+    let Some(checkpoint) = Api::<Checkpoint>::namespaced(ctx.client.clone(), &namespace)
+        .get_opt(name)
+        .await?
+    else {
+        return Ok(None);
+    };
+    let Some(store) = checkpoint
+        .status
+        .unwrap_or_default()
+        .stores
+        .first()
+        .cloned()
+    else {
+        return Ok(None);
+    };
+    // Only this pod as it is now: one bound to a node meanwhile has changed.
+    let params = DeleteParams {
+        preconditions: Some(Preconditions {
+            uid: pod.uid(),
+            resource_version: pod.resource_version(),
+        }),
+        ..DeleteParams::default()
+    };
+    match Api::<Pod>::namespaced(ctx.client.clone(), &namespace)
+        .delete(&pod.name_any(), &params)
+        .await
+    {
+        Ok(_) => {}
+        Err(kube::Error::Api(status)) if status.code == 409 || status.code == 404 => {
+            return Ok(None);
+        }
+        Err(error) => return Err(error.into()),
+    }
+    let message = format!(
+        "no node holding checkpoint {name} can run the VM pod; it is in store {store} now, so the pod is replaced by one that may run on any node"
+    );
+    tracing::info!(
+        namespace,
+        sandbox = sandbox.name_any(),
+        checkpoint = name,
+        store,
+        "replacing a pinned VM pod"
+    );
+    super::publish(ctx, sandbox, EventType::Normal, "Replaced", message.clone()).await;
+    Ok(Some(message))
 }
 
 /// While `node`, where the sandbox's pod is, does not hold its checkpoint: the

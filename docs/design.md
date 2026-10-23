@@ -267,7 +267,8 @@ VM) and `savestate.dev/ports` (see "Exposed ports"):
   for a sandbox from an image, the checkpoint's `fingerprint.launcherImage` for a
   sandbox from a checkpoint. The pod spec is the record of which image a sandbox
   runs; the controller never changes an existing pod except its
-  `savestate.dev/ports` annotation.
+  `savestate.dev/ports` annotation (and replaces only an unscheduled one, see
+  "Re-placing a pinned pod").
 - resources: memory requests and limits are guest memory plus `vm.memoryOverhead`,
   never overcommitted; one `savestate.dev/vm`, the node agent's device plugin
   resource that brings `/dev/kvm`, `/dev/net/tun` and `/dev/vhost-vsock`; and the
@@ -304,6 +305,14 @@ VM) and `savestate.dev/ports` (see "Exposed ports"):
   model") equal to the checkpoint's, and preferred affinity (weight 100) for the
   nodes in `status.nodes`: the scheduler picks a holder with room if there is one,
   else any node that can run the checkpoint, which then imports it.
+- preferred pod affinity (weight 50, topology `kubernetes.io/hostname`) for nodes
+  running other VM pods (`app.kubernetes.io/component: vm`, any namespace), so the
+  scheduler packs VMs onto busy nodes and the cluster autoscaler can empty and remove
+  the others. The scheduler normalises each plugin's score: the holder preference is
+  the whole node-affinity score and the packing preference the whole pod-affinity
+  score, and both plugins weigh the same by default, so packing can at most tie with
+  the holder preference (where a holder runs no VM at all) and decides among the
+  nodes that are not holders.
 - host paths: `stateDir` at the same path, and the sandbox's run directory
   `/run/savestate/<namespace>/<sandbox>/<sandbox UID>/` at `/run/savestate`. The UID
   keeps a later sandbox of the same name from meeting an earlier one's files.
@@ -348,6 +357,15 @@ being deleted, or `Ready` without fingerprint, vCPUs or memory. It waits (sandbo
 `Pending` with a message) while the checkpoint does not exist, is not yet `Ready` or
 is on no node and in no store. A pod of the same name owned by an earlier sandbox
 is waited out.
+
+**Re-placing a pinned pod.** A pod pinned to the holders of a checkpoint no store
+had when it was created, which the scheduler finds no room for (`PodScheduled`
+`False`, `Unschedulable`), is deleted once a store holds the checkpoint (with its UID
+and resource version as preconditions, so a pod bound meanwhile stays), with a
+`Replaced` event; the next pod may run on any node that runs the checkpoint's CPU,
+including one the cluster autoscaler adds for it. An unscheduled pod has started
+nothing, and the API server removes it at once. This is the only pod the controller
+replaces.
 
 **Imports.** When the VM pod of a sandbox from a checkpoint is scheduled onto a node
 not in the checkpoint's `status.nodes`, the controller creates an import `Transfer`

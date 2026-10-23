@@ -8,7 +8,7 @@
 # Security level forbids both, so this is the privileged level. Keep sandbox
 # namespaces for sandboxes only and give people the savestate-user role there, never
 # pod creation. The controller builds every VM pod with no service-account token,
-# QEMU as non-root with its seccomp sandbox on, and a Guaranteed memory request.
+# QEMU as non-root with its seccomp sandbox on, and a memory request equal to its limit.
 apiVersion: v1
 kind: Namespace
 metadata:

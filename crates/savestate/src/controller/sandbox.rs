@@ -2,13 +2,15 @@
 
 use std::{sync::Arc, time::Duration};
 
-use k8s_openapi::api::core::v1::Pod;
+use k8s_openapi::{api::core::v1::Pod, apimachinery::pkg::api::resource::Quantity};
 use kube::{
     Api, ResourceExt,
     api::{Patch, PatchParams, PostParams},
     runtime::{Controller, controller::Action, events::EventType, reflector::ObjectRef, watcher},
 };
-use savestate_api::{Checkpoint, CheckpointPhase, Config, Sandbox, SandboxPhase, SandboxStatus};
+use savestate_api::{
+    Checkpoint, CheckpointPhase, Config, Sandbox, SandboxPhase, SandboxStatus, config::Shape,
+};
 use serde_json::json;
 
 use super::{Context, Error, MANAGER, pod};
@@ -201,6 +203,7 @@ async fn plan(sandbox: &Sandbox, ctx: &Context) -> Result<Plan, Error> {
         return Ok(Plan::Run(pod::Vm {
             image: ctx.launcher_image.clone(),
             vcpus,
+            cpu: cpu_request(&ctx.config, vcpus, memory, Some(disk))?,
             memory: memory.clone(),
             nodes: None,
         }));
@@ -240,6 +243,7 @@ async fn plan(sandbox: &Sandbox, ctx: &Context) -> Result<Plan, Error> {
     Ok(Plan::Run(pod::Vm {
         image: fingerprint.launcher_image,
         vcpus,
+        cpu: cpu_request(&ctx.config, vcpus, &memory, status.disk.as_ref())?,
         memory,
         nodes: Some(status.nodes),
     }))
@@ -250,8 +254,8 @@ fn refuse_by_config(
     config: &Config,
     image: &str,
     vcpus: u32,
-    memory: &k8s_openapi::apimachinery::pkg::api::resource::Quantity,
-    disk: &k8s_openapi::apimachinery::pkg::api::resource::Quantity,
+    memory: &Quantity,
+    disk: &Quantity,
 ) -> Result<Option<String>, Error> {
     let registries = &config.images.registries;
     let allowed = |prefix: &String| {
@@ -266,17 +270,8 @@ fn refuse_by_config(
         )));
     }
     let shapes = &config.vm.shapes;
-    if shapes.is_empty() {
+    if shapes.is_empty() || offered(config, vcpus, memory, disk)?.is_some() {
         return Ok(None);
-    }
-    let (memory_q, disk_q) = (pod::parse(memory, "memory")?, pod::parse(disk, "disk")?);
-    for shape in shapes {
-        if shape.vcpus == vcpus
-            && pod::parse(&shape.memory, "vm.shapes memory")? == memory_q
-            && pod::parse(&shape.disk, "vm.shapes disk")? == disk_q
-        {
-            return Ok(None);
-        }
     }
     let offered: Vec<String> = shapes
         .iter()
@@ -288,6 +283,43 @@ fn refuse_by_config(
         disk.0,
         offered.join(", ")
     )))
+}
+
+/// The configured shape a sandbox of this size has, if any.
+fn offered<'a>(
+    config: &'a Config,
+    vcpus: u32,
+    memory: &Quantity,
+    disk: &Quantity,
+) -> Result<Option<&'a Shape>, Error> {
+    let (memory, disk) = (pod::parse(memory, "memory")?, pod::parse(disk, "disk")?);
+    for shape in &config.vm.shapes {
+        if shape.vcpus == vcpus
+            && pod::parse(&shape.memory, "vm.shapes memory")? == memory
+            && pod::parse(&shape.disk, "vm.shapes disk")? == disk
+        {
+            return Ok(Some(shape));
+        }
+    }
+    Ok(None)
+}
+
+/// The CPU a VM pod requests: its shape's `cpuRequest`, else
+/// `vm.cpuRequestPerVcpu` for each vCPU.
+fn cpu_request(
+    config: &Config,
+    vcpus: u32,
+    memory: &Quantity,
+    disk: Option<&Quantity>,
+) -> Result<Quantity, Error> {
+    if let Some(disk) = disk
+        && let Some(request) =
+            offered(config, vcpus, memory, disk)?.and_then(|s| s.cpu_request.as_ref())
+    {
+        return Ok(request.clone());
+    }
+    let per_vcpu = pod::parse(&config.vm.cpu_request_per_vcpu, "vm.cpuRequestPerVcpu")?;
+    Ok((per_vcpu * vcpus).into())
 }
 
 /// Sandbox status from its VM pod.

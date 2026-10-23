@@ -30,10 +30,18 @@ vm:
   # Added to each sandbox's memory for its pod's memory request, to cover QEMU.
   # memoryOverhead: 512Mi
 
-  # Shapes a sandbox from an image may use. Default: [] (any shape).
+  # CPU a VM pod requests per vCPU, for shapes without their own cpuRequest; more
+  # than 0, at most 1. At 1 the pod's CPU limit equals its request (Guaranteed);
+  # below 1 it has no CPU limit (Burstable; see "CPU requests below the vCPU count"
+  # in docs/design.md). Memory is always request = limit.
+  # cpuRequestPerVcpu: 1
+
+  # Shapes a sandbox from an image may use. Default: [] (any shape). cpuRequest
+  # (more than 0, at most vcpus) is the CPU a sandbox of the shape requests.
+  # Default: vcpus × cpuRequestPerVcpu.
   shapes:
     - {vcpus: 2, memory: 4Gi, disk: 30Gi}
-    - {vcpus: 4, memory: 8Gi, disk: 60Gi}
+    - {vcpus: 4, memory: 8Gi, disk: 60Gi, cpuRequest: 3500m}
 
   # Where VM pods run. The node-agent DaemonSet in node.yaml must select the same
   # nodes. Default: any node.

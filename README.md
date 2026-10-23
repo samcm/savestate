@@ -27,7 +27,7 @@ capacity, scheduling and quotas stay plain Kubernetes.
 
 ## How it works
 
-A controller turns each `Sandbox` object into one Guaranteed VM pod. A node agent
+A controller turns each `Sandbox` object into one VM pod. A node agent
 on every node owns that node's base images, disk layers and checkpoints, and tells
 the launcher in each VM pod to checkpoint or restore. The launcher drives stock QEMU
 over QMP; a guest agent inside the VM runs commands, copies files and fixes up clock,
@@ -47,10 +47,10 @@ the same static `savestate` binary.
                                  └────────────┬─────────────┘
                                    unix socket│
 ┌─────────────────────────────────────────────▼──────────────┐
-│ VM pod (Guaranteed, not privileged): savestate launcher →  │
-│ qemu (QMP) · no service-account token · /dev/kvm,          │
-│ /dev/net/tun, /dev/vhost-vsock from the node agent's       │
-│ device plugin · seccomp profile savestate/vm.json          │
+│ VM pod (not privileged): savestate launcher → qemu (QMP)   │
+│ no service-account token · memory request = limit ·        │
+│ /dev/kvm, /dev/net/tun, /dev/vhost-vsock from the node     │
+│ agent's device plugin · seccomp profile savestate/vm.json  │
 │ tap + nftables NAT inside the pod's network namespace      │
 │        └─ vsock ─▶ savestate-guest (exec, files, fixups)    │
 └────────────────────────────────────────────────────────────┘

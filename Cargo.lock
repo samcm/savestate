@@ -3153,6 +3153,7 @@ dependencies = [
  "ipnet",
  "k8s-openapi",
  "kube",
+ "kube_quantity",
  "schemars",
  "serde",
  "serde-saphyr 2.0.0",

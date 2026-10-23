@@ -22,6 +22,7 @@ fn manifest(name: &str, chain: &[String]) -> Manifest {
         memory_mib: 1024,
         disk_bytes: 4 << 30,
         guest_time_unix_ns: None,
+        image: "ghcr.io/example/base@sha256:0".into(),
         chain: chain.to_vec(),
         machine_args: vec!["-m".into(), "1024M".into()],
         migration: FileMigration {

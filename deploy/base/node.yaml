@@ -86,8 +86,9 @@ spec:
             requests:
               cpu: 100m
               memory: 128Mi
+            # Up to 256 MiB per transfer (transfers.perNode, default 4).
             limits:
-              memory: 1Gi
+              memory: 2Gi
           # Root without privilege: it owns the state directory and hands files to
           # the VM pods' non-root QEMU, serves the kubelet a device plugin and
           # installs the VM pods' seccomp profile.

@@ -46,13 +46,16 @@ message StartRequest {
 }
 
 message Boot {
-  // Base disk image, `images/sha256-<hex>.qcow2` relative to the state directory.
+  // Base disk image, `images/<hex>.qcow2` relative to the state directory.
   string image = 1;
   uint32 vcpus = 2;
   uint64 memory_mib = 3;
   uint64 disk_bytes = 4;
   // QEMU CPU model; the launcher adds `enforce`.
   string cpu_model = 5;
+  // The sandbox image `image` was pulled from, by digest (`…@sha256:<hex>`).
+  // Checkpoints record it, so that a node without the disk pulls it again.
+  string image_reference = 6;
 }
 
 message Restore {

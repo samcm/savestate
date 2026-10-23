@@ -6,9 +6,11 @@
 //! a restored one carries both histories. Along the way: labels and selectors,
 //! waiting for a sandbox that fails, exec with environment and working directory,
 //! detached processes that outlive a guest-agent restart, and file and directory
-//! copies. A checkpoint exported to an object store outlives its node-local copy: a
-//! sandbox started from it once the node has dropped its copy imports it from the
-//! store and resumes exactly its state. A guest port is unreachable until the
+//! copies. A checkpoint exported to an object store outlives its node-local copy: the
+//! store holds its memory file and disk layers but not the base image, and a
+//! sandbox started from it once the node has dropped its copy (and the base image)
+//! imports it from the store, pulls the image again, and resumes exactly its state.
+//! A guest port is unreachable until the
 //! sandbox exposes it; then it answers through the sandbox's Service to clients the
 //! installation allows and to no one else, and a fork of the sandbox answers through
 //! its own Service. Port-forward reaches any guest port.
@@ -639,6 +641,24 @@ async fn export_drop_the_local_copy_and_restore_from_the_store() {
     })
     .await;
     report(&format!("store objects: {}", store_objects(&uid).await));
+    // What the store holds for it is what the checkpoint adds to its base image: the
+    // memory file and the disk layer, plus small indexes and the manifest.
+    let (stored, files) = stored_bytes(&uid).await;
+    let status = checkpoints.get("parked-1").await.unwrap().status.unwrap();
+    let added = status.memory_bytes.unwrap() + status.disk_bytes.unwrap();
+    report(&format!(
+        "store bytes for the checkpoint: {:.1} MiB; memory file + disk layer on the node: {:.1} MiB",
+        f64_mib(stored),
+        f64_mib(added)
+    ));
+    assert!(
+        files.iter().all(|path| !path.starts_with("images/")),
+        "the store holds the base image: {files:?}"
+    );
+    assert!(
+        stored <= added + (1 << 20),
+        "the store holds {stored} bytes for a checkpoint that adds {added}: {files:?}"
+    );
 
     // Parked: the sandbox goes, and the node drops its copy; only the store has it.
     savestate(&["delete", "sandbox", "parked"]);
@@ -657,6 +677,22 @@ async fn export_drop_the_local_copy_and_restore_from_the_store() {
         "evicted: {}",
         note(&client, &ns, "parked-1", "Evicted").await
     ));
+    // As on a node that never had them: no layers of the checkpoint, no base image.
+    let base = format!(
+        "/var/lib/savestate/images/{}.qcow2",
+        image.rsplit_once("@sha256:").unwrap().1
+    );
+    let layers: Vec<String> = files
+        .iter()
+        .filter(|path| path.starts_with("layers/"))
+        .map(|path| format!("/var/lib/savestate/{path}"))
+        .collect();
+    let dropped = Command::new("docker")
+        .args(["exec", &node, "rm", "-f", &base])
+        .args(&layers)
+        .status()
+        .unwrap();
+    assert!(dropped.success());
 
     // Restored from the store: imported to the node, then resumed exactly.
     let started = Instant::now();
@@ -686,6 +722,11 @@ async fn export_drop_the_local_copy_and_restore_from_the_store() {
     std::thread::sleep(Duration::from_secs(1));
     assert!(counter("parked-back").1 > count, "the process runs");
     assert_eq!(sh("parked-back", "cat /root/state"), "kept\n");
+    let pulled = Command::new("docker")
+        .args(["exec", &node, "test", "-e", &base])
+        .status()
+        .unwrap();
+    assert!(pulled.success(), "the import did not bring back {base}");
     let status = checkpoints.get("parked-1").await.unwrap().status.unwrap();
     assert_eq!(
         status.nodes,
@@ -910,6 +951,42 @@ async fn scale_down(client: &Client, node: &str) -> Option<String> {
         .annotations()
         .get("cluster-autoscaler.kubernetes.io/scale-down-disabled")
         .cloned()
+}
+
+/// The bytes the store holds for checkpoint `uid` (its manifest and every object of
+/// the files it names), and those files.
+async fn stored_bytes(uid: &str) -> (u64, Vec<String>) {
+    use object_store::{ObjectStore as _, ObjectStoreExt as _, path::Path};
+    let endpoint = env("SAVESTATE_E2E_S3_ENDPOINT");
+    let store = object_store::aws::AmazonS3Builder::new()
+        .with_endpoint(&endpoint)
+        .with_bucket_name(env("SAVESTATE_E2E_S3_BUCKET"))
+        .with_region("us-east-1")
+        .with_access_key_id(env("SAVESTATE_E2E_S3_ACCESS_KEY_ID"))
+        .with_secret_access_key(env("SAVESTATE_E2E_S3_SECRET_ACCESS_KEY"))
+        .with_allow_http(endpoint.starts_with("http://"))
+        .build()
+        .unwrap();
+    let prefix = env("SAVESTATE_E2E_S3_PREFIX");
+    let manifest = store
+        .get(&Path::from(format!("{prefix}/manifests/{uid}.json")))
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    let mut bytes = manifest.len() as u64;
+    let manifest: serde_json::Value = serde_json::from_slice(&manifest).unwrap();
+    let files: Vec<String> = serde_json::from_value(manifest["files"].clone()).unwrap();
+    for file in &files {
+        let objects: Vec<_> = futures::TryStreamExt::try_collect(
+            store.list(Some(&Path::from(format!("{prefix}/files/{file}")))),
+        )
+        .await
+        .unwrap();
+        bytes += objects.iter().map(|object| object.size).sum::<u64>();
+    }
+    (bytes, files)
 }
 
 /// What the store holds for checkpoint `uid`: bytes per file, and the manifest.

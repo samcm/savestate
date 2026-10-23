@@ -87,7 +87,7 @@ Everything below describes one installation and comes from your overlay; nothing
 | State directory | `stateDir` (default `/var/lib/savestate`) and the node agent's `hostPath` must agree, on a disk large enough for your checkpoints. |
 | Object stores | `stores`: per store an S3-compatible `endpoint`, `bucket`, `region`, `prefix` (one prefix per installation) and `credentialsSecret`, a Secret in `savestate-system` with `accessKeyId` and `secretAccessKey`. `export` names the store every checkpoint is exported to (default: only checkpoints with `spec.export`). Without stores, checkpoints live only on the node that took them. |
 | Cache eviction | `cache.minFreePercent` (default 10): below that much free space on the state directory's filesystem, nodes drop their copies of exported checkpoints. |
-| TTL limits, transfer concurrency | `ttl` and `transfers.perNode` (defaults: no limits, one transfer per node). |
+| TTL limits, transfer concurrency | `ttl` and `transfers.perNode` (defaults: no limits, four transfers per node; each buffers up to 256 MiB in the node agent, whose memory limit in `base/node.yaml` allows four). |
 
 [`base/config.yaml`](base/config.yaml) is the example config; every field is
 documented there and in `crates/savestate-api/src/config.rs`. Fields not set take
@@ -190,7 +190,9 @@ import + restore. On one managed cluster with 64 GiB nodes that was 163 s from
 `Pending` to `Running`: the autoscaler asked for a node after 61 s and the node was
 Ready 139 s after the pod went pending; the import of 467 MiB took 4.5 s and the
 restore 3.3 s. Node boot dominates; the import grows with the checkpoint's memory
-file and new layers (a base image the node lacks comes from the store too).
+file and disk layers. Stores do not hold base images: a node that lacks one pulls it
+from its registry (or has it from `images.prefetch`) while the layers download, so
+keep every image a checkpoint may still need in its registry.
 
 **CPU model.** Use a named `vm.cpuModel` that every machine type the pool may get
 runs (for example `EPYC-Rome-v4` across Zen 2 and Zen 3, or a `Skylake-Server`
@@ -222,9 +224,9 @@ are dropped first when it fills (`cache.minFreePercent`).
 **Faster node join.**
 
 - `images.prefetch`: the base images your sandboxes boot from, by digest. Each new
-  node pulls them as soon as its agent starts, so the first boot there does not wait
-  for a multi-GiB pull. The node takes VMs meanwhile; only a boot from an image still
-  being pulled waits for it.
+  node pulls them as soon as its agent starts, so the first boot or import there does
+  not wait for a multi-GiB pull. The node takes VMs meanwhile; only a boot or import
+  needing an image still being pulled waits for it.
 - A startup taint `startup-taint.cluster-autoscaler.kubernetes.io/savestate=true:NoSchedule`
   on the VM pool (applied when a node registers). The node agent removes it once its
   node advertises VM slots, and again whenever it reappears, for example when an

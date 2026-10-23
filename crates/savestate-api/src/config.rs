@@ -242,7 +242,9 @@ pub struct Images {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Transfers {
-    /// Transfers each node sends or receives at a time. Default: 1.
+    /// Transfers each node sends or receives at a time; a free slot goes to an
+    /// import before an export. Each buffers at most 256 MiB in the node agent.
+    /// Default: 4.
     #[serde(default = "default_transfers_per_node")]
     pub per_node: u32,
 }
@@ -298,7 +300,7 @@ fn default_cpu_request_per_vcpu() -> Quantity {
 }
 
 fn default_transfers_per_node() -> u32 {
-    1
+    4
 }
 
 fn default_min_free_percent() -> u8 {

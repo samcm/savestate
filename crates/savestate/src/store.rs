@@ -52,6 +52,10 @@ pub struct Manifest {
     pub disk_bytes: u64,
     /// The guest's wall clock just before the save, in nanoseconds since the epoch.
     pub guest_time_unix_ns: Option<i64>,
+    /// The sandbox image the chain's base image was pulled from, by digest
+    /// (`…@sha256:<hex>`). Stores do not hold the base image; an import pulls it from
+    /// here.
+    pub image: String,
     /// The disk, base image first, the checkpoint's own (frozen) layer last; paths
     /// relative to the state directory.
     pub chain: Vec<String>,

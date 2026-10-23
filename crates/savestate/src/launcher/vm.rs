@@ -78,6 +78,8 @@ pub struct Vm {
     guest: Client,
     store: Store,
     layer_prefix: String,
+    /// The sandbox image the chain starts from, by digest.
+    image: String,
     /// QEMU's node name of the active disk layer.
     top_node: String,
     /// The disk, base image first, active layer last.
@@ -101,6 +103,8 @@ pub struct Vm {
 struct Planned {
     kind: LaunchKind,
     machine_args: Vec<String>,
+    /// The sandbox image the chain starts from, by digest.
+    image: String,
     /// The disk below the sandbox's first layer.
     chain: Vec<String>,
     vcpus: u32,
@@ -190,6 +194,7 @@ pub async fn start(ctx: &Context, request: StartRequest) -> anyhow::Result<Vm> {
         guest,
         store,
         layer_prefix: request.layer_prefix,
+        image: machine.image,
         top_node: "disk0".into(),
         chain,
         next_layer: 1,
@@ -260,6 +265,7 @@ async fn boot_machine(
     Ok(Planned {
         kind: LaunchKind::Boot,
         machine_args,
+        image: boot.image_reference.clone(),
         chain: vec![boot.image.clone()],
         vcpus: boot.vcpus,
         memory_mib: boot.memory_mib,
@@ -309,6 +315,7 @@ async fn restore_machine(
     Ok(Planned {
         kind: LaunchKind::Restore { generation: 0 },
         machine_args: manifest.machine_args.clone(),
+        image: manifest.image.clone(),
         chain: manifest.chain.clone(),
         vcpus: manifest.vcpus,
         memory_mib: manifest.memory_mib,
@@ -506,6 +513,7 @@ impl Vm {
             memory_mib: self.memory_mib,
             disk_bytes: self.disk_bytes,
             guest_time_unix_ns,
+            image: self.image.clone(),
             chain,
             machine_args: self.machine_args.clone(),
             migration: self.migration,

@@ -115,8 +115,11 @@ images:
 # cache:
 #   minFreePercent: 10
 
+# Transfers (exports and imports) each node runs at a time; a free slot goes to
+# an import, which a sandbox waits for, before an export. Each buffers up to
+# 256 MiB in the node agent: raise its memory limit (node.yaml) with this.
 # transfers:
-#   perNode: 1
+#   perNode: 4
 
 ttl:
   sandbox:

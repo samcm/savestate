@@ -29,6 +29,33 @@ request as any change to the behaviour it describes.
 - Drive stock QEMU over QMP. Do not patch QEMU or the host kernel.
 - Work through pull requests; keep each one to one coherent change.
 
+## Tests
+
+- Add a test only when you can name the realistic regression it catches, and that
+  regression would hurt a user: a restore that resumes the wrong state, copies that
+  are not independent, a crash that leaves a half-published checkpoint, a controller
+  that deletes data still in use, a CRD that accepts a spec that cannot work. If you
+  cannot name it, do not write the test.
+- Do not test trivia or the improbable: serde round-trips, argument formatting,
+  constants, getters, `Display` text, log lines, mock call order, or states the code
+  cannot reach.
+- Prefer one end-to-end test against real QEMU/KVM over many unit tests of glue code.
+  Unit tests are for logic with real edge cases (layer chains, GC reachability,
+  placement decisions).
+- Test through public interfaces so tests survive refactors.
+
+## No compatibility, no migrations
+
+Nothing is deployed. Make hard, clean breaking changes:
+
+- Change CRD fields, config, on-disk layout, checkpoint formats and wire protocols in
+  place. No version shims, fallback readers for old formats, deprecated aliases,
+  conversion webhooks or migration code, and no tests of upgrades from older versions.
+  A checkpoint from an older build may simply be refused; its fingerprint already
+  says so.
+- Delete the code and docs a change replaces in the same pull request.
+- This holds until `docs/design.md` says savestate has users to protect.
+
 ## Checks
 
 ```sh

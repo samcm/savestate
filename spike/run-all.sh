@@ -44,6 +44,7 @@ image=${GUEST_IMAGE:-$WORK/guest.qcow2}
 cp "$image" "$WORK/layers/base.qcow2"
 cp "${image%.qcow2}.vmlinuz" "$WORK/layers/base.vmlinuz"
 cp "${image%.qcow2}.initrd" "$WORK/layers/base.initrd"
+echo "| Guest | $(cat "${image%.qcow2}.info") |" >>"$OUT/host.md"
 chmod a-w "$WORK/layers/base.qcow2"
 
 failed=()

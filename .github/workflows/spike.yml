@@ -1,7 +1,8 @@
 name: spike
 
 # Phase 0: measure the QEMU mechanics in docs/design.md on real KVM. GitHub-hosted
-# runners are VMs with /dev/kvm (nested). QEMU runs in a Debian 13 container; see
+# runners are VMs with /dev/kvm (nested). QEMU is the launcher's own build: the
+# Dockerfile's base-amd64 stage (QEMU 11.1.2 from upstream source); see
 # spike/RESULTS.md. Results land in the job summary and the spike-results artifact.
 on:
   workflow_dispatch:
@@ -62,15 +63,34 @@ jobs:
           free -g
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
+          path: qemu-image.tar
+          key: spike-qemu-${{ hashFiles('Dockerfile') }}
+      - name: The launcher's QEMU (Dockerfile, target base-amd64)
+        run: |
+          if [ -f qemu-image.tar ]; then
+            docker load -i qemu-image.tar
+          else
+            docker build --target base-amd64 -t savestate-qemu -f Dockerfile .
+            docker save savestate-qemu -o qemu-image.tar
+          fi
+          docker run --rm savestate-qemu qemu-system-x86_64 --version
+      # The guest is rebuilt whenever Debian publishes a new trixie cloud image.
+      - name: Current Debian 13 cloud image
+        id: debian
+        run: |
+          sum=$(curl -fsSL https://cloud.debian.org/images/cloud/trixie/latest/SHA512SUMS |
+            awk '$2 == "debian-13-genericcloud-amd64.qcow2" { print substr($1, 1, 16) }')
+          echo "sum=$sum" >>"$GITHUB_OUTPUT"
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
           path: guest-image
-          key: spike-guest-${{ hashFiles('spike/prepare-guest.sh') }}
+          key: spike-guest-${{ steps.debian.outputs.sum }}-${{ hashFiles('spike/prepare-guest.sh') }}
       - name: Run the experiments
         run: |
           mkdir -p guest-image
           docker run --rm --privileged -v "$PWD:/repo" -v "$SCRATCH:/work" -w /repo \
             -e GUEST_IMAGE=/repo/guest-image/base.qcow2 -e EXP1_MEM -e CLOCK_WAIT -e EXPERIMENTS \
-            debian:trixie@sha256:4c25275446ca371766b8b093c696782eabce06263fccacb8d5d813b3dc44b308 \
-            bash -c 'spike/install-qemu.sh && spike/run-all.sh /work /repo/spike-out $EXPERIMENTS'
+            savestate-qemu bash -c 'spike/install-tools.sh && spike/run-all.sh /work /repo/spike-out $EXPERIMENTS'
       # Exercise spike/cross-cpu.sh end to end with this runner as both hosts (over
       # ssh to localhost), so it is known to work before it is run on real hardware.
       - name: cross-cpu.sh self-test
@@ -84,7 +104,7 @@ jobs:
           ssh-keyscan -H localhost >>~/.ssh/known_hosts 2>/dev/null
           mkdir -p /var/tmp/xc-save/guest
           sudo cp guest-image/base.* /var/tmp/xc-save/guest/ && sudo chown -R "$(id -u)" /var/tmp/xc-save
-          spike/cross-cpu.sh --cpu "$(cat "$SCRATCH/cpu-model")" --dir /var/tmp/xc-save --restore-dir /var/tmp/xc-restore \
+          spike/cross-cpu.sh --qemu-image savestate-qemu --cpu "$(cat "$SCRATCH/cpu-model")" --dir /var/tmp/xc-save --restore-dir /var/tmp/xc-restore \
             --image /var/tmp/xc-save/guest/base.qcow2 localhost localhost 2>&1 | tee cross-cpu-selftest.txt
           sudo mkdir -p spike-out && sudo cp cross-cpu-selftest.txt spike-out/
       - name: Summary

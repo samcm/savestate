@@ -23,20 +23,24 @@
 #                     NAME.initrd, from prepare-guest.sh) on SAVE_HOST, inside DIR when
 #                     QEMU runs in a container (default: built there by
 #                     prepare-guest.sh, which needs internet access and root)
-#   --runtime R       how QEMU runs on the hosts: docker (default) or podman, both run
-#                     through sudo in a debian:trixie container with install-qemu.sh, so
-#                     both hosts get the same QEMU build; or host, which uses the hosts'
+#   --runtime R       how QEMU runs on the hosts: docker (default) or podman, both
+#                     through sudo, in the launcher image's QEMU (see --qemu-image), so
+#                     both hosts run the identical build; or host, which uses the hosts'
 #                     own QEMU 11.1, qemu-img, python3, jq, curl and genisoimage
+#   --qemu-image IMG  container image with the QEMU to test, already present on this
+#                     machine (default: build the `base-amd64` stage of this checkout's
+#                     Dockerfile, i.e. the launcher's QEMU 11.1.2). It is copied to both
+#                     hosts with `docker save | ssh HOST sudo RUNTIME load`.
 #   --direct-io BOOL  migrate with direct-io (default true; false if DIR's filesystem
 #                     does not support O_DIRECT)
 #   --keep            keep DIR on both hosts afterwards
 #
 # Each host needs /dev/kvm, sshd, and either sudo plus docker/podman or the tools above.
+# This machine needs ssh, and docker for the default runtimes.
 # Exit status 0 means the restore passed every check.
 set -euo pipefail
 
-IMAGE_REF=debian:trixie@sha256:4c25275446ca371766b8b093c696782eabce06263fccacb8d5d813b3dc44b308
-FILES=(cross-cpu.sh lib.sh qmp.py prepare-guest.sh install-qemu.sh)
+FILES=(cross-cpu.sh lib.sh qmp.py prepare-guest.sh install-tools.sh)
 
 # --- inside a host (or its container): save and restore --------------------------
 
@@ -53,7 +57,7 @@ inner_setup() {
   trap 'for p in "$WORK"/vm/*/pid; do [ -f "$p" ] && kill -9 "$(cat "$p")" 2>/dev/null; done; true' EXIT
 }
 
-qemu_build() { qemu-system-x86_64 --version | head -1; }
+qemu_build() { echo "$(qemu-system-x86_64 --version | head -1), sha256 $(sha256sum "$(command -v qemu-system-x86_64)" | cut -c1-16)"; }
 
 inner_probe() {
   local cpu=$1
@@ -150,7 +154,7 @@ esac
 
 # --- on the coordinating machine --------------------------------------------------
 
-cpu=EPYC-Rome-v4 mem=2G dir=/var/tmp/savestate-cross-cpu rdir='' image='' runtime=docker dio=true keep=''
+cpu=EPYC-Rome-v4 mem=2G dir=/var/tmp/savestate-cross-cpu rdir='' image='' runtime=docker dio=true keep='' qemu_image=''
 while [ $# -gt 2 ]; do
   case "$1" in
     --cpu) cpu=$2; shift 2 ;;
@@ -159,6 +163,7 @@ while [ $# -gt 2 ]; do
     --restore-dir) rdir=$2; shift 2 ;;
     --image) image=$2; shift 2 ;;
     --runtime) runtime=$2; shift 2 ;;
+    --qemu-image) qemu_image=$2; shift 2 ;;
     --direct-io) dio=$2; shift 2 ;;
     --keep) keep=1; shift ;;
     *) echo "unknown option $1" >&2; exit 2 ;;
@@ -170,21 +175,33 @@ rdir=${rdir:-$dir}
 spike=$(cd "$(dirname "$0")" && pwd)
 
 # on HOST DIR ARGS...: run ARGS in DIR on HOST, inside a fresh QEMU container unless
-# --runtime host. Only the spike's own commands need QEMU installed first.
+# --runtime host. Only the spike's own commands need the tools installed first.
 on() {
   local host=$1 d=$2
   shift 2
   local cmd prep=
   cmd=$(printf '%q ' "$@")
-  [ "$1" = ./cross-cpu.sh ] && prep='./install-qemu.sh >&2 && '
+  [ "$1" = ./cross-cpu.sh ] && prep='./install-tools.sh >&2 && '
   case "$runtime" in
     host) ssh "$host" "cd $(printf %q "$d") && $cmd" ;;
     docker | podman)
       ssh "$host" "sudo $runtime run --rm -i --privileged -v $(printf %q "$d:$d") -w $(printf %q "$d") \
-        $IMAGE_REF bash -c $(printf %q "$prep$cmd")" ;;
+        $qemu_image bash -c $(printf %q "$prep$cmd")" ;;
     *) echo "unknown runtime $runtime" >&2; exit 2 ;;
   esac
 }
+
+if [ "$runtime" != host ]; then
+  if [ -z "$qemu_image" ]; then
+    qemu_image=savestate-qemu:cross-cpu
+    echo "== building the launcher's QEMU ($qemu_image) from $(dirname "$spike")/Dockerfile"
+    docker build -q --target base-amd64 -t "$qemu_image" -f "$(dirname "$spike")/Dockerfile" "$(dirname "$spike")"
+  fi
+  for h in "$save_host" "$restore_host"; do
+    echo "== loading $qemu_image on $h"
+    docker save "$qemu_image" | ssh "$h" "sudo $runtime load -q"
+  done
+fi
 
 for hd in "$save_host $dir" "$restore_host $rdir"; do
   read -r h d <<<"$hd"

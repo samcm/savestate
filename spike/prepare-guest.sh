@@ -10,13 +10,14 @@
 # Mounting the partition needs root.
 #
 # Usage: prepare-guest.sh OUTPUT.qcow2
-#   writes OUTPUT.qcow2, OUTPUT.vmlinuz and OUTPUT.initrd (does nothing if they exist)
+#   writes OUTPUT.qcow2, OUTPUT.vmlinuz, OUTPUT.initrd and OUTPUT.info (what it is);
+#   does nothing if they exist
 # Environment: CPU_MODEL (default EPYC-Rome-v4), ACCEL (default kvm)
 set -euo pipefail
 
 out=$1
 base=${out%.qcow2}
-[ -s "$out" ] && [ -s "$base.vmlinuz" ] && [ -s "$base.initrd" ] && { echo "guest $out already present"; exit 0; }
+[ -s "$out" ] && [ -s "$base.vmlinuz" ] && [ -s "$base.initrd" ] && [ -s "$base.info" ] && { echo "guest $out already present"; exit 0; }
 url=https://cloud.debian.org/images/cloud/trixie/latest
 img=debian-13-genericcloud-amd64.qcow2
 tmp=$(mktemp -d)
@@ -48,6 +49,7 @@ mkdir mnt
 mount -o loop,ro,offset=$(($(partx -g -o START -n 1 raw.img) * 512)) raw.img mnt
 cp "$(ls -v mnt/boot/vmlinuz-* | tail -1)" vmlinuz
 cp "$(ls -v mnt/boot/initrd.img-* | tail -1)" initrd
+echo "Debian $(cat mnt/etc/debian_version) generic cloud image (sha512 $(sha512sum "$img" | cut -c1-16)), kernel $(ls -v mnt/boot/vmlinuz-* | tail -1 | sed 's/.*vmlinuz-//')" >info
 umount mnt
 rm raw.img
 
@@ -64,5 +66,6 @@ mkdir -p "$(dirname "$out")"
 qemu-img convert -O qcow2 "$img" "$out.tmp"
 cp vmlinuz "$base.vmlinuz"
 cp initrd "$base.initrd"
+cp info "$base.info"
 mv "$out.tmp" "$out"
 qemu-img info "$out"

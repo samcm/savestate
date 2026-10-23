@@ -558,8 +558,10 @@ published.
 **Garbage collection.** Every minute the node agent lists its files, then the
 Sandboxes and Checkpoints of its namespaces (fresh), and removes checkpoints (and
 saves) whose object is gone, layers no existing sandbox owns and no remaining
-checkpoint's chain (including a complete save's) uses, images no sandbox boots and no
-chain uses, and run directories of sandboxes that are gone. Files are listed first, so
+checkpoint's chain (including a complete save's) uses, images no sandbox boots, no
+chain uses and no sandbox booted from in the last hour (a boot from a cached image
+records its use as the file's modification time, so deleting a sandbox and creating
+it again pulls nothing), and run directories of sandboxes that are gone. Files are listed first, so
 a file created meanwhile is never taken for garbage. It reports bytes per kind and
 free bytes as metrics (`savestate_node_disk_bytes`, `savestate_node_disk_free_bytes`)
 on `--metrics-listen` (default `0.0.0.0:9090`).

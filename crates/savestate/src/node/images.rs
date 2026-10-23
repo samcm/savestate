@@ -81,6 +81,9 @@ impl Images {
             .with_context(|| format!("image {reference} is not pinned by sha256 digest"))?;
         let path = self.root.join(crate::store::image_path(&hex));
         if path.exists() {
+            if let Err(error) = crate::store::touch(&path) {
+                tracing::warn!(path = %path.display(), %error, "recording an image's use");
+            }
             return Ok(hex);
         }
         let lock = self

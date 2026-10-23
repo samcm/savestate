@@ -1,4 +1,6 @@
-# Pushes ghcr.io/samcm/savestate:main and :sha-<short> for every push to main.
+# Pushes ghcr.io/samcm/savestate, and the guest base image as ghcr.io/samcm/savestate-base
+# (disk) and ghcr.io/samcm/savestate-rootfs (container), :main and :sha-<short>, for
+# every push to main.
 name: publish
 
 on:
@@ -28,3 +30,54 @@ jobs:
       packages: write
     with:
       push: true
+
+  # The generic guest base image (guest/rootfs) with this commit's guest agent, as
+  # :main and :sha-<short> of two images:
+  # - ghcr.io/samcm/savestate-base, the `disk` stage (FROM scratch with
+  #   /rootfs.qcow2): a sandbox image, usable by digest as is.
+  # - ghcr.io/samcm/savestate-rootfs, the `base` stage (Debian 13, systemd, the
+  #   guest agent): a container image to build an installation's own image FROM,
+  #   then convert with `guest/rootfs/build.sh disk-from` (see guest/README.md).
+  base-image:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    env:
+      DISK_IMAGE: ghcr.io/${{ github.repository }}-base
+      ROOTFS_IMAGE: ghcr.io/${{ github.repository }}-rootfs
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - name: Build the guest agent
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq musl-tools
+          cargo build --locked --release --target x86_64-unknown-linux-musl -p savestate-guest
+          install -D -m 0755 target/x86_64-unknown-linux-musl/release/savestate-guest "$RUNNER_TEMP/agent/savestate-guest"
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      # Single linux/amd64 manifests with gzip layers (the node agent reads gzip or
+      # plain tar), no attestations. The second build reuses the first's base stage.
+      - name: Build and push
+        run: |
+          push() {
+            local target=$1 image=$2
+            docker buildx build guest/rootfs \
+              --build-context "agent=$RUNNER_TEMP/agent" \
+              --target "$target" \
+              --platform linux/amd64 \
+              --provenance=false --sbom=false \
+              --output "type=image,push=true,compression=gzip,force-compression=true" \
+              --tag "$image:main" --tag "$image:sha-${GITHUB_SHA::7}" \
+              --metadata-file "$RUNNER_TEMP/$target.json"
+            echo "pushed $image@$(jq -r '."containerimage.digest"' "$RUNNER_TEMP/$target.json")" | tee -a "$GITHUB_STEP_SUMMARY"
+          }
+          push base "$ROOTFS_IMAGE"
+          push disk "$DISK_IMAGE"

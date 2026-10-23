@@ -49,7 +49,8 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=qemu /out/usr/local /usr/local
 # The guest kernel QEMU boots directly; part of every checkpoint's launcher image.
-COPY --chmod=0644 amd64/bzImage /usr/local/share/savestate/bzImage
+# Mode 0644 from the build context: --chmod would also apply to the directory.
+COPY amd64/bzImage /usr/local/share/savestate/bzImage
 RUN ! ldd /usr/local/bin/qemu-system-x86_64 /usr/local/bin/qemu-img | grep 'not found' \
     && qemu-system-x86_64 --version | grep -q '^QEMU emulator version 11\.1\.' \
     && qemu-system-x86_64 -machine help | grep -q '^pc-q35-11\.1 '

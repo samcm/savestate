@@ -66,7 +66,7 @@ jobs:
         run: |
           docker run --rm savestate:smoke --version
           docker run --rm --entrypoint sh savestate:smoke -c \
-            'qemu-system-x86_64 --version && qemu-img --version && ip -V && nft --version && test -s /usr/local/share/savestate/bzImage'
+            'qemu-system-x86_64 --version && qemu-img --version && ip -V && nft --version && su -s /bin/sh nobody -c "test -r /usr/local/share/savestate/bzImage"'
       - if: inputs.artifact
         run: docker save savestate:smoke | zstd -T0 -q -o image-amd64.tar.zst
       - if: inputs.artifact

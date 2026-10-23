@@ -20,7 +20,9 @@ use kube::CustomResourceExt;
 
 pub use checkpoint::{Checkpoint, CheckpointPhase, CheckpointSpec, CheckpointStatus, Fingerprint};
 pub use config::Config;
-pub use sandbox::{Clock, Sandbox, SandboxPhase, SandboxSource, SandboxSpec, SandboxStatus};
+pub use sandbox::{
+    Clock, Port, Protocol, Sandbox, SandboxPhase, SandboxSource, SandboxSpec, SandboxStatus,
+};
 pub use transfer::{Transfer, TransferEnd, TransferPhase, TransferSpec, TransferStatus};
 pub use ttl::{ParseTtlError, Ttl};
 

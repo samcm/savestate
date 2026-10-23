@@ -57,7 +57,8 @@ spec:
               
               Exactly one of `image` and `from` is set. A sandbox from an image states its shape
               (`vcpus`, `memory`, `disk`); a sandbox from a checkpoint inherits image and shape
-              from the checkpoint and must not set them. Only `ttl` can change after creation.
+              from the checkpoint and must not set them. Only `ttl`, `ports` and `service` can
+              change after creation.
             properties:
               clock:
                 description: |-
@@ -118,6 +119,51 @@ spec:
                   rule: "type(self) == int ? self > 0 : (isQuantity(self) && quantity(self).isGreaterThan(quantity('0')))"
                 - message: memory cannot change
                   rule: self == oldSelf
+              ports:
+                description: |-
+                  Guest ports reachable on the VM pod's address, from the sources the
+                  installation allows (`network.exposeFrom`). Nothing else reaches the guest.
+                  Can change at any time; a running sandbox follows within seconds. Not
+                  inherited from a checkpoint.
+                items:
+                  description: One guest port exposed on the VM pod's address, at the same number.
+                  properties:
+                    name:
+                      description: "Name of the Service port (a DNS label) [default: `tcp-8080` style]."
+                      maxLength: 63
+                      minLength: 1
+                      nullable: true
+                      pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                      type: string
+                    port:
+                      format: int32
+                      maximum: 65535.0
+                      minimum: 1.0
+                      type: integer
+                    protocol:
+                      default: TCP
+                      enum:
+                      - TCP
+                      - UDP
+                      type: string
+                  required:
+                  - port
+                  type: object
+                maxItems: 32
+                type: array
+                x-kubernetes-list-map-keys:
+                - port
+                - protocol
+                x-kubernetes-list-type: map
+                x-kubernetes-validations:
+                - message: port names must be unique
+                  rule: self.all(a, !has(a.name) || self.exists_one(b, has(b.name) && b.name == a.name))
+              service:
+                description: |-
+                  Also create a `ClusterIP` Service named after the sandbox, selecting its VM
+                  pod, with one port per entry in `ports`. Needs a name that is a DNS label
+                  starting with a letter.
+                type: boolean
               ttl:
                 description: |-
                   Delete the sandbox this long after its creation, e.g. `7d`. Can be changed
@@ -146,8 +192,12 @@ spec:
               rule: "!has(self.from) || !(has(self.vcpus) || has(self.memory) || has(self.disk))"
             - message: clock applies only to a sandbox started from a checkpoint (from)
               rule: "!has(self.clock) || has(self.from)"
-            - message: only ttl can change on a sandbox; delete it and create another
+            - message: >-
+                only ttl, ports and service can change on a sandbox; delete it and create
+                another
               rule: has(self.image) == has(oldSelf.image) && has(self.clock) == has(oldSelf.clock)
+            - message: service needs at least one port in ports
+              rule: "!has(self.service) || !self.service || (has(self.ports) && size(self.ports) > 0)"
           status:
             description: Written by the controller.
             nullable: true
@@ -187,6 +237,11 @@ spec:
         - spec
         title: Sandbox
         type: object
+        x-kubernetes-validations:
+        - message: >-
+            a sandbox with a service needs a name that is a DNS label starting with a
+            letter (at most 63 characters)
+          rule: "!has(self.spec.service) || !self.spec.service || self.metadata.name.matches('^[a-z]([-a-z0-9]{0,61}[a-z0-9])?$')"
     selectableFields:
     - jsonPath: .spec.from.checkpoint
     - jsonPath: .status.node

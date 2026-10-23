@@ -66,6 +66,13 @@ network:
   # egressAllow: [10.0.0.53/32]
   # DNS servers for guests. Default: [] (the VM pod's own resolvers).
   # dns: [10.0.0.53]
+  # Who may connect to the ports sandboxes expose (spec.ports): NetworkPolicy
+  # sources (namespaceSelector, podSelector, ipBlock), at least one. Default: pods
+  # in the sandbox's own namespace.
+  # exposeFrom:
+  #   - namespaceSelector:
+  #       matchLabels: {kubernetes.io/metadata.name: ingress}
+  #   - ipBlock: {cidr: 192.0.2.0/24}
 
 images:
   # Registries sandbox images may come from. Default: [] (any).

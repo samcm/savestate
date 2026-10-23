@@ -148,10 +148,10 @@ NODE`, `delete`.
                                  └────────────┬─────────────┘
                                    unix socket│
 ┌─────────────────────────────────────────────▼──────────────┐
-│ VM pod (Guaranteed, not privileged): savestate launcher →  │
-│ qemu (QMP) · no service-account token · /dev/kvm,          │
-│ /dev/net/tun, /dev/vhost-vsock from the node agent's       │
-│ device plugin · seccomp profile savestate/vm.json          │
+│ VM pod (not privileged): savestate launcher → qemu (QMP)   │
+│ no service-account token · memory request = limit ·        │
+│ /dev/kvm, /dev/net/tun, /dev/vhost-vsock from the node     │
+│ agent's device plugin · seccomp profile savestate/vm.json  │
 │ tap + nftables NAT inside the pod's network namespace      │
 │        └─ vsock ─▶ savestate-guest (exec, files, fixups)    │
 └────────────────────────────────────────────────────────────┘
@@ -194,9 +194,10 @@ savestate acts only in the sandbox namespaces the installation config lists; obj
 elsewhere are ignored. The controller and node agent get their permissions there
 through RoleBindings; cluster-wide, the controller only reads nodes.
 
-Capacity accounting is plain Kubernetes: each VM is a Guaranteed pod whose memory
-request is guest RAM plus the installation's memory overhead (`vm.memoryOverhead`,
-default 512 MiB), so the scheduler and ResourceQuota work unchanged. The spike
+Capacity accounting is plain Kubernetes: each VM is a pod whose memory request and
+limit are guest RAM plus the installation's memory overhead (`vm.memoryOverhead`,
+default 512 MiB) and whose CPU request is its vCPUs unless the installation reserves
+less (see "VM pods"), so the scheduler and ResourceQuota work unchanged. The spike
 measured QEMU's own resident memory outside guest RAM at 30–60 MiB. In the end-to-end
 test the VM pod's cgroup peak (QEMU, the launcher and KVM's kernel memory) was about
 250 MiB for a 1 GiB guest whose memory file held about 170 MiB, so everything outside
@@ -218,11 +219,16 @@ owned by it (deleting the sandbox deletes the pod) and labelled
   for a sandbox from an image, the checkpoint's `fingerprint.launcherImage` for a
   sandbox from a checkpoint. The pod spec is the record of which image a sandbox
   runs; the controller never changes an existing pod.
-- Guaranteed QoS: CPU requests and limits are `vcpus`; memory requests and limits are
-  guest memory plus `vm.memoryOverhead`; and one `savestate.dev/vm`, the node agent's
-  device plugin resource that brings `/dev/kvm`, `/dev/net/tun` and
-  `/dev/vhost-vsock`. For a sandbox from a checkpoint, shape comes from the
+- resources: memory requests and limits are guest memory plus `vm.memoryOverhead`,
+  never overcommitted; one `savestate.dev/vm`, the node agent's device plugin
+  resource that brings `/dev/kvm`, `/dev/net/tun` and `/dev/vhost-vsock`; and the
+  CPU request below. For a sandbox from a checkpoint, shape comes from the
   checkpoint's status.
+- CPU: the request is the `cpuRequest` of the sandbox's shape (the `vm.shapes` entry
+  with its vCPUs, memory and disk), else `vm.cpuRequestPerVcpu` per vCPU (default
+  `1`). A request of a whole CPU per vCPU, the default, is also the CPU limit, so
+  the pod is Guaranteed. A smaller request has no CPU limit, and the pod is
+  Burstable (see "CPU requests below the vCPU count").
 - `automountServiceAccountToken: false`, `enableServiceLinks: false`,
   `restartPolicy: Never`, `vm.nodeSelector` and `vm.tolerations`. The container is
   never privileged. Its security context:
@@ -247,6 +253,38 @@ owned by it (deleting the sandbox deletes the pod) and labelled
 - host paths: `stateDir` at the same path, and the sandbox's run directory
   `/run/savestate/<namespace>/<sandbox>/<sandbox UID>/` at `/run/savestate`. The UID
   keeps a later sandbox of the same name from meeting an earlier one's files.
+
+**CPU requests below the vCPU count.** A 4-vCPU sandbox that requests 4 CPUs fits no
+4-CPU node once the node reserves some CPU for itself, and only one on an 8-CPU
+node. A shape may reserve less: its VM still has all its vCPUs, and they compete
+for whatever CPU the node has free.
+
+Such a pod has no CPU limit. A guest never runs more threads than its vCPUs, so a
+limit equal to `vcpus` would only cap QEMU's own threads (I/O, and the migration
+channels during a checkpoint) on top of them, and CFS throttling stops every vCPU of
+the VM until the next period, which the guest sees as stalls. Without a limit a VM
+uses at most its vCPUs plus QEMU's small overhead, taken from CPU nobody else is
+using; under contention the kernel shares CPU in proportion to requests, so every
+pod still gets at least its request. The cost is that such a VM's speed depends on
+its neighbours: one requesting 500m for 4 vCPUs is promised half a CPU on a busy
+node.
+
+The pod is then Burstable rather than Guaranteed, which changes:
+
+- Eviction under node memory pressure: the kubelet ranks pods by whether their
+  memory use exceeds their request, then by priority, then by use above the request;
+  QoS class is not part of it. A VM pod's memory request equals its limit, so its
+  use never exceeds its request and it is evicted only after every pod that exceeds
+  its own, exactly as when it was Guaranteed.
+- The kernel's OOM killer, if the node runs out of memory before the kubelet
+  evicts anything: Guaranteed containers get `oom_score_adj` −997 and are almost
+  never chosen; Burstable ones get 1000 − 1000 × memory request / node memory
+  (at least 2), so a VM becomes a candidate, larger VMs less so. A killed QEMU fails
+  its sandbox.
+- The kubelet's static CPU manager policy gives exclusive cores only to Guaranteed
+  pods with whole CPUs; Burstable VM pods share the node's pool.
+
+Memory is unaffected: request = limit = guest RAM plus overhead in every case.
 
 Before creating the pod the controller refuses (sandbox `Failed`) an image outside
 `images.registries`, a shape not in `vm.shapes`, and a checkpoint that is `Failed`,
@@ -500,7 +538,7 @@ installation is supplied at install time and never committed here:
 | --- | --- |
 | CRD schemas, controller and node behaviour | Namespaces, RBAC subjects, quotas |
 | Generic defaults (state directory, transfer concurrency, TTL limits) and their config schema | Node selection, tolerations, which nodes run VMs |
-| Install manifests with placeholders (kustomize base, example values) | Guest CPU model, VM shapes offered, memory overhead margin |
+| Install manifests with placeholders (kustomize base, example values) | Guest CPU model, VM shapes offered and the CPU they request, memory overhead margin |
 | Guest image build recipe (kernel config, minimal rootfs, guest agent) | Base images and what is preinstalled in them, registries, pull secrets |
 | Test fixtures | Egress allowlists, DNS, off-cluster stores, credentials |
 
@@ -508,8 +546,8 @@ Installation config is one YAML file (operator and node agent) plus the usual
 Kubernetes objects; every field has a documented default or is required with a clear
 error, and unknown fields are refused. The schema is `savestate_api::config::Config`:
 `namespaces` (required), `stateDir`, `kubeletDir`, `launcherImage`, `vm` (`cpuModel`
-required, `memoryOverhead`, `shapes`, `nodeSelector`, `tolerations`,
-`slotsPerNode`), `network`
+required, `memoryOverhead`, `cpuRequestPerVcpu`, `shapes` with an optional
+`cpuRequest` each, `nodeSelector`, `tolerations`, `slotsPerNode`), `network`
 (`egressAllow`, `dns`), `images` (`registries`, `auth`), `transfers.perNode` and
 `ttl` (`default` and `max` per kind). `deploy/base` is a kustomize base with
 placeholder values and `deploy/README.md` lists what an installation supplies.

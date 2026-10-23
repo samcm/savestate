@@ -9,6 +9,7 @@ use std::{collections::BTreeMap, net::IpAddr, path::PathBuf};
 
 use ipnet::IpNet;
 use k8s_openapi::{api::core::v1::Toleration, apimachinery::pkg::api::resource::Quantity};
+use kube_quantity::ParsedQuantity;
 use serde::Deserialize;
 
 use crate::Ttl;
@@ -69,6 +70,13 @@ pub struct Vm {
     #[serde(default = "default_memory_overhead")]
     pub memory_overhead: Quantity,
 
+    /// CPU a VM pod requests per vCPU, for shapes that set no `cpuRequest`: more
+    /// than 0, at most 1. Below 1 the pod has no CPU limit and is Burstable (see
+    /// "VM pods" in `docs/design.md`). Default: `1`, a whole CPU per vCPU
+    /// (Guaranteed).
+    #[serde(default = "default_cpu_request_per_vcpu")]
+    pub cpu_request_per_vcpu: Quantity,
+
     /// Shapes a sandbox from an image may use; it must match one exactly.
     /// Default: empty, any shape.
     #[serde(default)]
@@ -97,6 +105,10 @@ pub struct Shape {
     pub vcpus: u32,
     pub memory: Quantity,
     pub disk: Quantity,
+    /// CPU the VM pod of a sandbox of this shape requests: more than 0, at most
+    /// `vcpus`. Default: `vcpus` × `vm.cpuRequestPerVcpu`.
+    #[serde(default)]
+    pub cpu_request: Option<Quantity>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -187,6 +199,10 @@ fn default_memory_overhead() -> Quantity {
     Quantity("512Mi".into())
 }
 
+fn default_cpu_request_per_vcpu() -> Quantity {
+    Quantity("1".into())
+}
+
 fn default_transfers_per_node() -> u32 {
     1
 }
@@ -225,6 +241,29 @@ impl Config {
             return Err(format!(
                 "launcherImage: {image:?} must be pinned by digest (…@sha256:…)"
             ));
+        }
+        let cpu = |quantity: &Quantity, what: &str| {
+            ParsedQuantity::try_from(quantity).map_err(|e| format!("{what}: {:?}: {e}", quantity.0))
+        };
+        let cpus = |n: u32| cpu(&Quantity(n.to_string()), "vcpus");
+        let zero = cpus(0)?;
+        let per_vcpu = cpu(&self.vm.cpu_request_per_vcpu, "vm.cpuRequestPerVcpu")?;
+        if per_vcpu <= zero || per_vcpu > cpus(1)? {
+            return Err(format!(
+                "vm.cpuRequestPerVcpu: {:?} must be more than 0 and at most 1",
+                self.vm.cpu_request_per_vcpu.0
+            ));
+        }
+        for shape in &self.vm.shapes {
+            if let Some(request) = &shape.cpu_request {
+                let parsed = cpu(request, "vm.shapes cpuRequest")?;
+                if parsed <= zero || parsed > cpus(shape.vcpus)? {
+                    return Err(format!(
+                        "vm.shapes: cpuRequest {:?} of the {}-vCPU shape must be more than 0 and at most {}",
+                        request.0, shape.vcpus, shape.vcpus
+                    ));
+                }
+            }
         }
         if self.vm.slots_per_node == 0 {
             return Err("vm.slotsPerNode: must be at least 1".into());

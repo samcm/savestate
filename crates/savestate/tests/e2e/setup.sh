@@ -57,6 +57,9 @@ namespaces: [$ns]
 launcherImage: $pinned
 vm:
   cpuModel: "$cpu"
+  shapes:
+    - {vcpus: 1, memory: 1Gi, disk: 4Gi}
+    - {vcpus: 4, memory: 1Gi, disk: 4Gi, cpuRequest: 500m}
   nodeSelector:
     savestate.dev/node: "true"
 network:

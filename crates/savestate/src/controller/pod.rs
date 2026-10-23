@@ -18,11 +18,12 @@ pub(super) const LABELS: &str = "app.kubernetes.io/name=savestate,app.kubernetes
 /// `RUN_DIR`, in the VM pod.
 pub(super) const RUN_DIR: &str = "/run/savestate";
 
-/// What the pod runs: the launcher image and the VM's size, and for a sandbox from
-/// a checkpoint the nodes it may run on.
+/// What the pod runs: the launcher image, the VM's size and the CPU its pod
+/// requests, and for a sandbox from a checkpoint the nodes it may run on.
 pub(super) struct Vm {
     pub image: String,
     pub vcpus: u32,
+    pub cpu: Quantity,
     pub memory: Quantity,
     pub nodes: Option<Vec<String>>,
 }
@@ -37,13 +38,17 @@ pub(super) fn build(sandbox: &Sandbox, vm: &Vm, config: &Config) -> Result<Pod, 
 
     let memory =
         parse(&vm.memory, "memory")? + parse(&config.vm.memory_overhead, "vm.memoryOverhead")?;
-    // Guaranteed QoS: requests equal limits for everything. One VM slot from the node
-    // agent's device plugin brings /dev/kvm, /dev/net/tun and /dev/vhost-vsock.
-    let resources = json!({
-        "cpu": vm.vcpus.to_string(),
-        "memory": Quantity::from(memory),
-        RESOURCE: "1",
-    });
+    // Memory is never overcommitted: its request is its limit. One VM slot from the
+    // node agent's device plugin brings /dev/kvm, /dev/net/tun and /dev/vhost-vsock.
+    // A pod requesting a whole CPU per vCPU is limited to that too (Guaranteed QoS);
+    // one requesting less has no CPU limit (Burstable), so QEMU's own threads are
+    // never throttled while its vCPUs run.
+    let mut limits = json!({"memory": Quantity::from(memory), RESOURCE: "1"});
+    let mut requests = limits.clone();
+    requests["cpu"] = json!(vm.cpu);
+    if parse(&vm.cpu, "CPU request")? >= parse(&Quantity(vm.vcpus.to_string()), "vcpus")? {
+        limits["cpu"] = json!(vm.cpu);
+    }
     // Root with exactly what the launcher uses before it drops to the QEMU user for
     // good: NET_ADMIN for the tap device, forwarding and nftables in its own network
     // namespace; CHOWN to hand its run directory to the QEMU user; SETUID and SETGID
@@ -101,7 +106,7 @@ pub(super) fn build(sandbox: &Sandbox, vm: &Vm, config: &Config) -> Result<Pod, 
                 "env": [{"name": "SAVESTATE_HOST_IPS", "valueFrom": {"fieldRef": {"fieldPath": "status.hostIPs"}}}],
                 // The launcher writes why the VM stopped to its termination log.
                 "terminationMessagePolicy": "FallbackToLogsOnError",
-                "resources": {"requests": resources, "limits": resources},
+                "resources": {"requests": requests, "limits": limits},
                 "securityContext": security,
                 // The launcher creates `ready` once the VM runs; the pod's Ready
                 // condition is how the controller learns it.

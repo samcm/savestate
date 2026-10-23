@@ -22,7 +22,10 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use k8s_openapi::api::{core::v1::Pod, events::v1::Event};
+use k8s_openapi::api::{
+    core::v1::{Node, Pod},
+    events::v1::Event,
+};
 use kube::{
     Api, Client,
     api::{AttachParams, ListParams},
@@ -94,6 +97,38 @@ async fn checkpoint_fork_and_resume_exactly() {
         "QEMU's capabilities: {qemu}"
     );
     assert!(qemu.contains("-sandbox on"), "{qemu}");
+
+    // A shape that requests less CPU than its vCPUs (setup.sh: 4 vCPUs, cpuRequest
+    // 500m): the pod is Burstable with no CPU limit, memory is still request = limit,
+    // and the guest has all four vCPUs. On a 4-CPU node that also runs the cluster,
+    // four whole CPUs would not fit next to `web`.
+    savestate(&[
+        "create", "burst", "--image", &image, "--vcpus", "4", "--memory", "1Gi", "--disk", "4Gi",
+    ]);
+    let pod = Api::<Pod>::namespaced(client.clone(), &ns)
+        .get("burst")
+        .await
+        .unwrap();
+    let resources =
+        serde_json::to_value(&pod.spec.as_ref().unwrap().containers[0].resources).unwrap();
+    report(&format!(
+        "VM pod resources (4 vCPUs, cpuRequest 500m): {resources}"
+    ));
+    assert_eq!(resources["requests"]["cpu"], "500m", "{resources}");
+    assert_eq!(resources["limits"].get("cpu"), None, "{resources}");
+    assert_eq!(
+        resources["limits"]["memory"], resources["requests"]["memory"],
+        "{resources}"
+    );
+    assert_eq!(pod.status.unwrap().qos_class.as_deref(), Some("Burstable"));
+    assert_eq!(sh("burst", "nproc").trim(), "4");
+    let node = Api::<Node>::all(client.clone())
+        .get(pod.spec.unwrap().node_name.as_deref().unwrap())
+        .await
+        .unwrap();
+    let allocatable = &node.status.unwrap().allocatable.unwrap()["cpu"].0;
+    report(&format!("node allocatable CPU: {allocatable}"));
+    savestate(&["delete", "sandbox", "burst"]);
 
     // Egress: the allowlisted address is reachable, other private ones are not.
     let (ip, port) = allowed.split_once(':').unwrap();

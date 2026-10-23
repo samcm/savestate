@@ -1,6 +1,11 @@
 [workspace]
 resolver = "3"
-members = ["crates/savestate", "crates/savestate-api"]
+members = [
+    "crates/savestate",
+    "crates/savestate-api",
+    "crates/savestate-guest",
+    "crates/savestate-guest-proto",
+]
 
 [workspace.package]
 version = "0.1.0"
@@ -42,6 +47,11 @@ expect_used = "warn"
 
 [workspace.dependencies]
 savestate-api = { path = "crates/savestate-api" }
+savestate-guest-proto = { path = "crates/savestate-guest-proto", default-features = false }
+
+# orbd's shared QEMU and guest-agent crates, pinned to one revision.
+orbd-guest = { git = "https://github.com/samcm/orbd", rev = "d1c39ce6b0d6d11a0f2748a2592e8666f940a9d8" }
+orbd-qemu = { git = "https://github.com/samcm/orbd", rev = "d1c39ce6b0d6d11a0f2748a2592e8666f940a9d8" }
 
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
@@ -51,14 +61,21 @@ jiff = "0.2"
 k8s-openapi = { version = "0.28", features = ["v1_36", "schemars"] }
 kube = { version = "4.2", default-features = false }
 kube_quantity = "0.9"
+libc = "0.2"
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.18", default-features = false, features = ["http-listener"] }
+nix = { version = "0.31", features = ["fs", "time"] }
+prost = "0.14"
+prost-build = "0.14"
+protoc-bin-vendored = "3"
 schemars = "1"
 serde = { version = "1", features = ["derive"] }
 serde-saphyr = { version = "2", default-features = false, features = ["serialize", "deserialize"] }
 serde_json = "1"
+tempfile = "3"
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio-vsock = "0.7"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 

@@ -1,0 +1,33 @@
+[package]
+name = "savestate-guest-proto"
+description = "The savestate guest protocol and its host-side client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+prost.workspace = true
+thiserror = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true, features = ["io-util"] }
+tokio-vsock = { workspace = true, optional = true }
+
+[build-dependencies]
+prost-build.workspace = true
+protoc-bin-vendored.workspace = true
+
+[dev-dependencies]
+orbd-qemu.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["time"] }
+
+[features]
+default = ["client"]
+# The host-side client (tokio, AF_VSOCK). Without it only the messages and framing are
+# built, for the guest agent.
+client = ["dep:thiserror", "dep:tokio", "dep:tokio-vsock"]
+
+[lints]
+workspace = true

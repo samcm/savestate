@@ -1,5 +1,6 @@
 # cargo-deny: run in CI (`cargo deny check`). Advisories fail the build; only
-# crates.io is an allowed source; duplicate versions are reported, not fatal.
+# crates.io and orbd (its shared crates, pinned by revision) are allowed sources;
+# duplicate versions are reported, not fatal.
 
 [graph]
 targets = ["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl", "x86_64-unknown-linux-gnu"]
@@ -15,6 +16,7 @@ allow-wildcard-paths = true
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
+allow-git = ["https://github.com/samcm/orbd"]
 
 [licenses]
 confidence-threshold = 0.9

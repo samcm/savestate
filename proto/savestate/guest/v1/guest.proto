@@ -1,0 +1,145 @@
+// savestate guest protocol, version 1: the host (launcher) <-> `savestate-guest` in a VM.
+//
+// Transport: an AF_VSOCK stream to the guest's port 1024. Frames are a u32 big-endian
+// length followed by that many bytes of protobuf, at most 1 MiB.
+//
+// One operation per connection: the host connects and sends one request (`Hello`,
+// `Exec`, `ReadFile`, `WriteFile`, `PrepareCheckpoint` or `Restore`), followed by its
+// stream (`Stdin` for `Exec`, `Chunk`s for `WriteFile`); the guest answers and closes
+// the connection. Restoring a VM resets every connection that was open at the
+// checkpoint; the guest keeps listening, so the host simply connects again.
+syntax = "proto3";
+
+package savestate.guest.v1;
+
+message HostMessage {
+  oneof body {
+    Hello hello = 1;
+    Exec exec = 2;
+    Stdin stdin = 3;
+    ReadFile read_file = 4;
+    WriteFile write_file = 5;
+    Chunk chunk = 6;
+    PrepareCheckpoint prepare_checkpoint = 7;
+    Restore restore = 8;
+  }
+}
+
+message GuestMessage {
+  oneof body {
+    HelloReply hello = 1;
+    Output output = 2;
+    Exited exited = 3;
+    Chunk chunk = 4;
+    Done done = 5;
+    Error error = 6;
+  }
+}
+
+// Answered with `HelloReply`. The host polls it to learn the agent is up.
+message Hello {}
+
+message HelloReply {
+  // The agent's version.
+  string version = 1;
+  // /proc/sys/kernel/random/boot_id: unchanged by a checkpoint restore, new on reboot.
+  string boot_id = 2;
+}
+
+message EnvVar {
+  string name = 1;
+  string value = 2;
+}
+
+// Runs a program as root, in the agent's environment plus `env`. The host then streams
+// `Stdin` (ending with `eof`); the guest streams `Output` and ends with `Exited`, or
+// `Error` if the program could not start. If the host goes away the program keeps
+// running with stdin closed and its output discarded.
+message Exec {
+  // Program (looked up in PATH) and arguments; must not be empty.
+  repeated string argv = 1;
+  repeated EnvVar env = 2;
+  // Working directory; empty means /.
+  string cwd = 3;
+}
+
+message Stdin {
+  bytes data = 1;
+  // No more input: the program's stdin is closed.
+  bool eof = 2;
+}
+
+enum Stream {
+  STREAM_STDOUT = 0;
+  STREAM_STDERR = 1;
+}
+
+message Output {
+  Stream stream = 1;
+  bytes data = 2;
+}
+
+message Exited {
+  oneof status {
+    int32 code = 1;
+    // Terminated by this signal.
+    int32 signal = 2;
+  }
+}
+
+// The guest streams the file's contents as `Chunk`s, the last one with `eof`, or answers
+// `Error` (possibly after some chunks).
+message ReadFile {
+  string path = 1;
+}
+
+// Replaces the file at `path` (absolute; the directory must exist) with the `Chunk`s
+// that follow, atomically once the `eof` chunk arrives: written next to it, fsynced and
+// renamed into place. Answered with `Done` or `Error` after the `eof` chunk. A
+// connection that ends before `eof` leaves the file untouched.
+message WriteFile {
+  string path = 1;
+  // Permission bits; 0 means 0644. Owner root.
+  uint32 mode = 2;
+}
+
+message Chunk {
+  bytes data = 1;
+  bool eof = 2;
+}
+
+// Before the host stops the VM for a checkpoint: syncs filesystems and drops the page
+// cache, so less guest memory holds data and the memory file is smaller. Answered with
+// `Done`.
+message PrepareCheckpoint {}
+
+// After a VM restored from a checkpoint is running again, applies these fixups in order,
+// then answers `Done`, or `Error` at the first that fails:
+//
+// 1. Steps the wall clock to `wall_clock_unix_ns` (clock `stepped`); 0 leaves it alone
+//   (clock `frozen`). The monotonic clock is not changed.
+// 2. Credits `entropy` to the kernel's random pool.
+// 3. Writes a new random /etc/machine-id.
+// 4. Sets the hostname (/etc/hostname, the running kernel's and /etc/hosts).
+// 5. Regenerates each SSH host key present in /etc/ssh and reloads the SSH server.
+// 6. Runs the executables in /etc/savestate/after-restore.d/ in name order, each with
+//   SAVESTATE_SANDBOX, SAVESTATE_CHECKPOINT and SAVESTATE_CLOCK (`frozen` or
+//   `stepped`) in its environment and at most 60 s each; a hook that fails stops the
+//   rest.
+message Restore {
+  int64 wall_clock_unix_ns = 1;
+  // At least 32 bytes from the host's random source.
+  bytes entropy = 2;
+  // The new hostname: an RFC 1123 label (lowercase letters, digits and `-`, at most
+  // 63 characters).
+  string hostname = 3;
+  // The restored sandbox and the checkpoint it was started from.
+  string sandbox = 4;
+  string checkpoint = 5;
+}
+
+message Done {}
+
+message Error {
+  string message = 1;
+}

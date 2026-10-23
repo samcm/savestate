@@ -142,7 +142,8 @@ scheduler and ResourceQuota work unchanged.
 
 ## QEMU mechanics
 
-Pinned by the launcher image: QEMU 11.1 (Debian 13 backports) and an explicit
+Pinned by the launcher image: stock QEMU 11.1 on Debian 13 (built from the upstream
+release until Debian 13 backports ships 11.1 for amd64) and an explicit
 versioned machine type (`pc-q35-11.1`). The guest CPU model is installation
 configuration: a named model that every node in the cluster can run (for example
 `EPYC-Rome-v4` where Zen 2 and Zen 3 hosts mix), never `-cpu host`, and without

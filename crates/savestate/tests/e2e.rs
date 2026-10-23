@@ -278,15 +278,16 @@ async fn checkpoint_fork_and_resume_exactly() {
     let pid_before = sh("web", &main_pid);
     let agent = "systemctl show -P MainPID savestate-guest";
     let agent_before = sh("web", agent);
-    // Detached itself: an attached exec would end with the agent it restarts.
+    // Detached itself: an attached exec would end with the agent it restarts. The
+    // pause lets the agent answer the exec before the restart stops it.
     savestate(&[
         "exec",
         "web",
         "--detach",
         "--",
-        "systemctl",
-        "restart",
-        "savestate-guest",
+        "sh",
+        "-c",
+        "sleep 1; systemctl restart savestate-guest",
     ]);
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {

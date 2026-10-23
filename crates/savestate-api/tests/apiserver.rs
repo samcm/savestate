@@ -20,8 +20,9 @@ use kube::{
     core::ApiResource,
 };
 use savestate_api::{
-    Checkpoint, CheckpointPhase, CheckpointSpec, CheckpointStatus, Clock, Fingerprint, Sandbox,
-    SandboxPhase, SandboxSource, SandboxSpec, SandboxStatus, Transfer, TransferEnd, TransferSpec,
+    Checkpoint, CheckpointPhase, CheckpointSpec, CheckpointStatus, Clock, Fingerprint, Port,
+    Protocol, Sandbox, SandboxPhase, SandboxSource, SandboxSpec, SandboxStatus, Transfer,
+    TransferEnd, TransferSpec,
 };
 use serde_json::{Value, json};
 
@@ -58,6 +59,19 @@ async fn crds_accept_what_works_and_refuse_what_cannot() {
             disk: Some(quantity("60Gi")),
             clock: None,
             ttl: Some("1d12h".parse().unwrap()),
+            ports: vec![
+                Port {
+                    name: Some("http".into()),
+                    port: 8080,
+                    protocol: Protocol::Tcp,
+                },
+                Port {
+                    name: None,
+                    port: 8080,
+                    protocol: Protocol::Udp,
+                },
+            ],
+            service: true,
         },
     );
     let from_checkpoint = Sandbox::new(
@@ -72,6 +86,8 @@ async fn crds_accept_what_works_and_refuse_what_cannot() {
             disk: None,
             clock: Some(Clock::Stepped),
             ttl: None,
+            ports: vec![],
+            service: false,
         },
     );
     let checkpoint = Checkpoint::new(
@@ -208,6 +224,29 @@ async fn crds_accept_what_works_and_refuse_what_cannot() {
             json!({"from": {"checkpoint": "c"}, "clock": "sometimes"}),
             "spec.clock",
         ),
+        // A Service needs ports, and each port reaches one guest port once.
+        (
+            merged(&image_spec, &json!({"service": true})),
+            "service needs at least one port",
+        ),
+        (
+            merged(
+                &image_spec,
+                &json!({"ports": [{"port": 80}, {"port": 80, "protocol": "TCP"}]}),
+            ),
+            "Duplicate value",
+        ),
+        (
+            merged(
+                &image_spec,
+                &json!({"ports": [{"name": "web", "port": 80}, {"name": "web", "port": 81}]}),
+            ),
+            "port names must be unique",
+        ),
+        (
+            merged(&image_spec, &json!({"ports": [{"port": 0}]})),
+            "spec.ports[0].port",
+        ),
     ];
     for (i, (spec, reason)) in refused.into_iter().enumerate() {
         let mut object =
@@ -232,7 +271,7 @@ async fn crds_accept_what_works_and_refuse_what_cannot() {
         ),
         (
             json!({"image": null, "vcpus": null, "memory": null, "disk": null, "from": {"checkpoint": "c"}}),
-            "only ttl can change on a sandbox",
+            "only ttl, ports and service can change on a sandbox",
         ),
     ];
     for (patch, reason) in changes {
@@ -245,12 +284,30 @@ async fn crds_accept_what_works_and_refuse_what_cannot() {
             "from cannot change",
         ),
         (json!({"clock": "frozen"}), "clock cannot change"),
-        (json!({"clock": null}), "only ttl can change on a sandbox"),
+        (
+            json!({"clock": null}),
+            "only ttl, ports and service can change on a sandbox",
+        ),
     ];
     for (patch, reason) in changes {
         let error = patch_spec(&sandboxes, "web-2", patch.clone()).await.err();
         assert_refused(error, reason, &patch);
     }
+    // Exposure changes on a running sandbox, including one from a checkpoint.
+    let exposed = patch_spec(
+        &sandboxes,
+        "web-2",
+        json!({"ports": [{"port": 22}], "service": true}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(exposed.spec.ports[0].protocol, Protocol::Tcp);
+    // The Service is named after the sandbox, so its name must be a DNS label.
+    let mut object = DynamicObject::new("1-web", &ApiResource::erase::<Sandbox>(&()));
+    object.data =
+        json!({"spec": merged(&image_spec, &json!({"ports": [{"port": 22}], "service": true}))});
+    let error = raw.create(&PostParams::default(), &object).await.err();
+    assert_refused(error, "needs a name that is a DNS label", &object.data);
     patch_spec(
         &checkpoints,
         "web-1-parked",

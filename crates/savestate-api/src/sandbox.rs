@@ -10,7 +10,8 @@ use crate::Ttl;
 ///
 /// Exactly one of `image` and `from` is set. A sandbox from an image states its shape
 /// (`vcpus`, `memory`, `disk`); a sandbox from a checkpoint inherits image and shape
-/// from the checkpoint and must not set them. Only `ttl` can change after creation.
+/// from the checkpoint and must not set them. Only `ttl`, `ports` and `service` can
+/// change after creation.
 #[derive(CustomResource, KubeSchema, Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[kube(
     group = "savestate.dev",
@@ -24,6 +25,8 @@ use crate::Ttl;
     derive = "PartialEq",
     selectable = ".spec.from.checkpoint",
     selectable = ".status.node",
+    validation = Rule::new("!has(self.spec.service) || !self.spec.service || self.metadata.name.matches('^[a-z]([-a-z0-9]{0,61}[a-z0-9])?$')")
+        .message("a sandbox with a service needs a name that is a DNS label starting with a letter (at most 63 characters)"),
     printcolumn(json_path = ".status.phase", name = "Phase", type_ = "string"),
     printcolumn(json_path = ".status.node", name = "Node", type_ = "string"),
     printcolumn(json_path = ".spec.from.checkpoint", name = "From", type_ = "string"),
@@ -67,7 +70,9 @@ use crate::Ttl;
     validation = Rule::new("!has(self.clock) || has(self.from)")
         .message("clock applies only to a sandbox started from a checkpoint (from)"),
     validation = Rule::new("has(self.image) == has(oldSelf.image) && has(self.clock) == has(oldSelf.clock)")
-        .message("only ttl can change on a sandbox; delete it and create another"),
+        .message("only ttl, ports and service can change on a sandbox; delete it and create another"),
+    validation = Rule::new("!has(self.service) || !self.service || (has(self.ports) && size(self.ports) > 0)")
+        .message("service needs at least one port in ports"),
 )]
 #[serde(rename_all = "camelCase")]
 pub struct SandboxSpec {
@@ -117,6 +122,62 @@ pub struct SandboxSpec {
     /// to extend or shorten its life. No TTL: it runs until deleted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ttl: Option<Ttl>,
+
+    /// Guest ports reachable on the VM pod's address, from the sources the
+    /// installation allows (`network.exposeFrom`). Nothing else reaches the guest.
+    /// Can change at any time; a running sandbox follows within seconds. Not
+    /// inherited from a checkpoint.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(length(max = 32))]
+    #[x_kube(
+        merge_strategy = ListMerge::Map(vec!["port".into(), "protocol".into()]),
+        validation = Rule::new("self.all(a, !has(a.name) || self.exists_one(b, has(b.name) && b.name == a.name))")
+            .message("port names must be unique"),
+    )]
+    pub ports: Vec<Port>,
+
+    /// Also create a `ClusterIP` Service named after the sandbox, selecting its VM
+    /// pod, with one port per entry in `ports`. Needs a name that is a DNS label
+    /// starting with a letter.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub service: bool,
+}
+
+/// One guest port exposed on the VM pod's address, at the same number.
+#[derive(JsonSchema, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct Port {
+    /// Name of the Service port (a DNS label) [default: `tcp-8080` style].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(
+        length(min = 1, max = 63),
+        regex(pattern = r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$")
+    )]
+    pub name: Option<String>,
+
+    #[schemars(range(min = 1, max = 65535), extend("format" = "int32"))]
+    pub port: u16,
+
+    #[serde(default)]
+    pub protocol: Protocol,
+}
+
+#[derive(JsonSchema, Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum Protocol {
+    #[default]
+    Tcp,
+    Udp,
+}
+
+impl Protocol {
+    /// `tcp` or `udp`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Tcp => "tcp",
+            Self::Udp => "udp",
+        }
+    }
 }
 
 /// A quantity (integer or string) greater than zero.

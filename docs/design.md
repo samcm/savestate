@@ -8,7 +8,9 @@ QEMU over QMP. It shares its QEMU, QMP and guest-agent code with
 
 Status: the engine runs: controller, node agent, launcher and CLI boot, checkpoint
 and restore sandboxes end to end, export checkpoints to S3-compatible object stores
-and restore them from there (phase 4); node-to-node copies come later. This document is the contract every part of the
+and restore them from there (phase 4); node-to-node copies come later. Exposed
+ports (`spec.ports`, "Exposed ports") are being built as described here. This
+document is the contract every part of the
 implementation follows; change it in the same pull request as any change to the
 behaviour it describes.
 
@@ -39,6 +41,7 @@ Guarantees and limits:
 | Clock | `frozen` (default): the guest's clock does not advance while it is paused or saved; a restored guest believes no time passed. `stepped`: after a restore the guest's wall clock is set to the host's current time. The monotonic clock never jumps. |
 | Randomness | Every restored sandbox gets fresh kernel entropy (new VM generation ID, which makes the guest kernel reseed, plus an explicit reseed from the guest agent). The kernel tells userspace nothing about a restore; programs that must react use the after-restore hooks. Secrets that programs already derived stay identical across siblings. |
 | Identity | Each restored sandbox gets a new machine-id, hostname and SSH host keys. Its in-guest IP and MAC are unchanged, which is safe because every sandbox has its own isolated network namespace. |
+| Network | A sandbox reaches the internet, and private addresses only where the installation allows. Nothing reaches it except the ports it exposes (`spec.ports`), from the sources the installation allows, and `port-forward` through the Kubernetes API. Every sandbox, forks included, is reachable on its own address and its own Service. |
 | Memory | Every running sandbox costs its full memory size. Nothing shares or overcommits guest RAM; KSM stays off. |
 | Placement | A sandbox from a checkpoint starts on a node that holds the checkpoint. One from a checkpoint in an object store can start on any node that can run it (holders are preferred): that node first copies the checkpoint from the store while the sandbox waits in `WaitingForTransfer`. |
 | Durability | A checkpoint is taken on node-local disk. One held by no store is lost with its node, so that node is kept from cluster-autoscaler scale-down while it holds one. Export to an object store (per checkpoint, or for all by default) makes it independent of every node; node-local copies of exported checkpoints are then a cache the node may drop under disk pressure. |
@@ -64,6 +67,9 @@ spec:
   disk: 60Gi
   # clock: stepped       # frozen (default) | stepped; only with from
   ttl: 7d
+  ports:                 # optional: guest ports reachable on the VM pod's address
+    - {name: http, port: 8080}   # protocol: TCP (default) | UDP; name optional
+  service: true          # optional: a ClusterIP Service named after the sandbox
 status:
   phase: Running         # Pending | WaitingForTransfer | Booting | Restoring | Running | Failed
   node: node-a
@@ -114,9 +120,16 @@ status:
   checkpoint inherits image, vCPUs, memory and disk from it and setting them is
   rejected (admission cannot see the checkpoint, so equal values are refused too).
   `clock` is only accepted with `from`; unset means `frozen`.
-- Specs are immutable except `ttl` and a checkpoint's `export`: changing a
-  sandbox's source, shape or clock, a checkpoint's sandbox, or anything in a transfer
-  is rejected.
+- Specs are immutable except `ttl`, a sandbox's `ports` and `service`, and a
+  checkpoint's `export`: changing a sandbox's source, shape or clock, a checkpoint's
+  sandbox, or anything in a transfer is rejected.
+- `ports` exposes guest ports, by default none (see "Exposed ports"): each entry is
+  a port (1–65535) and a protocol (`TCP`, the default, or `UDP`), at most once each,
+  with an optional name (a DNS label, unique; the Service port's name, else
+  `tcp-8080` style); at most 32. Exposure is host-side, not part of the VM, so a
+  sandbox from a checkpoint inherits none and sets its own. Changing `ports` on a
+  running sandbox takes effect within seconds. `service: true` needs at least one
+  port and a sandbox name that is a DNS label starting with a letter.
 - A TTL is whole numbers each followed by `d`, `h`, `m` or `s` (`7d`, `48h`,
   `1d12h`), counted from the object's creation. The installation config can set a
   default and a maximum per kind.
@@ -151,9 +164,12 @@ status:
 - Later, a `Migration` kind may move a running sandbox between nodes with QEMU live
   migration (for draining nodes). Not part of the MVP.
 
-The CLI is shorthand over these objects: `savestate create`, `checkpoint` (`--export
-STORE` also waits for the export), `fork NAME -n 3` (one checkpoint plus three
-sandboxes), `exec NAME -- CMD`, `cp`, `delete`.
+The CLI is shorthand over these objects: `savestate create` (`--port PORT[/udp]`,
+`--service`), `checkpoint` (`--export STORE` also waits for the export), `fork NAME
+-n 3` (one checkpoint plus three sandboxes, each with the forked sandbox's `ports`
+and `service`), `exec NAME -- CMD`, `cp`, `expose NAME PORT[/udp]... [--service]`
+(adds ports to `spec.ports`), `port-forward NAME LOCAL:GUEST...` (`kubectl
+port-forward` to the VM pod, which reaches any TCP port of the guest), `delete`.
 
 ## Architecture
 
@@ -241,15 +257,17 @@ Kubernetes Events on the Sandbox or Checkpoint.
 
 **VM pods.** Each Sandbox gets exactly one Pod, named after it, in its namespace,
 owned by it (deleting the sandbox deletes the pod), labelled
-`app.kubernetes.io/name: savestate` and `app.kubernetes.io/component: vm`, and
-annotated `cluster-autoscaler.kubernetes.io/safe-to-evict: "false"` (evicting it
-destroys the VM):
+`app.kubernetes.io/name: savestate`, `app.kubernetes.io/component: vm` and
+`savestate.dev/sandbox-uid: <sandbox UID>`, and annotated
+`cluster-autoscaler.kubernetes.io/safe-to-evict: "false"` (evicting it destroys the
+VM) and `savestate.dev/ports` (see "Exposed ports"):
 
 - one container, `launcher`, running `savestate launcher` from the launcher image:
   the installation's (`launcherImage`, else the controller's own image by digest)
   for a sandbox from an image, the checkpoint's `fingerprint.launcherImage` for a
   sandbox from a checkpoint. The pod spec is the record of which image a sandbox
-  runs; the controller never changes an existing pod.
+  runs; the controller never changes an existing pod except its
+  `savestate.dev/ports` annotation.
 - resources: memory requests and limits are guest memory plus `vm.memoryOverhead`,
   never overcommitted; one `savestate.dev/vm`, the node agent's device plugin
   resource that brings `/dev/kvm`, `/dev/net/tun` and `/dev/vhost-vsock`; and the
@@ -289,6 +307,8 @@ destroys the VM):
 - host paths: `stateDir` at the same path, and the sandbox's run directory
   `/run/savestate/<namespace>/<sandbox>/<sandbox UID>/` at `/run/savestate`. The UID
   keeps a later sandbox of the same name from meeting an earlier one's files.
+- a downward API volume at `/etc/savestate/pod` holding the pod's
+  `savestate.dev/ports` annotation as the file `ports`.
 
 **CPU requests below the vCPU count.** A 4-vCPU sandbox that requests 4 CPUs fits no
 4-CPU node once the node reserves some CPU for itself, and only one on an 8-CPU
@@ -342,6 +362,31 @@ config's `export`) is not yet in `status.stores`, the controller creates the exp
 `status.nodes` that still exists. An export store missing from the config gets a
 `Warning` event and no transfer.
 
+**Exposed ports.** The controller keeps three things in step with a sandbox's
+`ports` and `service`:
+
+- the VM pod's `savestate.dev/ports` annotation: one `PORT/tcp` or `PORT/udp` per
+  line, set when the pod is created and updated whenever `ports` changes. The
+  launcher forwards exactly these (see "Network and security"). Container ports in
+  the pod spec are not used: Kubernetes does not let them change on a running pod,
+  and neither Services nor NetworkPolicies need them.
+- while `ports` is not empty, a NetworkPolicy named after the sandbox and owned by
+  it, selecting its VM pod by `savestate.dev/sandbox-uid` and allowing ingress on
+  exactly those ports from `network.exposeFrom` (default: every pod in the sandbox's
+  namespace). It adds to the namespace's policy refusing all ingress to VM pods.
+- while `service` is true, a `ClusterIP` Service named after the sandbox and owned
+  by it, selecting its VM pod by `savestate.dev/sandbox-uid`, with one port per entry
+  in `ports` (same number, protocol and name).
+
+Either object is deleted once `ports` is empty or `service` false. One of that name
+that the sandbox does not own (an earlier sandbox's, or someone else's) is left
+alone with a `Warning` event. Selecting by UID keeps a Service from reaching the
+pod of an earlier sandbox of the same name. Each sandbox started from a checkpoint
+has its own pod, so its exposure is its own: forks of one sandbox are reachable
+independently, each at the same guest port behind its own address and Service.
+External exposure (an Ingress or a `LoadBalancer` Service) is the installation's
+choice; `deploy/README.md` has an example.
+
 **Sandbox status** is derived from the pod (and, while it imports, its transfer):
 
 | Pod | Sandbox |
@@ -383,7 +428,7 @@ no checkpoint of this cluster are garbage.
 
 | Who | Writes |
 | --- | --- |
-| Controller | VM pods; Sandbox `status` (all of it); TTL deletions; the Checkpoint finalizer; `Failed` on Checkpoints that cannot start; Transfers (exports and imports); deletions in stores |
+| Controller | VM pods (and their `savestate.dev/ports` annotation); Services and NetworkPolicies of sandboxes that expose ports; Sandbox `status` (all of it); TTL deletions; the Checkpoint finalizer; `Failed` on Checkpoints that cannot start; Transfers (exports and imports); deletions in stores |
 | Node agent | Checkpoint `status` (`phase`, `nodes`, `stores`, `vcpus`, `memory`, `disk`, sizes, `guestTime`, `parent`, `fingerprint`, `message`); Transfer `status`; files under `stateDir`; objects in stores; its node's `savestate.dev/cpu` label and scale-down annotation; removes run directories of sandboxes that are gone |
 | Launcher | listens on `/run/savestate/launcher.sock` in its pod (the run directory on the host); creates `/run/savestate/ready` once the VM runs and never removes it while the VM lives. A readiness probe (`test -e /run/savestate/ready`, every 2 s) turns that into the pod's Ready condition, which the controller reads. It exits non-zero when QEMU exits or the VM cannot start, and zero when its pod is deleted. |
 
@@ -669,28 +714,48 @@ checkpoint of its own cluster.
   traffic, drops traffic to private, shared, loopback, link-local, multicast and
   reserved ranges and to the node's own addresses, except `network.egressAllow` and
   port 53 of the guest's DNS servers, drops IPv6, and lets nothing reach the guest or
-  the pod from it unsolicited. Every sandbox sees the same guest address
-  (`10.0.2.15/24` via `10.0.2.2`, MAC `52:54:00:12:34:56`); DNS is `network.dns`, else
-  the VM pod's own resolvers. Forwarding is enabled per interface through netlink.
+  the pod from it unsolicited except through its exposed ports. Every sandbox sees
+  the same guest address (`10.0.2.15/24` via `10.0.2.2`, MAC `52:54:00:12:34:56`);
+  DNS is `network.dns`, else the VM pod's own resolvers. Forwarding is enabled per
+  interface through netlink.
+- Exposed ports: the table holds a set `exposed` of protocol and port pairs.
+  Connections arriving on the pod's own addresses from outside (not from the guest)
+  to a pair in the set are DNATed to the guest at the same port, and the forward
+  chain lets in exactly those connections (`ct status dnat`) and lets out the
+  guest's replies to them (`ct direction reply`); everything the guest starts itself
+  still meets the egress rules. Clients' addresses reach the guest unchanged. The
+  set is replaced in one nftables transaction whenever the pod's
+  `savestate.dev/ports` annotation changes (read from the downward API volume every
+  second), by a process the launcher starts as root before it drops its privileges
+  (`savestate launcher-ports`), which does nothing else. Nothing else inbound opens.
+- Port-forward: `kubectl port-forward` connects to `127.0.0.1` inside the pod. TCP
+  connections to `127.0.0.1` in the pod are DNATed to the guest on any port and
+  masqueraded to `10.0.2.2` on the way in (`route_localnet` is set on the tap device
+  so they may leave loopback). Only processes in the pod can make them, and the
+  Kubernetes API authorizes port-forward (`pods/portforward`) as it does exec, so
+  this needs no exposure; NetworkPolicies do not apply to it.
 - The launcher builds that network as root, hands its run directory to the QEMU user
-  (uid and gid 65532), and then drops to that user for good, keeping only the groups
-  that own `/dev/kvm`, `/dev/net/tun` and `/dev/vhost-vsock`. QEMU runs as that user
-  with `-sandbox on`; the launcher has no service-account token. Its container is
-  never privileged: devices come from the node agent's device plugin, and the
-  container keeps only `NET_ADMIN` (the tap device, forwarding and nftables in its
-  own network namespace), `CHOWN` (handing the run directory to the QEMU user),
-  `SETUID` and `SETGID` (becoming it), under savestate's seccomp profile.
-- Exec and file copy use Kubernetes `pods/exec` RBAC; there is no separate API server.
-  `savestate exec` and `cp` run `savestate guest` in the VM pod, which reaches the
-  guest agent over vsock.
+  (uid and gid 65532), starts `savestate launcher-ports`, and then drops to that user
+  for good, keeping only the groups that own `/dev/kvm`, `/dev/net/tun` and
+  `/dev/vhost-vsock`. QEMU runs as that user with `-sandbox on`; the launcher has no
+  service-account token. Its container is never privileged: devices come from the
+  node agent's device plugin, and the container keeps only `NET_ADMIN` (the tap
+  device, forwarding and nftables in its own network namespace), `CHOWN` (handing the
+  run directory to the QEMU user), `SETUID` and `SETGID` (becoming it), under
+  savestate's seccomp profile.
+- Exec, file copy and port-forward use Kubernetes `pods/exec` and `pods/portforward`
+  RBAC; there is no separate API server. `savestate exec` and `cp` run `savestate
+  guest` in the VM pod, which reaches the guest agent over vsock.
 - VM pods need `NET_ADMIN` in their own network namespace and `hostPath` volumes
   (the node's state directory and their run directory). The baseline Pod Security
   level forbids both (a Localhost seccomp profile and device-plugin devices would
   pass it), so sandbox namespaces need the privileged level. They therefore hold
-  only sandboxes; users get the `savestate-user` role
-  (savestate objects, read pods, `pods/exec`) and never pod creation there. A
-  NetworkPolicy refuses all ingress to VM pods (`app.kubernetes.io/component: vm`):
-  exec goes through the kubelet and the node agent uses a unix socket.
+  only sandboxes; users get the `savestate-user` role (savestate objects, read pods,
+  `pods/exec`, `pods/portforward`) and never pod creation there. A NetworkPolicy
+  refuses all ingress to VM pods (`app.kubernetes.io/component: vm`); the
+  controller's per-sandbox policies open exposed ports only (see "Exposed ports").
+  Exec and port-forward go through the kubelet and the node agent uses a unix
+  socket.
 
 ## Configuration boundary
 
@@ -704,7 +769,7 @@ installation is supplied at install time and never committed here:
 | Generic defaults (state directory, transfer concurrency, cache eviction threshold, TTL limits) and their config schema | Node selection, tolerations, which nodes run VMs |
 | Install manifests with placeholders (kustomize base, example values) | Guest CPU model, VM shapes offered and the CPU they request, memory overhead margin |
 | Guest image build recipe (kernel config, minimal rootfs, guest agent) | Base images and what is preinstalled in them, registries, pull secrets |
-| Test fixtures | Egress allowlists, DNS, object stores (endpoint, bucket, region, prefix), which store checkpoints export to, credentials |
+| Test fixtures | Egress allowlists, DNS, who may reach exposed ports, object stores (endpoint, bucket, region, prefix), which store checkpoints export to, credentials |
 
 Installation config is one YAML file (operator and node agent) plus the usual
 Kubernetes objects; every field has a documented default or is required with a clear
@@ -712,7 +777,7 @@ error, and unknown fields are refused. The schema is `savestate_api::config::Con
 `namespaces` (required), `stateDir`, `kubeletDir`, `launcherImage`, `vm` (`cpuModel`
 required, `memoryOverhead`, `cpuRequestPerVcpu`, `shapes` with an optional
 `cpuRequest` each, `nodeSelector`, `nodeAffinity`, `tolerations`, `slotsPerNode`), `network`
-(`egressAllow`, `dns`), `images` (`registries`, `auth`), `stores` (per name:
+(`egressAllow`, `dns`, `exposeFrom`), `images` (`registries`, `auth`), `stores` (per name:
 `endpoint`, `bucket`, `region` and `credentialsSecret` required, `prefix`), `export`
 (a store name; default none), `cache.minFreePercent`, `transfers.perNode` and `ttl`
 (`default` and `max` per kind). `deploy/base` is a kustomize base with

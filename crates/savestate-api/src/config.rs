@@ -9,7 +9,10 @@ use std::{collections::BTreeMap, net::IpAddr, path::PathBuf};
 
 use ipnet::IpNet;
 use k8s_openapi::{
-    api::core::v1::{NodeSelector, Toleration},
+    api::{
+        core::v1::{NodeSelector, Toleration},
+        networking::v1::NetworkPolicyPeer,
+    },
     apimachinery::pkg::api::resource::Quantity,
 };
 use kube_quantity::ParsedQuantity;
@@ -195,6 +198,13 @@ pub struct Network {
     /// Default: empty, the VM pod's own resolvers.
     #[serde(default)]
     pub dns: Vec<IpAddr>,
+
+    /// Who may connect to sandboxes' exposed ports (`spec.ports`): the sources of
+    /// the `NetworkPolicy` the controller applies to each such sandbox's VM pod
+    /// (namespace and pod selectors, IP blocks). Default: pods in the sandbox's
+    /// own namespace.
+    #[serde(default)]
+    pub expose_from: Option<Vec<NetworkPolicyPeer>>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -345,6 +355,12 @@ impl Config {
         }
         if self.transfers.per_node == 0 {
             return Err("transfers.perNode: must be at least 1".into());
+        }
+        // A NetworkPolicy rule with no sources admits every source.
+        if self.network.expose_from.as_ref().is_some_and(Vec::is_empty) {
+            return Err(
+                "network.exposeFrom: list at least one source, or leave it out for the sandbox's own namespace".into(),
+            );
         }
         self.check_stores()?;
         if self.cache.min_free_percent > 100 {

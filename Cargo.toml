@@ -5,6 +5,7 @@ members = [
     "crates/savestate-api",
     "crates/savestate-guest",
     "crates/savestate-guest-proto",
+    "crates/savestate-objstore",
 ]
 
 [workspace.package]
@@ -48,6 +49,7 @@ expect_used = "warn"
 [workspace.dependencies]
 savestate-api = { path = "crates/savestate-api" }
 savestate-guest-proto = { path = "crates/savestate-guest-proto", default-features = false }
+savestate-objstore = { path = "crates/savestate-objstore" }
 
 # orbd's shared QEMU and guest-agent crates, pinned to one revision.
 orbd-guest = { git = "https://github.com/samcm/orbd", rev = "5c7658c834713db11642208eb2ac2d1036df4b2d" }
@@ -56,12 +58,14 @@ orbd-vm = { git = "https://github.com/samcm/orbd", rev = "5c7658c834713db1164220
 
 anyhow = "1"
 base64 = "0.23"
+bytes = "1"
 fail = "0.5"
 flate2 = "1"
 hyper-util = { version = "0.1", features = ["tokio"] }
 nftables = "0.6"
 oci-client = { version = "0.18", default-features = false, features = ["rustls-tls-no-provider"] }
 rand = "0.10"
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
 rtnetlink = "0.23"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 sha2 = "0.11"
@@ -83,6 +87,8 @@ libc = "0.2"
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.18", default-features = false, features = ["http-listener"] }
 nix = { version = "0.31", features = ["fs", "time"] }
+# S3 only, signing with ring like the rest of the binary (no aws-lc-rs).
+object_store = { version = "0.14", default-features = false, features = ["aws-base", "reqwest", "ring"] }
 prost = "0.14"
 prost-build = "0.14"
 protoc-bin-vendored = "3"

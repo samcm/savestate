@@ -10,11 +10,18 @@ use savestate_api::{Config, Sandbox};
 use serde_json::json;
 
 use super::Error;
-use crate::node::{RESOURCE, SECCOMP_PROFILE};
+use crate::{
+    launcher::ports,
+    node::{RESOURCE, SECCOMP_PROFILE},
+};
 
 /// Labels on every VM pod; the controller watches pods by them and the
 /// `NetworkPolicy` in `deploy/base/sandboxes.yaml` selects them.
 pub(super) const LABELS: &str = "app.kubernetes.io/name=savestate,app.kubernetes.io/component=vm";
+
+/// Label holding the UID of a VM pod's sandbox, which its Service and
+/// `NetworkPolicy` select.
+pub(super) const SANDBOX_UID: &str = "savestate.dev/sandbox-uid";
 
 /// Host directory holding one directory per sandbox for the launcher's socket
 /// (`RUN_DIR/<namespace>/<sandbox>/<sandbox UID>/`), mounted at the same path,
@@ -84,6 +91,7 @@ pub(super) fn build(sandbox: &Sandbox, vm: &Vm, config: &Config) -> Result<Pod, 
     }
     let affinity = affinity(&vm.placement, config.vm.node_affinity.as_ref());
     let state_dir = config.state_dir.display().to_string();
+    let (ports_dir, ports_file) = ports::FILE.rsplit_once('/').unwrap_or_default();
 
     let pod = json!({
         "apiVersion": "v1",
@@ -94,9 +102,14 @@ pub(super) fn build(sandbox: &Sandbox, vm: &Vm, config: &Config) -> Result<Pod, 
             "labels": {
                 "app.kubernetes.io/name": "savestate",
                 "app.kubernetes.io/component": "vm",
+                SANDBOX_UID: uid,
             },
-            // Evicting a VM pod destroys its VM.
-            "annotations": {"cluster-autoscaler.kubernetes.io/safe-to-evict": "false"},
+            "annotations": {
+                // Evicting a VM pod destroys its VM.
+                "cluster-autoscaler.kubernetes.io/safe-to-evict": "false",
+                // Changed by the controller as `spec.ports` changes.
+                ports::ANNOTATION: ports::format(&sandbox.spec.ports),
+            },
             "ownerReferences": [owner],
         },
         "spec": {
@@ -127,6 +140,7 @@ pub(super) fn build(sandbox: &Sandbox, vm: &Vm, config: &Config) -> Result<Pod, 
                 "volumeMounts": [
                     {"name": "state", "mountPath": state_dir},
                     {"name": "run", "mountPath": RUN_DIR},
+                    {"name": "pod", "mountPath": ports_dir, "readOnly": true},
                 ],
             }],
             "volumes": [
@@ -135,6 +149,11 @@ pub(super) fn build(sandbox: &Sandbox, vm: &Vm, config: &Config) -> Result<Pod, 
                     "path": format!("{RUN_DIR}/{namespace}/{}/{uid}", sandbox.name_any()),
                     "type": "DirectoryOrCreate",
                 }},
+                // The exposed ports, which the kubelet updates as the annotation changes.
+                {"name": "pod", "downwardAPI": {"items": [{
+                    "path": ports_file,
+                    "fieldRef": {"fieldPath": format!("metadata.annotations['{}']", ports::ANNOTATION)},
+                }]}},
             ],
         },
     });

@@ -3,7 +3,8 @@
 # the controller reading nodes for placement.
 #
 #   controller  writes Sandbox status, creates VM pods and Transfers, enforces TTLs
-#               and finalizers, reads the object stores' credentials.
+#               and finalizers, applies the Services and NetworkPolicies of
+#               sandboxes that expose ports, reads the object stores' credentials.
 #   node agent  reads everything about the sandboxes on its node, writes Checkpoint
 #               and Transfer status, labels and annotates its node, reads the object
 #               stores' credentials.
@@ -35,9 +36,16 @@ rules:
   - apiGroups: [savestate.dev]
     resources: [sandboxes/status, checkpoints/status, transfers/status]
     verbs: [get, update, patch]
+  # patch: only a VM pod's savestate.dev/ports annotation.
   - apiGroups: [""]
     resources: [pods]
-    verbs: [get, list, watch, create, delete]
+    verbs: [get, list, watch, create, patch, delete]
+  - apiGroups: [""]
+    resources: [services]
+    verbs: [get, list, watch, create, patch, delete]
+  - apiGroups: [networking.k8s.io]
+    resources: [networkpolicies]
+    verbs: [get, list, watch, create, patch, delete]
   - apiGroups: [events.k8s.io]
     resources: [events]
     verbs: [create, patch]
@@ -178,5 +186,8 @@ rules:
     resources: [pods, pods/log]
     verbs: [get, list, watch]
   - apiGroups: [""]
-    resources: [pods/exec]
+    resources: [pods/exec, pods/portforward]
     verbs: [get, create]
+  - apiGroups: [""]
+    resources: [services]
+    verbs: [get, list, watch]

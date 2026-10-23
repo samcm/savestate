@@ -8,10 +8,13 @@
 //! VM devices, for good, so QEMU runs unprivileged (and with `-sandbox on`). It
 //! creates `ready` in the run directory once the VM runs, and exits non-zero when
 //! QEMU stops or the VM cannot start. Exec and file copy reach the guest through
-//! `savestate guest` (see [`guest`]), run in the pod through `pods/exec`.
+//! `savestate guest` (see [`guest`]), run in the pod through `pods/exec`. One root
+//! process stays: `savestate launcher-ports` (see [`ports`]), which keeps the exposed
+//! ports in step with the sandbox.
 
 pub mod guest;
 mod net;
+pub mod ports;
 mod vm;
 
 use std::{
@@ -82,6 +85,9 @@ pub struct Args {
     /// The guest kernel.
     #[arg(long, default_value = KERNEL)]
     pub kernel: PathBuf,
+    /// The exposed ports, which `savestate launcher-ports` follows.
+    #[arg(long, default_value = ports::FILE)]
+    pub ports_file: PathBuf,
     #[arg(long, default_value = RUN_DIR)]
     pub run_dir: PathBuf,
 }
@@ -120,6 +126,14 @@ fn launch(args: &Args) -> anyhow::Result<ExitCode> {
         .context("setting up the guest network")?;
     std::os::unix::fs::chown(&args.run_dir, Some(QEMU_UID), Some(QEMU_GID))
         .with_context(|| format!("chown {}", args.run_dir.display()))?;
+    // Root, with NET_ADMIN, for the life of the pod: the exposed ports follow the
+    // sandbox's spec while everything else runs as the QEMU user.
+    let mut ports = std::process::Command::new(std::env::current_exe()?)
+        .arg("launcher-ports")
+        .arg("--file")
+        .arg(&args.ports_file)
+        .spawn()
+        .context("starting savestate launcher-ports")?;
     // Without O_CLOEXEC: QEMU inherits it.
     let vhost_vsock = nix::fcntl::open(
         "/dev/vhost-vsock",
@@ -129,6 +143,13 @@ fn launch(args: &Args) -> anyhow::Result<ExitCode> {
     .context("opening /dev/vhost-vsock")?;
     drop_privileges().context("dropping privileges")?;
     tracing::info!(dns = ?dns, "network ready; running as the QEMU user");
+    std::thread::spawn(move || {
+        let status = ports.wait();
+        tracing::error!(
+            ?status,
+            "launcher-ports stopped: exposed ports no longer change"
+        );
+    });
 
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()

@@ -15,7 +15,10 @@
 use std::{future::Future, time::Duration};
 
 use k8s_openapi::{
-    api::core::v1::{Namespace, Node, Pod},
+    api::{
+        core::v1::{Namespace, Node, Pod, Service},
+        networking::v1::NetworkPolicy,
+    },
     apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition,
 };
 use kube::{
@@ -219,6 +222,54 @@ async fn controller_runs_pins_fails_expires_and_protects() {
         .delete("spill", &DeleteParams::default())
         .await
         .unwrap();
+
+    // Exposure follows the spec both ways: the pod's ports annotation, a Service
+    // selecting this pod and a NetworkPolicy opening the port appear, and withdrawing
+    // the ports closes the port and removes both.
+    let services: Api<Service> = Api::namespaced(client.clone(), &ns);
+    let policies: Api<NetworkPolicy> = Api::namespaced(client.clone(), &ns);
+    let expose = |spec: serde_json::Value| {
+        let sandboxes = sandboxes.clone();
+        async move {
+            sandboxes
+                .patch(
+                    "web-1",
+                    &PatchParams::default(),
+                    &Patch::Merge(json!({"spec": spec})),
+                )
+                .await
+                .unwrap();
+        }
+    };
+    expose(json!({"ports": [{"port": 8080}], "service": true})).await;
+    let (service, policy) = wait_for("web-1's Service and NetworkPolicy", || async {
+        let annotated =
+            pods.get("web-1").await.unwrap().annotations()["savestate.dev/ports"] == "8080/tcp\n";
+        let service = services.get_opt("web-1").await.unwrap()?;
+        let policy = policies.get_opt("web-1").await.unwrap()?;
+        annotated.then_some((service, policy))
+    })
+    .await;
+    let labels = pods.get("web-1").await.unwrap().metadata.labels.unwrap();
+    let selector = service.spec.unwrap().selector.unwrap();
+    assert!(
+        selector.iter().all(|(k, v)| labels.get(k) == Some(v)),
+        "the Service does not select web-1's pod: {selector:?}"
+    );
+    let policy = serde_json::to_value(policy.spec.unwrap()).unwrap();
+    assert_eq!(
+        policy["ingress"],
+        json!([{"from": [{"podSelector": {}}], "ports": [{"port": 8080, "protocol": "TCP"}]}])
+    );
+    expose(json!({"ports": null, "service": null})).await;
+    wait_for("web-1's exposure to be withdrawn", || async {
+        let closed =
+            pods.get("web-1").await.unwrap().annotations()["savestate.dev/ports"].is_empty();
+        let service = services.get_opt("web-1").await.unwrap();
+        let policy = policies.get_opt("web-1").await.unwrap();
+        (closed && service.is_none() && policy.is_none()).then_some(())
+    })
+    .await;
 
     // An in-use checkpoint, here the ancestor of web-1's, is not deleted.
     checkpoints

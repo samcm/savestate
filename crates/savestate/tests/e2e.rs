@@ -5,7 +5,11 @@
 //! the other and of the original, which carries on unaffected. A sandbox forked from
 //! a restored one carries both histories. A checkpoint exported to an object store
 //! outlives its node-local copy: a sandbox started from it once the node has
-//! dropped its copy imports it from the store and resumes exactly its state.
+//! dropped its copy imports it from the store and resumes exactly its state. A guest
+//! port is unreachable until the sandbox exposes it; then it answers through the
+//! sandbox's Service to clients the installation allows and to no one else, and a
+//! fork of the sandbox answers through its own Service. Port-forward reaches any
+//! guest port.
 //!
 //! Needs a disposable cluster in `KUBECONFIG` with savestate installed and at least
 //! three 1-vCPU VMs' room on one node (CI: kind on a KVM runner), and:
@@ -20,6 +24,9 @@
 //!   copies the node agent drops as soon as they are unused (`cache.minFreePercent:
 //!   100`), and `SAVESTATE_E2E_S3_ENDPOINT`, `_BUCKET`, `_PREFIX`, `_ACCESS_KEY_ID`
 //!   and `_SECRET_ACCESS_KEY` to look into it
+//! - `SAVESTATE_E2E_CLIENTS`: the namespace `network.exposeFrom` allows, and
+//!   `SAVESTATE_E2E_CLIENT_IMAGE`, an image with bash and coreutils for client pods
+//!   there and in `default` (which it does not allow); `kubectl` on the `PATH`
 
 // clippy.toml allows these in `#[test]` functions only, not in a test file's helpers.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -31,12 +38,12 @@ use std::{
 };
 
 use k8s_openapi::api::{
-    core::v1::{Node, Pod},
+    core::v1::{Node, Pod, Service},
     events::v1::Event,
 };
 use kube::{
     Api, Client, ResourceExt as _,
-    api::{AttachParams, ListParams, Patch, PatchParams},
+    api::{AttachParams, DeleteParams, ListParams, Patch, PatchParams, PostParams},
 };
 use savestate_api::{Checkpoint, SandboxPhase, Transfer, TransferPhase};
 
@@ -574,6 +581,210 @@ async fn export_drop_the_local_copy_and_restore_from_the_store() {
 }
 
 /// The node's scale-down annotation.
+#[tokio::test]
+#[ignore = "needs a cluster with savestate installed on KVM nodes; see the module docs"]
+#[expect(clippy::too_many_lines, reason = "one scenario, read top to bottom")]
+async fn exposed_ports_reach_allowed_clients_and_each_fork() {
+    let image = env("SAVESTATE_E2E_IMAGE");
+    let ns = env("SAVESTATE_NAMESPACE");
+    let clients = env("SAVESTATE_E2E_CLIENTS");
+    let client_image = env("SAVESTATE_E2E_CLIENT_IMAGE");
+    let client = Client::try_default().await.expect("KUBECONFIG");
+    let services: Api<Service> = Api::namespaced(client.clone(), &ns);
+    let pods: Api<Pod> = Api::namespaced(client.clone(), &ns);
+
+    // A pod in the namespace `network.exposeFrom` allows, and one elsewhere.
+    let inside = (clients.as_str(), "inside");
+    let outside = ("default", "outside");
+    for (namespace, name) in [inside, outside] {
+        client_pod(&client, namespace, name, &client_image).await;
+    }
+
+    // A sandbox serving HTTP on 8080: each answer is its hostname, so it says which
+    // sandbox answered.
+    savestate(&[
+        "create", "site", "--image", &image, "--vcpus", "1", "--memory", "1Gi", "--disk", "4Gi",
+    ]);
+    sh(
+        "site",
+        r#"cat >/usr/local/bin/hello <<'END'
+#!/bin/bash
+while IFS= read -r line && [ -n "${line%$'\r'}" ]; do :; done
+printf 'HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n\r\n%s\n' "$(cat /proc/sys/kernel/hostname)"
+END
+chmod +x /usr/local/bin/hello
+systemd-run --unit=hello systemd-socket-activate --listen=8080 --accept --inetd /usr/local/bin/hello"#,
+    );
+    let site_ip = pod_ip(&pods, "site").await;
+
+    // Not exposed: nothing reaches it, not even from the allowed namespace.
+    assert_eq!(
+        fetch(&client, inside, &format!("{site_ip}:8080")).await,
+        None,
+        "an unexposed port answered"
+    );
+
+    // Port-forward reaches any guest port through the Kubernetes API, exposed or not.
+    let mut forward = cli()
+        .args(["port-forward", "site", "18080:8080"])
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut answer = None;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while answer.is_none() && Instant::now() < deadline {
+        answer = fetch_local("127.0.0.1:18080");
+        if answer.is_none() {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }
+    forward.kill().unwrap();
+    forward.wait().unwrap();
+    assert_eq!(answer.as_deref(), Some("site"), "port-forward");
+
+    // Exposed with a Service: allowed clients reach it, others do not.
+    let started = Instant::now();
+    let out = savestate(&["expose", "site", "8080", "--service"]);
+    assert!(out.contains("site exposes 8080/tcp"), "{out}");
+    let site_service = service_ip(&services, "site").await;
+    let site_url = format!("{site_service}:8080");
+    wait_for("the exposed port to answer", 120, || async {
+        fetch(&client, inside, &site_url).await.as_deref() == Some("site")
+    })
+    .await;
+    report(&format!(
+        "expose: the Service answered {:.1} s after `savestate expose`",
+        secs(started)
+    ));
+    assert_eq!(
+        fetch(&client, outside, &site_url).await,
+        None,
+        "a client outside network.exposeFrom reached the exposed port"
+    );
+    assert_eq!(
+        fetch(&client, outside, &format!("{site_ip}:8080")).await,
+        None,
+        "a client outside network.exposeFrom reached the VM pod"
+    );
+
+    // A fork gets the same ports and its own Service, which reaches the fork; the
+    // original's Service still reaches the original.
+    let out = savestate(&["fork", "site", "-n", "1"]);
+    let fork = out
+        .lines()
+        .find_map(|line| line.strip_prefix("sandbox ")?.split(' ').next())
+        .expect("fork names its sandbox")
+        .to_owned();
+    let fork_url = format!("{}:8080", service_ip(&services, &fork).await);
+    wait_for("the fork's Service to answer", 120, || async {
+        fetch(&client, inside, &fork_url).await.as_deref() == Some(fork.as_str())
+    })
+    .await;
+    assert_eq!(
+        fetch(&client, inside, &site_url).await.as_deref(),
+        Some("site")
+    );
+    assert_eq!(
+        fetch(&client, outside, &fork_url).await,
+        None,
+        "a client outside network.exposeFrom reached the fork"
+    );
+
+    let checkpoint = fork.rsplit_once('-').unwrap().0.to_owned();
+    for sandbox in ["site", fork.as_str()] {
+        savestate(&["delete", "sandbox", sandbox]);
+    }
+    savestate(&["delete", "checkpoint", &checkpoint]);
+    for (namespace, name) in [inside, outside] {
+        Api::<Pod>::namespaced(client.clone(), namespace)
+            .delete(name, &DeleteParams::default())
+            .await
+            .unwrap();
+    }
+}
+
+/// Starts a pod running `image` (which has bash and coreutils) in `namespace`, and
+/// waits until it runs.
+async fn client_pod(client: &Client, namespace: &str, name: &str, image: &str) {
+    let pods: Api<Pod> = Api::namespaced(client.clone(), namespace);
+    let pod = serde_json::from_value(serde_json::json!({
+        "metadata": {"name": name},
+        "spec": {
+            "containers": [{"name": "client", "image": image, "command": ["sleep", "infinity"]}],
+            "terminationGracePeriodSeconds": 0,
+        },
+    }))
+    .unwrap();
+    pods.create(&PostParams::default(), &pod).await.unwrap();
+    wait_for(&format!("pod {namespace}/{name}"), 120, || async {
+        pods.get(name)
+            .await
+            .unwrap()
+            .status
+            .and_then(|s| s.phase)
+            .as_deref()
+            == Some("Running")
+    })
+    .await;
+}
+
+/// One HTTP GET of `addr` (`IP:PORT`) from a client pod: the answer's last line,
+/// or `None` if it could not connect or got no answer within 5 s.
+async fn fetch(client: &Client, (namespace, pod): (&str, &str), addr: &str) -> Option<String> {
+    let (ip, port) = addr.split_once(':').unwrap();
+    let script = format!(
+        "exec 3<>/dev/tcp/{ip}/{port} && printf 'GET / HTTP/1.0\\r\\n\\r\\n' >&3 && cat <&3"
+    );
+    let pods: Api<Pod> = Api::namespaced(client.clone(), namespace);
+    let params = AttachParams::default().container("client").stderr(false);
+    let mut process = pods
+        .exec(pod, ["timeout", "5", "bash", "-c", &script], &params)
+        .await
+        .unwrap();
+    let status = process.take_status().unwrap();
+    let mut out = String::new();
+    tokio::io::AsyncReadExt::read_to_string(&mut process.stdout().unwrap(), &mut out)
+        .await
+        .unwrap();
+    let ok = status.await.and_then(|s| s.status).as_deref() == Some("Success");
+    ok.then(|| out.lines().last().unwrap_or_default().to_owned())
+}
+
+/// The same GET from this process.
+fn fetch_local(addr: &str) -> Option<String> {
+    use std::io::Read as _;
+    let mut stream = std::net::TcpStream::connect(addr).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
+    stream.write_all(b"GET / HTTP/1.0\r\n\r\n").ok()?;
+    let mut out = String::new();
+    stream.read_to_string(&mut out).ok()?;
+    out.lines().last().map(str::to_owned)
+}
+
+async fn pod_ip(pods: &Api<Pod>, name: &str) -> String {
+    pods.get(name)
+        .await
+        .unwrap()
+        .status
+        .and_then(|s| s.pod_ip)
+        .unwrap()
+}
+
+/// The `ClusterIP` of a sandbox's Service, once the controller has made it.
+async fn service_ip(services: &Api<Service>, name: &str) -> String {
+    wait_for(&format!("service {name}"), 60, || async {
+        services.get_opt(name).await.unwrap().is_some()
+    })
+    .await;
+    services
+        .get(name)
+        .await
+        .unwrap()
+        .spec
+        .and_then(|s| s.cluster_ip)
+        .unwrap()
+}
+
 async fn scale_down(client: &Client, node: &str) -> Option<String> {
     Api::<Node>::all(client.clone())
         .get(node)

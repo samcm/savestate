@@ -8,9 +8,8 @@ QEMU over QMP. It shares its QEMU, QMP and guest-agent code with
 
 Status: the engine runs: controller, node agent, launcher and CLI boot, checkpoint
 and restore sandboxes end to end, export checkpoints to S3-compatible object stores
-and restore them from there (phase 4); node-to-node copies come later. Exposed
-ports (`spec.ports`, "Exposed ports") are being built as described here. This
-document is the contract every part of the
+and restore them from there (phase 4), and expose guest ports to the cluster;
+node-to-node copies come later. This document is the contract every part of the
 implementation follows; change it in the same pull request as any change to the
 behaviour it describes.
 
@@ -175,15 +174,16 @@ kubeconfig context and namespace (`--namespace`, else `SAVESTATE_NAMESPACE`).
 
 | Verb | What it does |
 | --- | --- |
-| `create NAME --image IMAGE --vcpus N --memory Q --disk Q [--port PORT[/udp]]… [--service]` | creates a sandbox from an image (with `spec.ports` and `spec.service`) and waits until it is `Running` |
+| `create NAME --image IMAGE --vcpus N --memory Q --disk Q` | creates a sandbox from an image and waits until it is `Running` |
 | `create NAME --from CHECKPOINT [--clock stepped]` | creates a sandbox from a checkpoint and waits until it is `Running` |
+| `create … --port PORT[/udp]… [--service]` | either of the above, with `spec.ports` and `spec.service` |
 | `checkpoint SANDBOX [--name NAME] [--export STORE]` | waits until the sandbox runs, creates a checkpoint of it (named `<sandbox>-<random>` without `--name`) and waits until it is `Ready`, and with `--export` until the store holds it |
 | `fork SANDBOX [-n N]` | one checkpoint as above, then `N` sandboxes from it named `<checkpoint>-1` to `<checkpoint>-N`, each with the forked sandbox's `ports` and `service`, and waits until they run |
 | `list sandboxes\|checkpoints [-l SELECTOR]` | a table: name, phase, node and source of each sandbox; name, phase, sandbox, parent, nodes, stores and sizes of each checkpoint |
 | `get NAME [--kind sandbox\|checkpoint]` | one sandbox (phase, node, source, shape, TTL, labels, message) or checkpoint (phase, sandbox, parent, nodes, stores, shape, sizes, guest time, TTL, labels, message) |
 | `exec NAME [-i] -- CMD…` | runs a command in the guest with its stdin, stdout and stderr; exits with its exit code |
 | `cp SRC DST` | copies a file in or out; one side is `NAME:PATH` |
-| `expose NAME PORT[/udp]… [--service]` | adds ports to the sandbox's `spec.ports` |
+| `expose NAME PORT[/udp]… [--service]` | adds ports to the sandbox's `spec.ports` (and sets `spec.service`, then prints the Service's address) |
 | `port-forward NAME LOCAL:GUEST…` | `kubectl port-forward` to the VM pod, which reaches any TCP port of the guest |
 | `delete sandbox\|checkpoint NAME` | deletes the object |
 

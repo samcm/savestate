@@ -3,7 +3,13 @@
 
 use std::{sync::Arc, time::Duration};
 
-use k8s_openapi::{api::core::v1::Pod, apimachinery::pkg::api::resource::Quantity};
+use k8s_openapi::{
+    api::{
+        core::v1::{Pod, Service},
+        networking::v1::NetworkPolicy,
+    },
+    apimachinery::pkg::api::resource::Quantity,
+};
 use kube::{
     Api, Resource as _, ResourceExt,
     api::{DeleteParams, Patch, PatchParams, PostParams, Preconditions},
@@ -16,6 +22,7 @@ use savestate_api::{
 use serde_json::json;
 
 use super::{Context, Error, MANAGER, pod};
+use crate::launcher;
 
 pub(super) async fn run(ctx: Arc<Context>, namespace: String) {
     let client = ctx.client.clone();
@@ -32,6 +39,15 @@ pub(super) async fn run(ctx: Arc<Context>, namespace: String) {
         // Import progress.
         .owns(
             Api::<Transfer>::namespaced(client.clone(), &namespace),
+            watcher::Config::default(),
+        )
+        // Exposed ports.
+        .owns(
+            Api::<Service>::namespaced(client.clone(), &namespace),
+            watcher::Config::default(),
+        )
+        .owns(
+            Api::<NetworkPolicy>::namespaced(client.clone(), &namespace),
             watcher::Config::default(),
         )
         // A checkpoint becoming Ready (or failing) moves the sandboxes waiting for it.
@@ -91,20 +107,21 @@ async fn reconcile(sandbox: Arc<Sandbox>, ctx: Arc<Context>) -> Result<Action, E
 
     let pods = Api::<Pod>::namespaced(ctx.client.clone(), &namespace);
     let mut retry = None;
-    let status = match pods.get_opt(&name).await? {
-        Some(pod) if !super::owned_by(&pod, &*sandbox) => {
+    let pod = pods.get_opt(&name).await?;
+    let status = match &pod {
+        Some(pod) if !super::owned_by(pod, &*sandbox) => {
             retry = Some(Duration::from_secs(5));
             waiting(
                 &sandbox,
                 format!("waiting for the VM pod of an earlier sandbox named {name} to go away"),
             )
         }
-        Some(pod) if let Some(message) = replace_pinned(&ctx, &sandbox, &pod).await? => {
+        Some(pod) if let Some(message) = replace_pinned(&ctx, &sandbox, pod).await? => {
             retry = Some(Duration::from_secs(1));
             waiting(&sandbox, message)
         }
         Some(pod) => {
-            let mut status = observe(&sandbox, &pod, &old);
+            let mut status = observe(&sandbox, pod, &old);
             if status.phase == SandboxPhase::Restoring
                 && let Some(node) = &status.node
                 && let Some(waiting) = import(&ctx, &sandbox, node).await?
@@ -148,6 +165,9 @@ async fn reconcile(sandbox: Arc<Sandbox>, ctx: Arc<Context>) -> Result<Action, E
         },
     };
 
+    let pod = pod.filter(|pod| super::owned_by(pod, &*sandbox));
+    expose(&ctx, &sandbox, pod.as_ref()).await?;
+
     if status != old {
         let patch = json!({
             "apiVersion": "savestate.dev/v1alpha1",
@@ -164,6 +184,143 @@ async fn reconcile(sandbox: Arc<Sandbox>, ctx: Arc<Context>) -> Result<Action, E
         transition(&ctx, &sandbox, &old, &status).await;
     }
     Ok(retry.map_or_else(|| super::requeue(left), Action::requeue))
+}
+
+/// The VM pod's ports annotation, the sandbox's `NetworkPolicy` and its Service, in
+/// step with `ports` and `service` (see "Exposed ports" in `docs/design.md`).
+async fn expose(ctx: &Context, sandbox: &Sandbox, pod: Option<&Pod>) -> Result<(), Error> {
+    let namespace = sandbox.namespace().unwrap_or_default();
+    let name = sandbox.name_any();
+    let ports = &sandbox.spec.ports;
+    let annotation = launcher::ports::format(ports);
+    if let Some(pod) = pod
+        && pod.annotations().get(launcher::ports::ANNOTATION) != Some(&annotation)
+    {
+        let patch = json!({"metadata": {"annotations": {launcher::ports::ANNOTATION: annotation}}});
+        // A pod replaced meanwhile gets the annotation when it is created.
+        match Api::<Pod>::namespaced(ctx.client.clone(), &namespace)
+            .patch(&name, &PatchParams::default(), &Patch::Merge(patch))
+            .await
+        {
+            Ok(_) => {}
+            Err(kube::Error::Api(status)) if status.code == 404 => {}
+            Err(error) => return Err(error.into()),
+        }
+        tracing::info!(
+            namespace,
+            name,
+            ports = annotation.trim().replace('\n', " "),
+            "exposed ports changed"
+        );
+    }
+
+    let owner = sandbox
+        .controller_owner_ref(&())
+        .ok_or_else(|| Error::PodSpec("the sandbox has no UID yet".into()))?;
+    let selector = json!({pod::SANDBOX_UID: sandbox.uid()});
+    let metadata = json!({"name": name, "namespace": namespace, "ownerReferences": [owner]});
+    let policy = (!ports.is_empty()).then(|| {
+        // Default: every pod in the sandbox's namespace.
+        let from = ctx
+            .config
+            .network
+            .expose_from
+            .as_ref()
+            .map_or_else(|| json!([{"podSelector": {}}]), |from| json!(from));
+        let ports: Vec<_> = ports
+            .iter()
+            .map(|p| json!({"port": p.port, "protocol": p.protocol}))
+            .collect();
+        json!({
+            "apiVersion": "networking.k8s.io/v1",
+            "kind": "NetworkPolicy",
+            "metadata": metadata,
+            "spec": {
+                "podSelector": {"matchLabels": selector},
+                "policyTypes": ["Ingress"],
+                "ingress": [{"from": from, "ports": ports}],
+            },
+        })
+    });
+    sync::<NetworkPolicy>(ctx, sandbox, policy).await?;
+    let service = sandbox.spec.service.then(|| {
+        let ports: Vec<_> = ports
+            .iter()
+            .map(|p| {
+                let name = p
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| format!("{}-{}", p.protocol.as_str(), p.port));
+                json!({"name": name, "port": p.port, "targetPort": p.port, "protocol": p.protocol})
+            })
+            .collect();
+        json!({
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": metadata,
+            "spec": {"type": "ClusterIP", "selector": selector, "ports": ports},
+        })
+    });
+    sync::<Service>(ctx, sandbox, service).await
+}
+
+/// Applies `want`, an object named after the sandbox and owned by it, or deletes
+/// the sandbox's object of that kind when `None`. One of that name the sandbox
+/// does not own is left alone.
+async fn sync<K>(
+    ctx: &Context,
+    sandbox: &Sandbox,
+    want: Option<serde_json::Value>,
+) -> Result<(), Error>
+where
+    K: kube::Resource<DynamicType = (), Scope = k8s_openapi::NamespaceResourceScope>
+        + Clone
+        + serde::de::DeserializeOwned
+        + serde::Serialize
+        + std::fmt::Debug,
+{
+    let name = sandbox.name_any();
+    let api = Api::<K>::namespaced(ctx.client.clone(), &sandbox.namespace().unwrap_or_default());
+    let existing = api.get_opt(&name).await?;
+    match (existing, want) {
+        (Some(object), _) if !super::owned_by(&object, sandbox) => {
+            super::publish(
+                ctx,
+                sandbox,
+                EventType::Warning,
+                "NotExposed",
+                format!(
+                    "a {} named {name} that this sandbox does not own exists; it is left alone",
+                    K::kind(&())
+                ),
+            )
+            .await;
+        }
+        (Some(object), None) => {
+            let params = DeleteParams {
+                preconditions: Some(Preconditions {
+                    uid: object.meta().uid.clone(),
+                    resource_version: None,
+                }),
+                ..DeleteParams::default()
+            };
+            match api.delete(&name, &params).await {
+                Ok(_) => {}
+                Err(kube::Error::Api(status)) if status.code == 404 || status.code == 409 => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        (None, None) => {}
+        (_, Some(want)) => {
+            api.patch(
+                &name,
+                &PatchParams::apply(MANAGER).force(),
+                &Patch::Apply(want),
+            )
+            .await?;
+        }
+    }
+    Ok(())
 }
 
 /// Events, logs and metrics for a status change.

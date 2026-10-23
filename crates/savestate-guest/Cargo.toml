@@ -14,6 +14,7 @@ savestate-guest-proto.workspace = true
 libc.workspace = true
 nix.workspace = true
 prost.workspace = true
+tar.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 

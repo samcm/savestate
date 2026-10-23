@@ -1,7 +1,8 @@
 //! `savestate-guest`: the agent inside every savestate VM, run as
 //! `savestate-guest.service`. It serves the host on vsock port
-//! [`PORT`](savestate_guest_proto::PORT) with the `savestate.guest.v1` protocol: exec,
-//! file copy, the pre-checkpoint hook and the post-restore fixups. The vsock transport
+//! [`PORT`](savestate_guest_proto::PORT) with the `savestate.guest.v1` protocol: exec
+//! (attached, or detached as systemd units), file and directory copy, the
+//! pre-checkpoint hook and the post-restore fixups. The vsock transport
 //! and the guest-side building blocks (atomic writes, hostname, bounded tool runs)
 //! come from orbd's guest library.
 //!
@@ -9,6 +10,7 @@
 //! * `savestate-guest --version`
 
 mod conn;
+mod detached;
 mod exec;
 mod files;
 mod fixups;
@@ -95,6 +97,8 @@ fn dispatch(conn: &Arc<Conn>, body: host_message::Body) -> Result<(), String> {
                 .into(),
         })),
         host_message::Body::Exec(e) => exec::run(conn, &e),
+        host_message::Body::Processes(p) => detached::processes(conn, &p.id),
+        host_message::Body::Logs(l) => detached::logs(conn, &l.id, l.follow),
         host_message::Body::ReadFile(r) => files::read(conn, &r.path),
         host_message::Body::WriteFile(w) => files::write(conn, &w),
         host_message::Body::PrepareCheckpoint(_) => {

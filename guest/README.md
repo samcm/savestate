@@ -83,9 +83,15 @@ vsock port 1024; the host side is `savestate_guest_proto::Client`. One operation
 connection:
 
 - `Hello`: agent version and boot id (unchanged by a restore).
-- `Exec`: run a program as root with streamed stdin, stdout and stderr; returns its
-  exit code or signal.
-- `ReadFile`, `WriteFile`: copy one file out or in (written atomically).
+- `Exec`: run a program as root, with environment variables and a working directory,
+  with streamed stdin, stdout and stderr; returns its exit code or signal. Detached,
+  it runs as the transient systemd unit `savestate-exec-<id>.service` instead, which
+  outlives the connection and the agent, with its output in
+  `/var/log/savestate/exec/<id>.stdout` and `.stderr`.
+- `Processes`, `Logs`: detached processes, running or how they exited, and their
+  output so far or as it comes.
+- `ReadFile`, `WriteFile`: copy a file out or in (written atomically, creating
+  missing parent directories), or a directory as a tar stream.
 - `PrepareCheckpoint`: sync, drop the page cache and compact memory before the host stops the VM.
 - `Restore`: after a restored VM runs again, in this order: step the wall clock to a
   host-supplied time (clock `stepped` only), credit host-supplied entropy to the

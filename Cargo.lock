@@ -3140,6 +3140,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-stream",
+ "tokio-util",
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
@@ -3173,6 +3174,7 @@ dependencies = [
  "orbd-guest",
  "prost",
  "savestate-guest-proto",
+ "tar",
  "tracing",
  "tracing-subscriber",
 ]

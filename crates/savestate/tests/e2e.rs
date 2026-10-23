@@ -3,13 +3,15 @@
 //! two sandboxes start from the checkpoint (one with a frozen clock, one stepped),
 //! and each is shown to have resumed exactly the checkpoint's state, independently of
 //! the other and of the original, which carries on unaffected. A sandbox forked from
-//! a restored one carries both histories. A checkpoint exported to an object store
-//! outlives its node-local copy: a sandbox started from it once the node has
-//! dropped its copy imports it from the store and resumes exactly its state. A guest
-//! port is unreachable until the sandbox exposes it; then it answers through the
-//! sandbox's Service to clients the installation allows and to no one else, and a
-//! fork of the sandbox answers through its own Service. Port-forward reaches any
-//! guest port.
+//! a restored one carries both histories. Along the way: labels and selectors,
+//! waiting for a sandbox that fails, exec with environment and working directory,
+//! detached processes that outlive a guest-agent restart, and file and directory
+//! copies. A checkpoint exported to an object store outlives its node-local copy: a
+//! sandbox started from it once the node has dropped its copy imports it from the
+//! store and resumes exactly its state. A guest port is unreachable until the
+//! sandbox exposes it; then it answers through the sandbox's Service to clients the
+//! installation allows and to no one else, and a fork of the sandbox answers through
+//! its own Service. Port-forward reaches any guest port.
 //!
 //! Needs a disposable cluster in `KUBECONFIG` with savestate installed and at least
 //! three 1-vCPU VMs' room on one node (CI: kind on a KVM runner), and:
@@ -32,7 +34,9 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::{
+    fs::Permissions,
     io::Write as _,
+    os::unix::fs::PermissionsExt as _,
     process::{Command, Output},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -209,6 +213,118 @@ async fn checkpoint_fork_and_resume_exactly() {
     let download = dir.path().join("download");
     savestate(&["cp", "web:/etc/hostname", download.to_str().unwrap()]);
     assert_eq!(std::fs::read_to_string(&download).unwrap(), "web\n");
+
+    // exec with environment variables and a working directory.
+    let out = cli()
+        .args([
+            "exec",
+            "web",
+            "--env",
+            "A=1",
+            "--env",
+            "B=two words",
+            "--cwd",
+            "/tmp",
+        ])
+        .args(["--", "sh", "-c", "echo \"$A|$B|$(pwd)\""])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", describe(&out));
+    assert_eq!(String::from_utf8(out.stdout).unwrap(), "1|two words|/tmp\n");
+
+    // cp creates missing directories, and sets --mode; directories copy both ways.
+    savestate(&[
+        "cp",
+        upload.to_str().unwrap(),
+        "web:/root/new/deeper/copied",
+        "--mode",
+        "600",
+    ]);
+    assert_eq!(
+        sh(
+            "web",
+            "stat -c '%a %n' /root/new /root/new/deeper /root/new/deeper/copied; cat /root/new/deeper/copied"
+        ),
+        "755 /root/new\n755 /root/new/deeper\n600 /root/new/deeper/copied\ncopied in\n"
+    );
+    let tree = dir.path().join("tree");
+    std::fs::create_dir_all(tree.join("sub")).unwrap();
+    std::fs::write(tree.join("sub/run"), "#!/bin/sh\necho ran\n").unwrap();
+    std::fs::set_permissions(tree.join("sub/run"), Permissions::from_mode(0o750)).unwrap();
+    std::fs::write(tree.join("top"), "top\n").unwrap();
+    savestate(&["cp", tree.to_str().unwrap(), "web:/srv/tree"]);
+    assert_eq!(
+        sh(
+            "web",
+            "/srv/tree/sub/run; stat -c %a /srv/tree/sub/run; cat /srv/tree/top"
+        ),
+        "ran\n750\ntop\n"
+    );
+    let back = dir.path().join("back");
+    savestate(&["cp", "web:/srv/tree", back.to_str().unwrap()]);
+    assert_eq!(std::fs::read_to_string(back.join("top")).unwrap(), "top\n");
+    let run = std::fs::metadata(back.join("sub/run")).unwrap();
+    assert_eq!(run.permissions().mode() & 0o7777, 0o750);
+
+    // A detached process outlives its exec and a restart of the guest agent, and its
+    // status and output stay readable.
+    let id = savestate(&[
+        "exec", "web", "--detach", "--env", "WHO=detached", "--cwd", "/root", "--", "sh", "-c",
+        "echo \"$WHO in $(pwd)\"; echo warning >&2; while [ ! -e /run/go ]; do sleep 0.1; done; echo done; exit 7",
+    ])
+    .trim()
+    .to_owned();
+    let main_pid = format!("systemctl show -P MainPID savestate-exec-{id}");
+    let pid_before = sh("web", &main_pid);
+    let agent = "systemctl show -P MainPID savestate-guest";
+    let agent_before = sh("web", agent);
+    // Detached itself: an attached exec would end with the agent it restarts.
+    savestate(&[
+        "exec",
+        "web",
+        "--detach",
+        "--",
+        "systemctl",
+        "restart",
+        "savestate-guest",
+    ]);
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let out = exec("web", agent);
+        let now = String::from_utf8_lossy(&out.stdout).into_owned();
+        if out.status.success() && now != agent_before && now.trim() != "0" {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the guest agent did not restart");
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    let ps = json(&["ps", "web", &id, "-o", "json"]);
+    assert_eq!(ps[0]["state"], "running", "{ps}");
+    assert_eq!(sh("web", &main_pid), pid_before, "the same process runs");
+    sh("web", "touch /run/go");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let ps = loop {
+        let ps = json(&["ps", "web", &id, "-o", "json"]);
+        if ps[0]["state"] == "exited" {
+            break ps;
+        }
+        assert!(Instant::now() < deadline, "{ps}");
+        std::thread::sleep(Duration::from_millis(500));
+    };
+    assert_eq!(ps[0]["exitCode"], 7, "{ps}");
+    let logs = cli().args(["logs", "web", &id]).output().unwrap();
+    assert!(logs.status.success(), "{}", describe(&logs));
+    assert_eq!(
+        (logs.stdout.as_slice(), logs.stderr.as_slice()),
+        (&b"detached in /root\ndone\n"[..], &b"warning\n"[..])
+    );
+    let follow = cli()
+        .args(["logs", "web", &id, "--follow"])
+        .output()
+        .unwrap();
+    assert_eq!(follow.status.code(), Some(7), "{}", describe(&follow));
+    assert_eq!(follow.stdout, logs.stdout);
+    savestate(&["ps", "web"]);
 
     // State: a process counting in its memory, and a file on disk.
     sh(

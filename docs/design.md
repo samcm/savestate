@@ -188,7 +188,7 @@ through RoleBindings; cluster-wide, the controller only reads nodes.
 Capacity accounting is plain Kubernetes: each VM is a Guaranteed pod whose memory
 request is guest RAM plus the installation's memory overhead (`vm.memoryOverhead`,
 default 512 MiB), so the scheduler and ResourceQuota work unchanged. The spike measured
-QEMU's own resident memory outside guest RAM at 40–60 MiB; the margin also covers KVM
+QEMU's own resident memory outside guest RAM at 30–60 MiB; the margin also covers KVM
 kernel memory and the launcher, which phase 1 measures in the pod's cgroup.
 
 ## Controller
@@ -287,9 +287,9 @@ Checkpoint (sandbox keeps running):
 2. `stop`.
 3. `blockdev-snapshot`: a new overlay becomes the sandbox's active disk; the previous
    top layer is now immutable and belongs to the checkpoint. The overlay is created
-   with `qemu-img create -f qcow2 -u -b <top layer> -F qcow2 <new> <size>` (`-u`: the
-   running QEMU holds the top layer's write lock) and added with `blockdev-add`
-   (`"backing": null`) before `blockdev-snapshot`.
+   with `qemu-img create -f qcow2 -u -b <top layer> -F qcow2 <new> <size>` (`-u` and
+   an explicit size, so `qemu-img` does not open the layer the running QEMU has open)
+   and added with `blockdev-add` (`"backing": null`) before `blockdev-snapshot`.
 4. Migrate to a file with `multifd` + `mapped-ram` (and `direct-io`), with
    `max-bandwidth` raised far above the disk's rate: QEMU's default of 128 MiB/s
    applies to a save to file too and otherwise dominates the pause. The RAM file is

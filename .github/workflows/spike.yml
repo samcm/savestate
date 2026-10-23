@@ -70,7 +70,7 @@ jobs:
           docker run --rm --privileged -v "$PWD:/repo" -v "$SCRATCH:/work" -w /repo \
             -e GUEST_IMAGE=/repo/guest-image/base.qcow2 -e EXP1_MEM -e CLOCK_WAIT -e EXPERIMENTS \
             debian:trixie@sha256:4c25275446ca371766b8b093c696782eabce06263fccacb8d5d813b3dc44b308 \
-            bash -c 'spike/install-qemu.sh && spike/run-all.sh /work /repo/spike-out $EXPERIMENTS'
+            bash -c 'spike/install-qemu.sh && spike/debug-boot.sh; spike/run-all.sh /work /repo/spike-out $EXPERIMENTS'
       - name: Summary
         if: always()
         run: |

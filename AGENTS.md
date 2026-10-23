@@ -71,6 +71,23 @@ Use established crates and generators instead of hand-written equivalents:
   placement decisions).
 - Test through public interfaces so tests survive refactors.
 
+## Versions
+
+Use the latest stable release of everything, and keep it that way:
+
+- Rust toolchain, crates (newest major, not the version some dependency happens to
+  use), QEMU, the guest kernel (latest stable series from kernel.org), Debian, the
+  Kubernetes API level (`k8s-openapi` feature) and the Kubernetes versions CI tests
+  against, GitHub Actions and base image digests.
+- When you add or touch a dependency, take its newest stable version. Do not hold one
+  back for compatibility; there is nothing to stay compatible with.
+- Dependabot opens weekly bumps for crates, actions and base images. Versions it
+  cannot see (`rust-toolchain.toml`, `QEMU_VERSION` in the Dockerfile, the guest
+  kernel version, kind node images, the `k8s-openapi` feature) are bumped by hand
+  whenever they are touched or found stale.
+- A release that is broken for us (for example a distro package that fails to build)
+  is the only reason to pin older, with a comment saying when to move on.
+
 ## No compatibility, no migrations
 
 Nothing is deployed. Make hard, clean breaking changes:

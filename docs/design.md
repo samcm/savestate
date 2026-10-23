@@ -153,7 +153,8 @@ status:
   `Transfer` afterwards only deletes the record. Deleting a `Transfer` that is still
   copying cancels it and removes partial files (an export's partial objects go with
   the store's garbage collection). Each node runs at most `transfers.perNode`
-  transfers at a time (default one).
+  transfers at a time (default four); a free slot goes to an import before an
+  export.
 - A checkpoint with `spec.export` (else the config's `export`) gets an export
   `Transfer` from the controller once it is `Ready`, named `<checkpoint>-to-<store>`
   and owned by the checkpoint. A failed export is not retried; delete its `Transfer`
@@ -549,7 +550,12 @@ finished from disk: published, or complete (manifest written) and published now,
 `Ready`; anything else is discarded and `Failed`.
 
 **Transfers.** The node agent runs the exports from its node (`spec.from.node`) and
-the imports to it (`spec.to.node`), at most `transfers.perNode` at a time, writing
+the imports to it (`spec.to.node`), at most `transfers.perNode` at a time (default
+4). A slot that comes free goes to a waiting import, which a sandbox waits for,
+before any waiting export; exports are background work, and several run side by
+side, so one large export holds back neither the others nor a fork. Each transfer
+buffers at most 256 MiB (below), so the node agent's memory limit allows
+`transfers.perNode` × 256 MiB on top of its own use. It writes
 `Copying` with `bytesTotal`, then `bytesDone` every few seconds, then `Ready` or
 `Failed` with a message and an event on the Transfer saying how many bytes moved and
 how long it took. An export of a checkpoint not on the node, or to or from a store
@@ -595,9 +601,9 @@ the host's `/lib/modules`) and check the CPU model (`probe-cpu`, below). The nod
 agent then installs the seccomp profile and only then advertises VM slots, so no VM
 pod is admitted to a node before both its module and its profile are there. Image
 prefetch runs alongside and is not waited for: a node takes VMs from checkpoints
-(which import their image with the rest of the chain if it is missing) and VMs from
-other images at once, and only a VM booting from an image still being pulled waits
-for it. An installation may give new VM nodes the startup taint
+(whose import pulls their image alongside the layers if it is missing) and VMs from
+other images at once, and only a VM booting from, or an import needing, an image
+still being pulled waits for it. An installation may give new VM nodes the startup taint
 `startup-taint.cluster-autoscaler.kubernetes.io/savestate` (`NoSchedule`; the node
 agent tolerates it): the cluster autoscaler counts a node with that taint as still
 starting, rather than as a node the pending VM pods cannot use, and so adds no
@@ -731,8 +737,8 @@ destination, in QEMU master after 11.1).
   images/<hex>.qcow2                 base images by manifest digest, read-only
   layers/<sandbox UID>-<n>.qcow2     disk layers: a sandbox's nth, frozen (read-only)
                                      once a checkpoint takes it
-  checkpoints/<UID>/manifest.json    shape, layer chain, machine arguments, guest time,
-                                     sizes, parent, fingerprint
+  checkpoints/<UID>/manifest.json    shape, base image reference, layer chain, machine
+                                     arguments, guest time, sizes, parent, fingerprint
   checkpoints/<UID>/memory           mapped-ram file (sparse)
   checkpoints/<UID>.tmp/             save or import in progress; complete once
                                      manifest.json exists
@@ -775,12 +781,20 @@ collections/<pass>.json        a garbage collection that may be deleting: writte
                                before it lists anything, removed when it is done
 ```
 
-`<path>` is the file's path in the state directory: `images/<hex>.qcow2`,
-`layers/<id>.qcow2` and `checkpoints/<UID>/memory`. Each of those names one
-immutable file (an image by digest, a layer once frozen, a memory file by its
-checkpoint), so a file is uploaded once and every checkpoint whose chain uses it
-shares it: exporting a child of an exported checkpoint uploads only its own layer and
-memory file.
+`<path>` is the file's path in the state directory: `layers/<id>.qcow2` and
+`checkpoints/<UID>/memory`. Each of those names one immutable file (a layer once
+frozen, a memory file by its checkpoint), so a file is uploaded once and every
+checkpoint whose chain uses it shares it: exporting a child of an exported checkpoint
+uploads only its own layer and memory file.
+
+Base images are not in the store. A chain starts with `images/<hex>.qcow2`, the disk
+of a sandbox image pinned by digest, and the checkpoint's manifest records that image
+(`image`, `…@sha256:<hex>`); a registry already holds it by digest, nodes cache and
+prefetch it, and it is usually far larger than what a checkpoint adds (a multi-GiB
+disk against a layer of what the guest wrote and its used RAM). An import pulls it
+through the node's image cache. A checkpoint therefore restores on a node without
+the image only while its registry still serves it; keep images that checkpoints may
+need. No option archives images in stores: a registry is that archive.
 
 A file's data is its allocated extents (`SEEK_DATA`/`SEEK_HOLE`) in order: the
 memory file holds only the guest's non-zero pages, so its holes cost nothing to
@@ -794,16 +808,19 @@ Every chunk is checked against its digest when it is downloaded, before it is
 written.
 
 **Export** (node agent on a node holding the checkpoint): write
-`exports/<UID>.json` listing the checkpoint's chain and memory file; wait until the
+`exports/<UID>.json` listing the checkpoint's memory file and the layers of its
+chain (not the base image); wait until the
 collections listed in `collections/` now have finished (at most 30 s); for each file, the memory file and newest layer first, skip it if its index exists, else
 upload the chunks not yet there and then its index; write `manifests/<UID>.json`;
 delete the export record. A checkpoint whose manifest exists is exported already.
 
-**Import** (node agent of the destination node): read the manifest; for each file
-not already on the node, download its chunks into `<path>.part` (the memory file
-into `checkpoints/<UID>.tmp/`), fsync and rename it into place; write the
-checkpoint's `manifest.json` into the `.tmp` directory last and publish it like a
-save.
+**Import** (node agent of the destination node): read the manifest; at the same
+time pull the base image it names through the image cache (nothing to do when the
+node has it, and a prefetch of it in progress is joined rather than repeated) and,
+for each file not already on the node, download its chunks into `<path>.part` (the
+memory file into `checkpoints/<UID>.tmp/`), fsync and rename it into place; once
+both are done, write the checkpoint's `manifest.json` into the `.tmp` directory last
+and publish it like a save.
 
 **Garbage collection** (controller, every minute per store): write its marker
 `collections/<pass>.json`; list `files/`; then,

@@ -1,6 +1,7 @@
 //! Transfers of this node: exports of checkpoints held here to object stores
 //! (`spec.from.node` is this node) and imports from stores to here (`spec.to.node`).
-//! At most `transfers.perNode` run at a time. A transfer runs inside its reconcile, so
+//! At most `transfers.perNode` run at a time, and a free slot goes to an import (a
+//! sandbox waits for it) before an export. A transfer runs inside its reconcile, so
 //! one runs at most once at a time; after a restart of the node agent a `Copying`
 //! transfer is simply run again, and what is already at the destination is not
 //! copied twice. One whose object is deleted while copying stops at its next
@@ -59,9 +60,8 @@ async fn reconcile(transfer: Arc<Transfer>, ctx: Arc<Context>) -> Result<Action,
     }
     let _slot = ctx
         .transfer_slots
-        .acquire()
-        .await
-        .map_err(|error| anyhow::anyhow!("transfer slots: {error}"))?;
+        .acquire(transfer.spec.from.store.is_some())
+        .await;
     if !write_status(
         &ctx,
         &transfer,
@@ -74,7 +74,7 @@ async fn reconcile(transfer: Arc<Transfer>, ctx: Arc<Context>) -> Result<Action,
     let started = Instant::now();
     let progress = Progress::default();
     let mut partial = Vec::new();
-    let outcome = tokio::select! {
+    let outcome: Option<anyhow::Result<(Moved, String)>> = tokio::select! {
         result = copy(&ctx, &transfer, &progress, &mut partial) => Some(result),
         () = report(&ctx, &transfer, &progress) => None,
     };
@@ -90,7 +90,7 @@ async fn reconcile(transfer: Arc<Transfer>, ctx: Arc<Context>) -> Result<Action,
             remove(&partial);
             tracing::info!(namespace, transfer = name, "deleted while copying; stopped");
         }
-        Some(Ok(moved)) => {
+        Some(Ok((moved, image))) => {
             let seconds = started.elapsed().as_secs_f64();
             let total = moved.copied + moved.present;
             let status =
@@ -98,7 +98,7 @@ async fn reconcile(transfer: Arc<Transfer>, ctx: Arc<Context>) -> Result<Action,
             write_status(&ctx, &transfer, status).await?;
             #[expect(clippy::cast_precision_loss, reason = "bytes as MiB")]
             let note = format!(
-                "{what} of checkpoint {} done in {seconds:.1} s: {:.1} MiB of data, {:.1} MiB copied, {:.1} MiB already there",
+                "{what} of checkpoint {} done in {seconds:.1} s: {:.1} MiB of data, {:.1} MiB copied, {:.1} MiB already there{image}",
                 transfer.spec.checkpoint,
                 total as f64 / 1_048_576.0,
                 moved.copied as f64 / 1_048_576.0,
@@ -129,12 +129,13 @@ async fn reconcile(transfer: Arc<Transfer>, ctx: Arc<Context>) -> Result<Action,
 }
 
 /// Runs the copy; `partial` collects what to remove here if it does not finish.
+/// Returns what moved, and for an import how it came by the base image.
 async fn copy(
     ctx: &Context,
     transfer: &Transfer,
     progress: &Progress,
     partial: &mut Vec<PathBuf>,
-) -> anyhow::Result<Moved> {
+) -> anyhow::Result<(Moved, String)> {
     let spec = &transfer.spec;
     let namespace = transfer.namespace().unwrap_or_default();
     let checkpoint = Api::<Checkpoint>::namespaced(ctx.client.clone(), &namespace)
@@ -143,7 +144,10 @@ async fn copy(
         .with_context(|| format!("checkpoint {} does not exist", spec.checkpoint))?;
     let uid = checkpoint.uid().unwrap_or_default();
     match (&spec.from.store, &spec.to.store) {
-        (None, Some(store)) => export(ctx, &checkpoint, &uid, store, progress).await,
+        (None, Some(store)) => Ok((
+            export(ctx, &checkpoint, &uid, store, progress).await?,
+            String::new(),
+        )),
         (Some(store), None) => import(ctx, &checkpoint, &uid, store, progress, partial).await,
         _ => bail!("a transfer goes from a node to a store or from a store to a node"),
     }
@@ -166,9 +170,17 @@ async fn export(
     })?;
     let raw: serde_json::Value =
         fsutil::read_json(&dir.join(orbd_vm::checkpoint::MANIFEST))?.context("no manifest")?;
-    // Its own files first: the memory file, then the chain, newest layer first.
+    // Its own files first: the memory file, then the chain, newest layer first. Not
+    // the base image: every node pulls it from its registry by `manifest.image`.
     let mut files = vec![format!("checkpoints/{uid}/{MEMORY}")];
-    files.extend(manifest.chain.iter().rev().cloned());
+    files.extend(
+        manifest
+            .chain
+            .iter()
+            .rev()
+            .filter(|path| !path.starts_with("images/"))
+            .cloned(),
+    );
     let remote = crate::stores::open(&ctx.client, &ctx.config, store).await?;
     let moved = remote
         .export(uid, ctx.store.root(), &files, &raw, progress)
@@ -198,11 +210,12 @@ async fn import(
     store: &str,
     progress: &Progress,
     partial: &mut Vec<PathBuf>,
-) -> anyhow::Result<Moved> {
+) -> anyhow::Result<(Moved, String)> {
     // One import of a checkpoint at a time here; a second finds it published.
     let _busy = Busy::wait(ctx, uid).await;
     let checkpoints = ctx.store.checkpoints();
     let mut moved = Moved::default();
+    let mut image_note = String::new();
     if !checkpoints.published(uid).is_dir() {
         let remote = crate::stores::open(&ctx.client, &ctx.config, store).await?;
         let manifest = remote.manifest(uid).await?.with_context(|| {
@@ -211,6 +224,13 @@ async fn import(
                 checkpoint.name_any()
             )
         })?;
+        let local: crate::store::Manifest = serde_json::from_value(manifest.checkpoint.clone())
+            .context("the checkpoint's manifest in the store")?;
+        let base = local
+            .chain
+            .first()
+            .context("the checkpoint's chain is empty")?
+            .clone();
         let tmp = ctx.store.begin_save(uid)?;
         partial.push(tmp.clone());
         let memory = format!("checkpoints/{uid}/{MEMORY}");
@@ -230,12 +250,39 @@ async fn import(
                 wanted.push((path.clone(), target));
             }
         }
-        let _writing = Writing::new(ctx, &manifest.files);
-        moved = remote
-            .download(&wanted, progress)
-            .await
-            .with_context(|| format!("importing from store {store}"))?;
-        // Files already on the node (an image, a parent's layers), by their size here.
+        let mut writing = local.chain.clone();
+        writing.extend(manifest.files.iter().cloned());
+        let _writing = Writing::new(ctx, &writing);
+        // The base image comes from its registry (or this node's cache), while the
+        // layers and memory file come from the store.
+        let cached = ctx.store.root().join(&base).exists();
+        let image = async {
+            let started = Instant::now();
+            let hex = ctx.images.ensure(&local.image).await?;
+            anyhow::ensure!(
+                crate::store::image_path(&hex) == base,
+                "image {} is not the checkpoint's base image {base}",
+                local.image
+            );
+            Ok(started.elapsed())
+        };
+        let download = async {
+            remote
+                .download(&wanted, progress)
+                .await
+                .with_context(|| format!("importing from store {store}"))
+        };
+        let (pulled, downloaded) = tokio::try_join!(image, download)?;
+        moved = downloaded;
+        image_note = if cached {
+            "; base image already here".to_owned()
+        } else {
+            format!(
+                "; base image pulled in {:.1} s alongside",
+                pulled.as_secs_f64()
+            )
+        };
+        // Files already on the node (a parent's layers), by their size here.
         moved.present = present;
         // Last: the manifest completes the copy, which is then published.
         fsutil::write_json_atomic(
@@ -255,7 +302,7 @@ async fn import(
         true
     })
     .await?;
-    Ok(moved)
+    Ok((moved, image_note))
 }
 
 /// Writes the transfer's progress every [`REPORT`]; returns once the transfer is gone.
@@ -373,4 +420,114 @@ fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// The node's `transfers.perNode` transfer slots. A slot that comes free goes to a
+/// waiting import before any waiting export.
+pub(super) struct Slots {
+    state: std::sync::Mutex<SlotState>,
+    freed: tokio::sync::Notify,
+}
+
+struct SlotState {
+    free: usize,
+    imports_waiting: usize,
+}
+
+impl Slots {
+    pub(super) fn new(slots: usize) -> Self {
+        Self {
+            state: std::sync::Mutex::new(SlotState {
+                free: slots,
+                imports_waiting: 0,
+            }),
+            freed: tokio::sync::Notify::new(),
+        }
+    }
+
+    /// Waits for a slot, which is held until the result is dropped.
+    pub(super) async fn acquire(&self, import: bool) -> Slot<'_> {
+        let _waiting = import.then(|| ImportWaiting::new(self));
+        loop {
+            let freed = self.freed.notified();
+            tokio::pin!(freed);
+            // Registered before the state is looked at, so no release is missed.
+            freed.as_mut().enable();
+            {
+                let mut state = lock(&self.state);
+                if state.free > 0 && (import || state.imports_waiting == 0) {
+                    state.free -= 1;
+                    return Slot { slots: self };
+                }
+            }
+            freed.await;
+        }
+    }
+
+    fn release(&self) {
+        lock(&self.state).free += 1;
+        self.freed.notify_waiters();
+    }
+}
+
+/// A transfer slot, released when dropped.
+pub(super) struct Slot<'a> {
+    slots: &'a Slots,
+}
+
+impl Drop for Slot<'_> {
+    fn drop(&mut self) {
+        self.slots.release();
+    }
+}
+
+/// An import waiting for a slot, while this lives: exports wait behind it.
+struct ImportWaiting<'a> {
+    slots: &'a Slots,
+}
+
+impl<'a> ImportWaiting<'a> {
+    fn new(slots: &'a Slots) -> Self {
+        lock(&slots.state).imports_waiting += 1;
+        Self { slots }
+    }
+}
+
+impl Drop for ImportWaiting<'_> {
+    fn drop(&mut self) {
+        lock(&self.slots.state).imports_waiting -= 1;
+        // Exports held back by this import may take a free slot now.
+        self.slots.freed.notify_waiters();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use futures::FutureExt as _;
+
+    use super::Slots;
+
+    /// A fork's import does not queue behind background exports: the slot an export
+    /// frees goes to the import that waits, though an export waited longer.
+    #[tokio::test]
+    async fn a_freed_slot_goes_to_a_waiting_import_first() {
+        let slots = Slots::new(1);
+        let running = slots.acquire(false).await;
+        let mut export = Box::pin(slots.acquire(false));
+        assert!((&mut export).now_or_never().is_none());
+        let mut import = Box::pin(slots.acquire(true));
+        assert!((&mut import).now_or_never().is_none());
+
+        drop(running);
+        let import = tokio::time::timeout(Duration::from_secs(1), import)
+            .await
+            .expect("the import gets the freed slot");
+        assert!((&mut export).now_or_never().is_none());
+        drop(import);
+        tokio::time::timeout(Duration::from_secs(1), export)
+            .await
+            .expect("the export gets the slot after the import");
+    }
 }

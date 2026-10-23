@@ -187,6 +187,7 @@ async fn plan(
             memory_mib: memory >> 20,
             disk_bytes: super::bytes(disk)?,
             cpu_model: ctx.config.vm.cpu_model.clone(),
+            image_reference: image.clone(),
         })
     };
     Ok(Some(StartRequest {

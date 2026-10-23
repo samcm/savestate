@@ -55,7 +55,7 @@ struct Context {
     /// Held while a restore looks for its checkpoint and while copies are evicted.
     restores: tokio::sync::Mutex<()>,
     /// `transfers.perNode`.
-    transfer_slots: tokio::sync::Semaphore,
+    transfer_slots: transfers::Slots,
     recorder: Recorder,
 }
 
@@ -101,7 +101,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         importing: std::sync::Mutex::default(),
         writing: std::sync::Mutex::default(),
         restores: tokio::sync::Mutex::default(),
-        transfer_slots: tokio::sync::Semaphore::new(
+        transfer_slots: transfers::Slots::new(
             usize::try_from(config.transfers.per_node).unwrap_or(1),
         ),
         recorder,

@@ -16,8 +16,11 @@ to the behaviour it describes.
   node, booted from a disk image or started from a checkpoint. It runs until it is
   deleted. You run commands in it and copy files in and out.
 - A **checkpoint** is a named, read-only, complete picture of a sandbox at one
-  instant: RAM, CPU and device state, and disk. Taking one pauses the sandbox for a
-  few seconds; it then carries on. A checkpoint is the only kind of saved state.
+  instant: RAM, CPU and device state, and disk. Taking one pauses the sandbox while
+  its RAM is written out, then it carries on. The pause grows with the RAM the guest
+  is using: 1–2 s for an idle 8 GiB guest; for a busy one, about its used RAM
+  divided by the node disk's write rate (18 s for 6.8 GiB at 400 MB/s, about 7 s at
+  1 GB/s). A checkpoint is the only kind of saved state.
 - **Starting a sandbox from a checkpoint** gives a VM that wakes exactly where the
   checkpoint was: same processes mid-flight, same files, same in-guest network
   address. Any number of sandboxes can start from one checkpoint; each is fully
@@ -32,7 +35,7 @@ Guarantees and limits:
 | Topic | Behaviour |
 | --- | --- |
 | Clock | `frozen` (default): the guest's clock does not advance while it is paused or saved; a restored guest believes no time passed. `stepped`: after a restore the guest's wall clock is set to the host's current time. The monotonic clock never jumps. |
-| Randomness | Every restored sandbox gets fresh kernel entropy (new VM generation ID plus an explicit reseed from the guest agent). Secrets that programs already derived stay identical across siblings. |
+| Randomness | Every restored sandbox gets fresh kernel entropy (new VM generation ID, which makes the guest kernel reseed, plus an explicit reseed from the guest agent). The kernel tells userspace nothing about a restore; programs that must react use the after-restore hooks. Secrets that programs already derived stay identical across siblings. |
 | Identity | Each restored sandbox gets a new machine-id, hostname and SSH host keys. Its in-guest IP and MAC are unchanged, which is safe because every sandbox has its own isolated network namespace. |
 | Memory | Every running sandbox costs its full memory size. Nothing shares or overcommits guest RAM; KSM stays off. |
 | Placement | A sandbox from a checkpoint starts on a node that holds the checkpoint. Checkpoints live on node-local disk. Copies to other nodes are explicit `Transfer`s (see below). |
@@ -184,7 +187,9 @@ through RoleBindings; cluster-wide, the controller only reads nodes.
 
 Capacity accounting is plain Kubernetes: each VM is a Guaranteed pod whose memory
 request is guest RAM plus the installation's memory overhead (`vm.memoryOverhead`,
-default 512 MiB; measure), so the scheduler and ResourceQuota work unchanged.
+default 512 MiB), so the scheduler and ResourceQuota work unchanged. The spike
+measured QEMU's own resident memory outside guest RAM at 30–60 MiB; the margin also
+covers KVM kernel memory and the launcher, which phase 1 measures in the pod's cgroup.
 
 ## Controller
 
@@ -268,18 +273,28 @@ release until Debian 13 backports ships 11.1 for amd64) and an explicit
 versioned machine type (`pc-q35-11.1`). The guest CPU model is installation
 configuration: a named model that every node in the cluster can run (for example
 `EPYC-Rome-v4` where Zen 2 and Zen 3 hosts mix), never `-cpu host`, and without
-`invtsc`, so checkpoints can later move between nodes. The launcher image digest and
-the CPU model are part of every checkpoint's fingerprint, and restores run that exact
-image.
+`invtsc`, so checkpoints can later move between nodes. The launcher always passes
+`-cpu <model>,enforce`, so a host that lacks a feature refuses to start rather than
+silently weakening the model; the node agent probes the configured model that way at
+start-up and reports a node that cannot run it. (Nested hosts often hide speculation
+control features: on nested Zen 3 and Zen 4 hosts `EPYC-Rome-v4` is refused.) The
+launcher image digest and the CPU model are part of every checkpoint's fingerprint,
+and restores run that exact image. Measured numbers are in `spike/RESULTS.md`.
 
 Checkpoint (sandbox keeps running):
 
 1. Guest agent pre-checkpoint hook (drops the page cache so the RAM file is smaller).
 2. `stop`.
 3. `blockdev-snapshot`: a new overlay becomes the sandbox's active disk; the previous
-   top layer is now immutable and belongs to the checkpoint.
-4. Migrate to a file with `multifd` + `mapped-ram` (and `direct-io`): the RAM file is
-   sparse and written in parallel.
+   top layer is now immutable and belongs to the checkpoint. The overlay is created
+   with `qemu-img create -f qcow2 -u -b <top layer> -F qcow2 <new> <size>` (`-u` and
+   an explicit size, so `qemu-img` does not open the layer the running QEMU has open)
+   and added with `blockdev-add` (`"backing": null`) before `blockdev-snapshot`.
+4. Migrate to a file with `multifd` + `mapped-ram` (and `direct-io`), with
+   `max-bandwidth` raised far above the disk's rate: QEMU's default of 128 MiB/s
+   applies to a save to file too and otherwise dominates the pause. The RAM file is
+   sparse (only non-zero pages are written) and written in parallel; the save runs at
+   the node disk's write rate.
 5. On `completed`: fsync, write `manifest.json`, publish by rename.
 6. `cont`. (After a completed migration `cont` reactivates the block devices and
    restarts the guest; see `qmp_cont` in QEMU.)
@@ -288,7 +303,9 @@ Restore (any number of times, concurrently):
 
 1. `qemu-img create -f qcow2 -b <checkpoint layer> -F qcow2 <new overlay>`.
 2. Start QEMU with the checkpoint's exact machine arguments, the new overlay,
-   `-device vmgenid,guid=auto`, a vsock context id of its own and `-incoming defer`.
+   `-device vmgenid,guid=auto`, a vsock context id of its own and `-incoming defer -S`
+   (`-S` keeps the guest stopped after the incoming migration until the launcher's
+   `cont`).
 3. Set the same migration capabilities, then `migrate-incoming` from the RAM file
    (opened read-only, so concurrent restores share one file) with
    `exit-on-error: false`.

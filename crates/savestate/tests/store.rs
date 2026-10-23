@@ -105,7 +105,9 @@ fn garbage_collection_keeps_what_live_objects_build_on() {
     for image in ["base", "other", "unused"] {
         touch(root, &image_path(image));
     }
-    for layer in ["s1-0", "s1-1", "s2-0", "s2-1", "s3-0", "s4-0", "s5-0"] {
+    for layer in [
+        "s1-0", "s1-1", "s2-0", "s2-1", "s3-0", "s4-0", "s5-0", "s6-0",
+    ] {
         touch(root, &layer_path(layer));
     }
     let kept = vec![image_path("base"), layer_path("s1-0")];
@@ -123,6 +125,8 @@ fn garbage_collection_keeps_what_live_objects_build_on() {
         sandboxes: ["s1", "s3"].map(String::from).into(),
         checkpoints: ["kept", "saving"].map(String::from).into(),
         images: ["other"].map(String::from).into(),
+        // An import is writing s6's layer; its checkpoint is not published yet.
+        files: [layer_path("s6-0")].into(),
     };
     store.collect(&inventory, &live).unwrap();
 
@@ -132,9 +136,9 @@ fn garbage_collection_keeps_what_live_objects_build_on() {
     assert!(!store.checkpoints().published("gone").exists());
     assert!(store.checkpoints().tmp("saving").exists());
     assert!(!store.checkpoints().tmp("abandoned").exists());
-    // Layers: a live sandbox's, and those in remaining chains (also of a save that
-    // is complete but not yet published).
-    for layer in ["s1-0", "s1-1", "s3-0", "s5-0"] {
+    // Layers: a live sandbox's, those in remaining chains (also of a save that is
+    // complete but not yet published), and one an import is writing.
+    for layer in ["s1-0", "s1-1", "s3-0", "s5-0", "s6-0"] {
         assert!(exists(&layer_path(layer)), "{layer} was removed");
     }
     for layer in ["s2-0", "s2-1", "s4-0"] {

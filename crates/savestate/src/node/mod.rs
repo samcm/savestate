@@ -1,17 +1,21 @@
 //! The node agent (`DaemonSet`): owns the state directory on its node (base images,
 //! disk layers, checkpoints; see [`crate::store`]), starts the VM in each VM pod on
-//! its node, checkpoints sandboxes on its node and writes Checkpoint status,
-//! garbage-collects files and run directories whose objects are gone, and reports
-//! disk use. As a kubelet device plugin it hands VM pods their devices and installs
+//! its node, checkpoints sandboxes on its node and writes Checkpoint status, exports
+//! checkpoints to object stores and imports them ([`transfers`]), keeps its node from
+//! scale-down while it holds the only copy of a checkpoint and drops exported copies
+//! under disk pressure ([`cache`]), garbage-collects files and run directories whose
+//! objects are gone, and reports disk use. As a kubelet device plugin it hands VM pods their devices and installs
 //! their seccomp profile ([`devices`]). It is the only component on a node that holds
 //! API credentials. See "Contract with the node agent and launcher" in
 //! `docs/design.md`.
 
+mod cache;
 mod checkpoints;
 mod devices;
 mod gc;
 mod images;
 mod launchers;
+mod transfers;
 
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
@@ -44,6 +48,14 @@ struct Context {
     cids: launchers::Cids,
     /// Checkpoints (UIDs) this process is saving now.
     saving: std::sync::Mutex<std::collections::BTreeSet<String>>,
+    /// Checkpoints (UIDs) this process is importing now.
+    importing: std::sync::Mutex<std::collections::BTreeSet<String>>,
+    /// Paths imports are writing, kept from garbage collection (once per import).
+    writing: std::sync::Mutex<Vec<String>>,
+    /// Held while a restore looks for its checkpoint and while copies are evicted.
+    restores: tokio::sync::Mutex<()>,
+    /// `transfers.perNode`.
+    transfer_slots: tokio::sync::Semaphore,
     recorder: Recorder,
 }
 
@@ -86,9 +98,16 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         images,
         cids: launchers::Cids::default(),
         saving: std::sync::Mutex::default(),
+        importing: std::sync::Mutex::default(),
+        writing: std::sync::Mutex::default(),
+        restores: tokio::sync::Mutex::default(),
+        transfer_slots: tokio::sync::Semaphore::new(
+            usize::try_from(config.transfers.per_node).unwrap_or(1),
+        ),
         recorder,
         config,
     });
+    cache::label(&ctx).await?;
     let mut tasks: Vec<BoxFuture<'static, ()>> = vec![
         gc::run(ctx.clone()).boxed(),
         devices::run(ctx.clone()).boxed(),
@@ -96,6 +115,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     for namespace in &ctx.config.namespaces {
         tasks.push(launchers::run(ctx.clone(), namespace.clone()).boxed());
         tasks.push(checkpoints::run(ctx.clone(), namespace.clone()).boxed());
+        tasks.push(transfers::run(ctx.clone(), namespace.clone()).boxed());
     }
     // The controllers stop on a signal; the collector and the device plugin with them.
     futures::future::select_all(tasks).await;

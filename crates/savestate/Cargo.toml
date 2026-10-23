@@ -57,4 +57,5 @@ protoc-bin-vendored.workspace = true
 tonic-prost-build.workspace = true
 
 [dev-dependencies]
+object_store.workspace = true
 tempfile.workspace = true

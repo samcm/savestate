@@ -2,7 +2,8 @@
 # Sets up the cluster tests/e2e.rs runs against, on a host with /dev/kvm and Docker:
 # a kind cluster with savestate installed from the image IMAGE (loaded in Docker), a
 # plain-HTTP registry holding a base image made from ROOTFS (guest/rootfs's
-# rootfs.qcow2), and the guest CPU model this host runs, picked like spike/ does.
+# rootfs.qcow2), an S3-compatible store checkpoints are exported to, and the guest
+# CPU model this host runs, picked like spike/ does.
 # VM pods get their devices from the node agent's device plugin. Writes the test's
 # environment to OUT (KEY=VALUE lines).
 #
@@ -41,6 +42,18 @@ digest=$(docker inspect --format '{{index .RepoDigests 0}}' localhost:5001/saves
 registry=$(docker inspect --format '{{(index .NetworkSettings.Networks "kind").IPAddress}}' savestate-registry)
 base="$registry:5000/savestate-test/base@$digest"
 
+# An S3-compatible store on kind's network (MinIO, from a community build: upstream
+# publishes no images any more) with a bucket for exported checkpoints; the test
+# reaches it on 127.0.0.1:9000.
+s3_key=savestate s3_secret=savestate-e2e-secret
+docker run -d --name savestate-s3 --network kind -p 127.0.0.1:9000:9000 \
+  -e MINIO_ROOT_USER=$s3_key -e MINIO_ROOT_PASSWORD=$s3_secret \
+  pgsty/minio:RELEASE.2026-08-04T00-00-00Z@sha256:b6bfe7239bfc83fb90d31612d9704d86039dd714f7904b3f1ad68f211e602372 \
+  server /data
+for _ in $(seq 60); do curl -fs http://127.0.0.1:9000/minio/health/live && break; sleep 1; done
+curl -fsS --aws-sigv4 aws:amz:us-east-1:s3 --user "$s3_key:$s3_secret" -X PUT http://127.0.0.1:9000/savestate
+s3=$(docker inspect --format '{{(index .NetworkSettings.Networks "kind").IPAddress}}' savestate-s3)
+
 # savestate's image on the node, named by its digest like a pulled one.
 docker tag "$image" savestate-test/savestate:e2e
 kind load docker-image --name savestate savestate-test/savestate:e2e
@@ -66,6 +79,16 @@ network:
   egressAllow: [$registry/32]
 images:
   plainHttp: ["$registry:5000"]
+stores:
+  e2e:
+    endpoint: http://$s3:9000
+    bucket: savestate
+    region: us-east-1
+    prefix: e2e
+    credentialsSecret: savestate-store-e2e
+# Every exported copy not in use is dropped, as if the disk were full.
+cache:
+  minFreePercent: 100
 EOF
 cat >"$overlay/kustomization.yaml" <<EOF
 resources:
@@ -80,6 +103,14 @@ configMapGenerator:
     behavior: replace
     files:
       - config.yaml
+secretGenerator:
+  - name: savestate-store-e2e
+    namespace: savestate-system
+    options:
+      disableNameSuffixHash: true
+    literals:
+      - accessKeyId=$s3_key
+      - secretAccessKey=$s3_secret
 EOF
 kubectl apply -k "$overlay"
 kubectl -n savestate-system rollout status deployment/savestate-controller --timeout=3m
@@ -100,5 +131,12 @@ SAVESTATE_NAMESPACE=$ns
 SAVESTATE_E2E_ALLOWED=$registry:5000
 SAVESTATE_E2E_BLOCKED=$api:443
 SAVESTATE_E2E_CPU_MODEL=$cpu
+SAVESTATE_E2E_NODE=$node
+SAVESTATE_E2E_STORE=e2e
+SAVESTATE_E2E_S3_ENDPOINT=http://127.0.0.1:9000
+SAVESTATE_E2E_S3_BUCKET=savestate
+SAVESTATE_E2E_S3_PREFIX=e2e
+SAVESTATE_E2E_S3_ACCESS_KEY_ID=$s3_key
+SAVESTATE_E2E_S3_SECRET_ACCESS_KEY=$s3_secret
 EOF
 cat "$out"

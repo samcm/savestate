@@ -40,6 +40,13 @@ pub fn cpu_label(cpu: &str) -> String {
     short_digest(cpu)
 }
 
+/// This node's CPU as a guest with CPU model `host` sees it: model name and a digest
+/// of its feature flags (a checkpoint's `fingerprint.hostCpu`).
+pub fn host_cpu() -> String {
+    let cpu = orbd_vm::process::CpuIdentity::host();
+    format!("{}, flags sha256:{}", cpu.model, cpu.flags_sha256)
+}
+
 /// The first 16 hex digits of the SHA-256 of `text`.
 pub fn short_digest(text: &str) -> String {
     use sha2::Digest as _;

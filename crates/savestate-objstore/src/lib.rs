@@ -90,24 +90,31 @@ impl std::fmt::Debug for Credentials {
 }
 
 /// Bytes of a transfer: `total` once known, `done` (copied, or found already at the
-/// destination) as it goes.
+/// destination) as it goes. Clones share the counts.
+#[derive(Clone, Debug, Default)]
+pub struct Progress(Arc<Counts>);
+
 #[derive(Debug, Default)]
-pub struct Progress {
+struct Counts {
     done: AtomicU64,
     total: AtomicU64,
 }
 
 impl Progress {
     pub fn done(&self) -> u64 {
-        self.done.load(Ordering::Relaxed)
+        self.0.done.load(Ordering::Relaxed)
     }
 
     pub fn total(&self) -> u64 {
-        self.total.load(Ordering::Relaxed)
+        self.0.total.load(Ordering::Relaxed)
     }
 
     fn add(&self, bytes: u64) {
-        self.done.fetch_add(bytes, Ordering::Relaxed);
+        self.0.done.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    fn set_total(&self, bytes: u64) {
+        self.0.total.store(bytes, Ordering::Relaxed);
     }
 }
 
@@ -263,7 +270,7 @@ impl Remote {
             local.push(opened);
         }
         let total = local.iter().map(|(_, layout)| layout.len).sum();
-        progress.total.store(total, Ordering::Relaxed);
+        progress.set_total(total);
         let mut moved = Moved::default();
         if self.contains(id).await? {
             progress.add(total);
@@ -328,12 +335,14 @@ impl Remote {
             .map_ok(|meta| meta.location.filename().unwrap_or_default().to_owned())
             .try_collect()
             .await?;
+        let present = Arc::new(present);
         let chunks: Vec<(String, u64, bool)> = futures::stream::iter(0..layout.chunks())
             .map(|k| {
-                let (file, layout, present, dir) = (file.clone(), layout.clone(), &present, &dir);
+                let (file, layout, present) = (file.clone(), layout.clone(), present.clone());
+                let (store, dir, full) = (self.data.clone(), dir.clone(), full.to_owned());
+                let progress = progress.clone();
                 async move {
                     let (start, end) = layout.chunk(k);
-                    let full = full.to_owned();
                     let data = tokio::task::spawn_blocking(move || {
                         layout
                             .read(&file, start, end)
@@ -343,8 +352,8 @@ impl Remote {
                     let digest = hex::encode(Sha256::digest(&data));
                     let new = !present.contains(&digest);
                     if new {
-                        self.data
-                            .put(&dir.clone().join(digest.as_str()), PutPayload::from(data))
+                        store
+                            .put(&dir.join(digest.as_str()), PutPayload::from(data))
                             .await?;
                     }
                     progress.add(end - start);
@@ -403,7 +412,7 @@ impl Remote {
             indexes.push((Arc::new(layout), index.chunks));
         }
         let total = indexes.iter().map(|(layout, _)| layout.len).sum();
-        progress.total.store(total, Ordering::Relaxed);
+        progress.set_total(total);
 
         for ((path, target), (layout, chunks)) in files.iter().zip(indexes) {
             let mut part = target.clone().into_os_string();
@@ -442,22 +451,25 @@ impl Remote {
             .map_err(|source| io(part, source))?;
         let file = Arc::new(file);
         let dir = self.key(&format!("files/{path}"));
-        futures::stream::iter(chunks.iter().enumerate())
+        futures::stream::iter(chunks.iter().cloned().enumerate())
             .map(|(k, digest)| {
-                let (file, layout, dir) = (file.clone(), layout.clone(), &dir);
+                let (file, layout, store) = (file.clone(), layout.clone(), self.data.clone());
+                let (key, part, progress) = (
+                    dir.clone().join(digest.as_str()),
+                    part.to_owned(),
+                    progress.clone(),
+                );
                 async move {
                     let (start, end) = layout.chunk(k as u64);
-                    let key = dir.clone().join(digest.as_str());
-                    let data = self.data.get(&key).await?.bytes().await?;
+                    let data = store.get(&key).await?.bytes().await?;
                     if data.len() as u64 != end - start
-                        || hex::encode(Sha256::digest(&data)) != *digest
+                        || hex::encode(Sha256::digest(&data)) != digest
                     {
                         return Err(Error::Corrupt(format!(
                             "{key}: {} bytes that do not match their digest",
                             data.len()
                         )));
                     }
-                    let part = part.to_owned();
                     tokio::task::spawn_blocking(move || {
                         layout
                             .write(&file, start, &data)
@@ -587,7 +599,6 @@ impl Remote {
         kept: &[(String, Path)],
         cache: &mut HashMap<String, Vec<String>>,
     ) -> Result<BTreeSet<String>, Error> {
-        let store = &*self.collector;
         let missing: Vec<Path> = kept
             .iter()
             .map(|(_, key)| key)
@@ -595,20 +606,24 @@ impl Remote {
             .cloned()
             .collect();
         let read: Vec<(Path, Vec<String>)> = futures::stream::iter(missing)
-            .map(|key| async move {
-                match store.get(&key).await {
-                    Ok(object) => {
-                        let bytes = object.bytes().await?;
-                        let files = if self.under("manifests", key.as_ref()).is_some() {
-                            json::<Manifest>(&key, &bytes)?.files
-                        } else {
-                            json::<Record>(&key, &bytes)?.files
-                        };
-                        Ok(Some((key, files)))
+            .map(|key| {
+                let store = self.collector.clone();
+                let manifest = self.under("manifests", key.as_ref()).is_some();
+                async move {
+                    match store.get(&key).await {
+                        Ok(object) => {
+                            let bytes = object.bytes().await?;
+                            let files = if manifest {
+                                json::<Manifest>(&key, &bytes)?.files
+                            } else {
+                                json::<Record>(&key, &bytes)?.files
+                            };
+                            Ok(Some((key, files)))
+                        }
+                        // Finished (an export record) or deleted meanwhile.
+                        Err(object_store::Error::NotFound { .. }) => Ok(None),
+                        Err(error) => Err(Error::from(error)),
                     }
-                    // Finished (an export record) or deleted meanwhile.
-                    Err(object_store::Error::NotFound { .. }) => Ok(None),
-                    Err(error) => Err(Error::from(error)),
                 }
             })
             .buffer_unordered(PARALLEL)

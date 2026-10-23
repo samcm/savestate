@@ -7,9 +7,8 @@ QEMU over QMP. It shares its QEMU, QMP and guest-agent code with
 [orbd](https://github.com/samcm/orbd).
 
 Status: the engine runs: controller, node agent, launcher and CLI boot, checkpoint
-and restore sandboxes end to end. Export of checkpoints to S3-compatible object
-stores and restore from them (phase 4) are being built as described here;
-node-to-node copies come later. This document is the contract every part of the
+and restore sandboxes end to end, export checkpoints to S3-compatible object stores
+and restore them from there (phase 4); node-to-node copies come later. This document is the contract every part of the
 implementation follows; change it in the same pull request as any change to the
 behaviour it describes.
 
@@ -400,9 +399,7 @@ global on a host: the lowest free one from 100000, kept in the run directory as
 `vsock-cid`, so it lives exactly as long as the sandbox; a restore gets its own), makes
 sure the base image or checkpoint is on the node, and sends `Start`: boot an image
 with the sandbox's shape and `vm.cpuModel`, or restore a checkpoint with its clock.
-A restore first records the checkpoint's UID in the run directory (`checkpoint`),
-which keeps the checkpoint's local copy from eviction while the sandbox lives. A
-checkpoint not on this node, while this node is not in its `status.nodes` and a
+A checkpoint not on this node, while this node is not in its `status.nodes` and a
 store holds it, is waited for: the controller is importing it here. Starts that
 cannot happen (an image that cannot be pulled, a checkpoint not on this node and in
 no store, a failed import) are sent as `Fail`, and the launcher exits with that
@@ -453,9 +450,12 @@ before marking a new checkpoint `Ready`.
 When the state directory's filesystem has less than `cache.minFreePercent` free
 (default 10), the node agent drops such copies, oldest checkpoint first, until it
 has enough: it removes its node from `status.nodes` (with the checkpoint's resource
-version), then the files. A copy a sandbox on this node was restored from (its run
-directory names it) is never dropped. Restores and evictions on a node take one lock,
-so a restore never starts from a copy being dropped.
+version), then the files; the next garbage collection removes the layers and images
+nothing else uses. A copy that the sandbox of a VM pod on this node starts or runs
+from is never dropped. A restore looks for its checkpoint, and an eviction lists the
+VM pods and drops copies, under one lock, so a restore never starts from a copy
+being dropped. Imports' files are kept from garbage collection until they are
+published.
 
 **Garbage collection.** Every minute the node agent lists its files, then the
 Sandboxes and Checkpoints of its namespaces (fresh), and removes checkpoints (and

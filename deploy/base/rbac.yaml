@@ -4,8 +4,9 @@
 #
 #   controller  writes Sandbox status, creates VM pods and Transfers, enforces TTLs
 #               and finalizers, reads the object stores' credentials.
-#   node agent  reads everything about the sandboxes on its node and writes
-#               Checkpoint and Transfer status.
+#   node agent  reads everything about the sandboxes on its node, writes Checkpoint
+#               and Transfer status, labels and annotates its node, reads the object
+#               stores' credentials.
 #   VM pods     no service-account token and no permissions at all.
 apiVersion: v1
 kind: ServiceAccount
@@ -109,6 +110,58 @@ rules:
   - apiGroups: [events.k8s.io]
     resources: [events]
     verbs: [create, patch]
+---
+# Cluster-wide: the node agent labels its own node with its guests' CPU
+# (savestate.dev/cpu) and sets cluster-autoscaler.kubernetes.io/scale-down-disabled
+# on it while it holds the only copy of a checkpoint. RBAC cannot narrow this to
+# one node.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: savestate-node-nodes
+rules:
+  - apiGroups: [""]
+    resources: [nodes]
+    verbs: [get, patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: savestate-node-nodes
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: savestate-node-nodes
+subjects:
+  - kind: ServiceAccount
+    name: savestate-node
+    namespace: savestate-system
+---
+# The node agent reads the object stores' credential Secrets (`credentialsSecret`;
+# an installation may narrow this with resourceNames).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: savestate-node
+  namespace: savestate-system
+rules:
+  - apiGroups: [""]
+    resources: [secrets]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: savestate-node
+  namespace: savestate-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: savestate-node
+subjects:
+  - kind: ServiceAccount
+    name: savestate-node
+    namespace: savestate-system
 ---
 # For people and tools using sandboxes; bind it in sandbox namespaces to whoever
 # your installation chooses. It deliberately grants no pod creation: sandbox

@@ -271,7 +271,7 @@ async fn restore_machine(
         fingerprint.machine_type,
     );
     if let Some(taken_on) = &fingerprint.host_cpu {
-        let here = host_cpu();
+        let here = crate::host_cpu();
         ensure!(
             *taken_on == here,
             "the checkpoint gives the guest the CPU it was taken on ({taken_on}); this node's is {here}"
@@ -482,7 +482,7 @@ impl Vm {
             qemu: self.qemu_version.clone(),
             machine_type: self.machine_type.clone(),
             cpu_model: self.cpu_model.clone(),
-            host_cpu: (self.cpu_model == HOST_CPU).then(host_cpu),
+            host_cpu: (self.cpu_model == HOST_CPU).then(crate::host_cpu),
             devices: devices_digest(&self.machine_args),
         };
         let manifest = Manifest {
@@ -505,13 +505,6 @@ impl Vm {
         fsutil::write_json_atomic(&dir.join(orbd_vm::checkpoint::MANIFEST), &manifest)?;
         Ok(save_ms)
     }
-}
-
-/// The node's CPU as a guest with CPU model `host` sees it: model name and a digest of
-/// its feature flags.
-fn host_cpu() -> String {
-    let cpu = orbd_vm::process::CpuIdentity::host();
-    format!("{}, flags sha256:{}", cpu.model, cpu.flags_sha256)
 }
 
 /// `sha256:<hex>` of the guest-visible machine arguments.

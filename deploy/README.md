@@ -7,8 +7,9 @@
   installation config as a ConfigMap, and one example sandbox namespace,
   `sandboxes`.
 
-Nodes that run VMs need KVM, `/dev/net/tun` and `/dev/vhost-vsock` (`modprobe
-vhost_vsock`), and a disk for `stateDir`. VM pods are never privileged: the node
+Nodes that run VMs need KVM, `/dev/net/tun`, `/dev/vhost-vsock` (the node agent's
+`load-modules` init container runs `modprobe vhost_vsock` where it is missing, from
+the host's `/lib/modules`), and a disk for `stateDir`. VM pods are never privileged: the node
 agent hands them those devices as a kubelet device plugin. Their launcher container
 runs as root with only `NET_ADMIN`, `CHOWN`, `SETUID` and `SETGID`, no privilege
 escalation, a read-only root filesystem and the seccomp profile
@@ -79,7 +80,7 @@ Everything below describes one installation and comes from your overlay; nothing
 | Memory overhead margin | `vm.memoryOverhead` (default `512Mi`); measure QEMU's overhead on your nodes. |
 | VMs per node | `vm.slotsPerNode` (default `110`, the kubelet's default pod limit). The node agent is a kubelet device plugin: it advertises that many units of `savestate.dev/vm`, each VM pod takes one, and with it the kubelet hands the pod `/dev/kvm`, `/dev/net/tun` and `/dev/vhost-vsock`. Set it lower to cap VMs per node; CPU and memory requests limit them otherwise. |
 | Kubelet directory | `kubeletDir` (default `/var/lib/kubelet`, also k3s's) and the node agent's `device-plugins` and `seccomp` `hostPath`s in [`base/node.yaml`](base/node.yaml) must agree. The node agent installs the VM pods' seccomp profile as `seccomp/savestate/vm.json` there at start-up, before it advertises any VM slot. |
-| Base images, registries, pull credentials | `images.registries`, and `images.auth` pointing at a Docker `config.json` you mount into the node agent (for example from a Secret, by patching `base/node.yaml`); `images.plainHttp` for registries reached without TLS. |
+| Base images, registries, pull credentials | `images.registries`, and `images.auth` pointing at a Docker `config.json` you mount into the node agent (for example from a Secret, by patching `base/node.yaml`); `images.plainHttp` for registries reached without TLS; `images.prefetch` for images every node pulls when its agent starts. |
 | Egress allowlist, DNS | `network.egressAllow` and `network.dns`. Guests reach the internet; cluster, node, link-local and private ranges are dropped except what you allow. |
 | State directory | `stateDir` (default `/var/lib/savestate`) and the node agent's `hostPath` must agree, on a disk large enough for your checkpoints. |
 | Object stores | `stores`: per store an S3-compatible `endpoint`, `bucket`, `region`, `prefix` (one prefix per installation) and `credentialsSecret`, a Secret in `savestate-system` with `accessKeyId` and `secretAccessKey`. `export` names the store every checkpoint is exported to (default: only checkpoints with `spec.export`). Without stores, checkpoints live only on the node that took them. |

@@ -52,6 +52,14 @@ async fn collect(ctx: &Context) -> anyhow::Result<()> {
         .collect();
 
     let mut live = Live::default();
+    // Prefetched images stay.
+    live.images.extend(
+        ctx.config
+            .images
+            .prefetch
+            .iter()
+            .filter_map(|image| Some(image.rsplit_once("@sha256:")?.1.to_owned())),
+    );
     // After the listing: what imports are writing now.
     live.files.extend(
         ctx.writing

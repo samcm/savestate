@@ -313,16 +313,22 @@ jobs:
       - name: Garbage collection removes everything once the objects are gone
         run: |
           node=savestate-control-plane
+          # The base image is in images.prefetch (setup.sh): it stays.
+          prefetched="${SAVESTATE_E2E_IMAGE##*@sha256:}.qcow2"
           store() {
             curl -fsS --aws-sigv4 aws:amz:us-east-1:s3 --user "$SAVESTATE_E2E_S3_ACCESS_KEY_ID:$SAVESTATE_E2E_S3_SECRET_ACCESS_KEY" \
               "$SAVESTATE_E2E_S3_ENDPOINT/$SAVESTATE_E2E_S3_BUCKET?list-type=2&prefix=$SAVESTATE_E2E_S3_PREFIX/"
           }
           for _ in $(seq 60); do
-            left=$(docker exec "$node" sh -c 'ls /var/lib/savestate/images /var/lib/savestate/layers /var/lib/savestate/checkpoints; ls /run/savestate/sandboxes 2>/dev/null' | grep -v ':$' | grep -vc '^$' || true)
+            left=$(docker exec "$node" sh -c 'ls /var/lib/savestate/images /var/lib/savestate/layers /var/lib/savestate/checkpoints; ls /run/savestate/sandboxes 2>/dev/null' | grep -v ':$' | grep -v "^$prefetched\$" | grep -vc '^$' || true)
             objects=$(store | grep -o '<Key>' | wc -l)
             pinned=$(kubectl get node "$node" -o jsonpath='{.metadata.annotations.cluster-autoscaler\.kubernetes\.io/scale-down-disabled}')
             if [ "$left" = 0 ] && [ "$objects" = 0 ] && [ -z "$pinned" ]; then
-              echo "state directory, run directories and store are empty; the node may be scaled down"
+              docker exec "$node" test -e "/var/lib/savestate/images/$prefetched" || {
+                echo "::error::the prefetched base image is not on the node"
+                exit 1
+              }
+              echo "state directory (but the prefetched image), run directories and store are empty; the node may be scaled down"
               exit 0
             fi
             sleep 5

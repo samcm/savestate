@@ -507,7 +507,9 @@ gets the post-restore fixups.
 `/rootfs.qcow2` (the `disk` stage of `guest/rootfs/Dockerfile`, or an installation's
 equivalent). The node agent pulls it by digest (credentials from `images.auth`, plain
 HTTP for `images.plainHttp`), checks the manifests against their digests, extracts the
-disk, refuses one with a backing file, and publishes it read-only by rename.
+disk, refuses one with a backing file, and publishes it read-only by rename. The
+images in `images.prefetch` are pulled as soon as the node agent starts and are never
+garbage; a sandbox booting from one while it is being pulled waits for that pull.
 
 **Taking a checkpoint.** The node agent takes `Pending` checkpoints of sandboxes
 `Running` on its node: it creates `checkpoints/<UID>.tmp/`, then sets the phase to
@@ -561,6 +563,22 @@ chain uses, and run directories of sandboxes that are gone. Files are listed fir
 a file created meanwhile is never taken for garbage. It reports bytes per kind and
 free bytes as metrics (`savestate_node_disk_bytes`, `savestate_node_disk_free_bytes`)
 on `--metrics-listen` (default `0.0.0.0:9090`).
+
+**Joining a node.** Before the node agent starts, its pod's init containers load
+`vhost_vsock` where `/dev/vhost-vsock` is missing (`load-modules`, privileged, with
+the host's `/lib/modules`) and check the CPU model (`probe-cpu`, below). The node
+agent then installs the seccomp profile and only then advertises VM slots, so no VM
+pod is admitted to a node before both its module and its profile are there. Image
+prefetch runs alongside and is not waited for: a node takes VMs from checkpoints
+(which import their image with the rest of the chain if it is missing) and VMs from
+other images at once, and only a VM booting from an image still being pulled waits
+for it. An installation may give new VM nodes the startup taint
+`startup-taint.cluster-autoscaler.kubernetes.io/savestate` (`NoSchedule`; the node
+agent tolerates it): the cluster autoscaler counts a node with that taint as still
+starting, rather than as a node the pending VM pods cannot use, and so adds no
+second node for them while the first comes up. The node agent removes the taint once
+its node's allocatable shows `savestate.dev/vm`, and again within 30 s whenever it
+reappears (a platform may copy an edited pool's taints onto its nodes).
 
 **Devices and seccomp.** The node agent is a kubelet device plugin (device plugin API
 v1beta1, `proto/kubelet/deviceplugin/v1beta1/api.proto`, copied from Kubernetes). At
@@ -849,7 +867,7 @@ error, and unknown fields are refused. The schema is `savestate_api::config::Con
 `namespaces` (required), `stateDir`, `kubeletDir`, `launcherImage`, `vm` (`cpuModel`
 required, `memoryOverhead`, `cpuRequestPerVcpu`, `shapes` with an optional
 `cpuRequest` each, `nodeSelector`, `nodeAffinity`, `tolerations`, `slotsPerNode`, `memoryFileDirectIo`), `network`
-(`egressAllow`, `dns`, `exposeFrom`), `images` (`registries`, `auth`), `stores` (per name:
+(`egressAllow`, `dns`, `exposeFrom`), `images` (`registries`, `auth`, `plainHttp`, `prefetch`), `stores` (per name:
 `endpoint`, `bucket`, `region` and `credentialsSecret` required, `prefix`), `export`
 (a store name; default none), `cache.minFreePercent`, `transfers.perNode` and `ttl`
 (`default` and `max` per kind). `deploy/base` is a kustomize base with

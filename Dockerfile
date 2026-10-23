@@ -43,8 +43,9 @@ RUN apt-get update \
 FROM base AS base-arm64
 
 FROM base AS base-amd64
+# kmod: the node agent's load-modules init container (modprobe vhost_vsock).
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends iproute2 nftables \
+    && apt-get install -y --no-install-recommends iproute2 nftables kmod \
         libaio1t64 libfdt1 libglib2.0-0t64 libpixman-1-0 libseccomp2 liburing2 libzstd1 \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=qemu /out/usr/local /usr/local

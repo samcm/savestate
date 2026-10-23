@@ -87,6 +87,10 @@ images:
   # auth: /etc/savestate/registry/config.json
   # Registries (host[:port]) reached over plain HTTP. Default: [] (HTTPS only).
   # plainHttp: [registry.example.internal:5000]
+  # Sandbox images, by digest, every node agent pulls when it starts and keeps,
+  # so the first sandbox from one on a new node does not wait for the pull.
+  # Default: [].
+  # prefetch: [ghcr.io/example/base@sha256:...]
 
 # S3-compatible object stores checkpoints are exported to and restored from, by
 # name. Each prefix belongs to this installation alone: garbage collection deletes

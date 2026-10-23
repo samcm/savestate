@@ -12,6 +12,11 @@ use std::{path::Path, pin::Pin, sync::Arc, time::Duration};
 use anyhow::Context as _;
 use futures::{Stream, StreamExt as _};
 use hyper_util::rt::TokioIo;
+use k8s_openapi::api::core::v1::Node;
+use kube::{
+    Api,
+    api::{Patch, PatchParams},
+};
 use orbd_vm::fsutil;
 use tonic::{
     Request, Response, Status,
@@ -62,6 +67,65 @@ const SOCKET: &str = "savestate.sock";
 /// The kubelet's registration socket there.
 const KUBELET_SOCKET: &str = "kubelet.sock";
 const VERSION: &str = "v1beta1";
+
+/// A taint an installation may give new VM nodes: the cluster autoscaler counts a
+/// node with it as still starting, not as a node the pending VM pods cannot use, so
+/// it adds no further node for them meanwhile. The node agent removes it once its
+/// node advertises VM slots.
+pub const STARTUP_TAINT: &str = "startup-taint.cluster-autoscaler.kubernetes.io/savestate";
+
+/// Removes [`STARTUP_TAINT`] from this node once the node advertises VM slots, and
+/// again whenever it comes back (a platform may copy a pool's taints onto its
+/// existing nodes when they are edited).
+pub(super) async fn untaint(ctx: Arc<Context>) {
+    let nodes = Api::<Node>::all(ctx.client.clone());
+    loop {
+        let wait = match untaint_once(&nodes, &ctx.node).await {
+            Ok(true) => Duration::from_secs(30),
+            Ok(false) => Duration::from_secs(2),
+            Err(error) => {
+                tracing::warn!(%error, "removing the startup taint");
+                Duration::from_secs(2)
+            }
+        };
+        tokio::time::sleep(wait).await;
+    }
+}
+
+/// Whether the node is free of [`STARTUP_TAINT`] (removing it now if it has VM slots).
+async fn untaint_once(nodes: &Api<Node>, name: &str) -> Result<bool, kube::Error> {
+    let node = nodes.get(name).await?;
+    let taints = node.spec.and_then(|spec| spec.taints).unwrap_or_default();
+    if !taints.iter().any(|taint| taint.key == STARTUP_TAINT) {
+        return Ok(true);
+    }
+    let slots = node
+        .status
+        .and_then(|status| status.allocatable)
+        .and_then(|allocatable| allocatable.get(RESOURCE).cloned())
+        .is_some_and(|quantity| quantity.0 != "0");
+    if !slots {
+        return Ok(false);
+    }
+    let kept: Vec<_> = taints
+        .into_iter()
+        .filter(|taint| taint.key != STARTUP_TAINT)
+        .collect();
+    // The resource version makes it a replace of the taints read above, not of
+    // whatever another writer has set since.
+    let patch = serde_json::json!({
+        "metadata": {"resourceVersion": node.metadata.resource_version},
+        "spec": {"taints": kept},
+    });
+    nodes
+        .patch(name, &PatchParams::default(), &Patch::Merge(patch))
+        .await?;
+    tracing::info!(
+        taint = STARTUP_TAINT,
+        "VM slots are advertised: removed the startup taint"
+    );
+    Ok(true)
+}
 
 /// Installs the VM pods' seccomp profile under `kubelet_dir`, atomically.
 pub(super) fn install_seccomp_profile(kubelet_dir: &Path) -> anyhow::Result<()> {

@@ -231,6 +231,12 @@ pub struct Images {
     /// HTTPS, e.g. a registry inside the cluster. Default: none.
     #[serde(default)]
     pub plain_http: Vec<String>,
+
+    /// Sandbox images, pinned by digest, that every node agent pulls as soon as it
+    /// starts and keeps, so the first sandbox booted from one on a new node does not
+    /// wait for its pull. Default: none.
+    #[serde(default)]
+    pub prefetch: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -332,6 +338,15 @@ impl Config {
         {
             return Err(format!(
                 "launcherImage: {image:?} must be pinned by digest (…@sha256:…)"
+            ));
+        }
+        if let Some(image) = self.images.prefetch.iter().find(|image| {
+            !image.rsplit_once("@sha256:").is_some_and(|(_, hex)| {
+                hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit())
+            })
+        }) {
+            return Err(format!(
+                "images.prefetch: {image:?} must be pinned by digest (…@sha256:…)"
             ));
         }
         let cpu = |quantity: &Quantity, what: &str| {

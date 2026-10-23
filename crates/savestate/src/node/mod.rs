@@ -108,6 +108,27 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         config,
     });
     cache::label(&ctx).await?;
+    // In the background: VM slots are advertised meanwhile, and a sandbox booting
+    // from an image being prefetched waits for the same pull.
+    for image in ctx.config.images.prefetch.clone() {
+        let ctx = ctx.clone();
+        tokio::spawn(async move {
+            let started = std::time::Instant::now();
+            match ctx.images.ensure(&image).await {
+                Ok(_) => tracing::info!(
+                    image,
+                    secs = started.elapsed().as_secs_f64(),
+                    "prefetched an image"
+                ),
+                Err(error) => tracing::warn!(
+                    image,
+                    error = format!("{error:#}"),
+                    "prefetching an image failed"
+                ),
+            }
+        });
+    }
+    tokio::spawn(devices::untaint(ctx.clone()));
     let mut tasks: Vec<BoxFuture<'static, ()>> = vec![
         gc::run(ctx.clone()).boxed(),
         devices::run(ctx.clone()).boxed(),

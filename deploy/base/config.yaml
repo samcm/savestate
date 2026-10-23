@@ -47,6 +47,12 @@ vm:
   # nodes. Default: any node.
   nodeSelector:
     savestate.dev/node: "true"
+  # Required node affinity for VM pods, on top of nodeSelector: Kubernetes
+  # nodeSelectorTerms, any one of which a node must match. Default: none.
+  # nodeAffinity:
+  #   nodeSelectorTerms:
+  #     - matchExpressions:
+  #         - {key: kubernetes.io/hostname, operator: In, values: [node-a, node-b]}
   # tolerations: []
 
   # VMs each node may run: the node agent advertises this many units of the

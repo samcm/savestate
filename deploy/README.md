@@ -17,7 +17,7 @@ drops to uid 65532 before starting QEMU, which applies its own seccomp filter.
 Install in this order:
 
 1. Label the VM nodes (the base selects `savestate.dev/node: "true"`), or set your own
-   selection in the config and `base/node.yaml`.
+   selection (`vm.nodeSelector` or `vm.nodeAffinity`) in the config and `base/node.yaml`.
 2. Write `config.yaml` for your installation (see below and
    [`base/config.yaml`](base/config.yaml)).
 3. Apply an overlay of your own that replaces every placeholder (it includes the
@@ -70,7 +70,7 @@ Everything below describes one installation and comes from your overlay; nothing
 | Sandbox namespaces | `namespaces` in the config, and one copy of [`base/sandboxes.yaml`](base/sandboxes.yaml) per namespace (Namespace with the privileged Pod Security level, RoleBindings for the controller and node agent, a NetworkPolicy refusing ingress to VM pods). |
 | Who may use sandboxes | RoleBindings of the `savestate-user` ClusterRole in sandbox namespaces. Do not give them pod creation there. |
 | Quotas | ResourceQuotas in sandbox namespaces. A VM pod requests its sandbox's memory plus `vm.memoryOverhead`, so memory quotas count sandboxes directly. |
-| Which nodes run VMs, tolerations | `vm.nodeSelector` and `vm.tolerations` in the config, and the same selection on the node-agent DaemonSet ([`base/node.yaml`](base/node.yaml)). The base selects nodes labelled `savestate.dev/node: "true"`. |
+| Which nodes run VMs, tolerations | `vm.nodeSelector`, `vm.nodeAffinity` (e.g. a list of hostnames, without labelling nodes) and `vm.tolerations` in the config, and the same selection on the node-agent DaemonSet ([`base/node.yaml`](base/node.yaml)). The base selects nodes labelled `savestate.dev/node: "true"`. |
 | Guest CPU model | `vm.cpuModel` (required). `host` where all VM nodes are one machine type: guests get the node's CPU, and a checkpoint restores only on nodes with an identical CPU (the node agent labels nodes `savestate.dev/cpu`). A named QEMU model every VM node can run (e.g. `EPYC-Rome-v4`) is run with `enforce`, checked on every node at start-up (a node that cannot run it shows the missing features in its node-agent pod's `probe-cpu` init container), and lets checkpoints move between any VM nodes. |
 | VM shapes offered | `vm.shapes` (default: any shape). |
 | CPU each VM reserves | `cpuRequest` per shape, else `vm.cpuRequestPerVcpu` per vCPU (default `1`, a whole CPU per vCPU: the pod's CPU limit equals its request and it is Guaranteed). Reserve less to fit VMs on nodes that keep some CPU for themselves, e.g. `cpuRequest: 3500m` for a 4-vCPU shape on 4-CPU nodes; such pods have no CPU limit and are Burstable (see "CPU requests below the vCPU count" in [docs/design.md](../docs/design.md)). Memory is always request = limit. |

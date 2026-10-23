@@ -20,7 +20,7 @@ spec:
     spec:
       serviceAccountName: savestate-node
       # The nodes that run VMs: the same selection as `vm.nodeSelector` (and
-      # `vm.tolerations`) in config.yaml.
+      # `vm.nodeAffinity` and `vm.tolerations`) in config.yaml.
       nodeSelector:
         savestate.dev/node: "true"
       securityContext:

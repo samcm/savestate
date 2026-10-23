@@ -11,6 +11,8 @@
 //!   objects.
 //! - [`store`]: the layout of a node's state directory, shared by the node agent and
 //!   the launcher.
+//! - [`stores`]: the object stores of the installation config, opened with their
+//!   credentials, shared by the controller and the node agent.
 //!
 //! The CRD types and the installation config live in the `savestate-api` crate.
 //! QEMU, QMP and guest-agent code comes from orbd's shared crates.
@@ -20,12 +22,31 @@ pub mod controller;
 pub mod launcher;
 pub mod node;
 pub mod store;
+pub mod stores;
 pub mod telemetry;
 
 use std::path::Path;
 
 use anyhow::Context;
 use savestate_api::Config;
+
+/// Label on every VM node: [`cpu_label`] of the CPU guests get there.
+pub const CPU_LABEL: &str = "savestate.dev/cpu";
+
+/// The [`CPU_LABEL`] value for guests given `cpu`: a checkpoint's
+/// `fingerprint.hostCpu`, else its `cpuModel` (and a node's the same for what its
+/// guests get).
+pub fn cpu_label(cpu: &str) -> String {
+    short_digest(cpu)
+}
+
+/// The first 16 hex digits of the SHA-256 of `text`.
+pub fn short_digest(text: &str) -> String {
+    use sha2::Digest as _;
+    let mut digest = hex::encode(sha2::Sha256::digest(text.as_bytes()));
+    digest.truncate(16);
+    digest
+}
 
 /// Read and check the installation config at `path`.
 pub fn load_config(path: &Path) -> anyhow::Result<Config> {

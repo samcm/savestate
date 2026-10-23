@@ -1,15 +1,17 @@
-//! Sandbox → VM pod, and Sandbox status from that pod.
+//! Sandbox → VM pod, Sandbox status from that pod, and the import Transfer of a
+//! sandbox whose pod lands on a node without its checkpoint.
 
 use std::{sync::Arc, time::Duration};
 
 use k8s_openapi::{api::core::v1::Pod, apimachinery::pkg::api::resource::Quantity};
 use kube::{
-    Api, ResourceExt,
+    Api, Resource as _, ResourceExt,
     api::{Patch, PatchParams, PostParams},
     runtime::{Controller, controller::Action, events::EventType, reflector::ObjectRef, watcher},
 };
 use savestate_api::{
-    Checkpoint, CheckpointPhase, Config, Sandbox, SandboxPhase, SandboxStatus, config::Shape,
+    Checkpoint, CheckpointPhase, Config, Sandbox, SandboxPhase, SandboxStatus, Transfer,
+    TransferEnd, TransferPhase, TransferSpec, config::Shape,
 };
 use serde_json::json;
 
@@ -26,6 +28,11 @@ pub(super) async fn run(ctx: Arc<Context>, namespace: String) {
         .owns(
             Api::<Pod>::namespaced(client.clone(), &namespace),
             watcher::Config::default().labels(pod::LABELS),
+        )
+        // Import progress.
+        .owns(
+            Api::<Transfer>::namespaced(client.clone(), &namespace),
+            watcher::Config::default(),
         )
         // A checkpoint becoming Ready (or failing) moves the sandboxes waiting for it.
         .watches(
@@ -85,14 +92,24 @@ async fn reconcile(sandbox: Arc<Sandbox>, ctx: Arc<Context>) -> Result<Action, E
     let pods = Api::<Pod>::namespaced(ctx.client.clone(), &namespace);
     let mut retry = None;
     let status = match pods.get_opt(&name).await? {
-        Some(pod) if !pod::owned_by(&pod, &sandbox) => {
+        Some(pod) if !super::owned_by(&pod, &*sandbox) => {
             retry = Some(Duration::from_secs(5));
             waiting(
                 &sandbox,
                 format!("waiting for the VM pod of an earlier sandbox named {name} to go away"),
             )
         }
-        Some(pod) => observe(&sandbox, &pod, &old),
+        Some(pod) => {
+            let mut status = observe(&sandbox, &pod, &old);
+            if status.phase == SandboxPhase::Restoring
+                && let Some(node) = &status.node
+                && let Some(waiting) = import(&ctx, &sandbox, node).await?
+            {
+                status.phase = SandboxPhase::WaitingForTransfer;
+                status.message = Some(waiting);
+            }
+            status
+        }
         // Placed once, so the VM ran or started there: its state is gone.
         None if old.node.is_some() => {
             failed(&sandbox, old.node.clone(), "the VM pod was deleted".into())
@@ -205,7 +222,7 @@ async fn plan(sandbox: &Sandbox, ctx: &Context) -> Result<Plan, Error> {
             vcpus,
             cpu: cpu_request(&ctx.config, vcpus, memory, Some(disk))?,
             memory: memory.clone(),
-            nodes: None,
+            placement: pod::Placement::Any,
         }));
     };
 
@@ -230,8 +247,10 @@ async fn plan(sandbox: &Sandbox, ctx: &Context) -> Result<Plan, Error> {
             )));
         }
     }
-    if status.nodes.is_empty() {
-        return Ok(Plan::Wait(format!("no node holds checkpoint {name}")));
+    if status.nodes.is_empty() && status.stores.is_empty() {
+        return Ok(Plan::Wait(format!(
+            "no node holds checkpoint {name} and no store has it"
+        )));
     }
     let (Some(fingerprint), Some(vcpus), Some(memory)) =
         (status.fingerprint, status.vcpus, status.memory)
@@ -240,12 +259,124 @@ async fn plan(sandbox: &Sandbox, ctx: &Context) -> Result<Plan, Error> {
             "checkpoint {name} is Ready but its status lacks fingerprint, vcpus or memory"
         )));
     };
+    // In a store, it can start on any node that gives guests the CPU it was taken
+    // with, which imports it unless it holds it already.
+    let placement = if status.stores.is_empty() {
+        pod::Placement::Nodes(status.nodes)
+    } else {
+        let cpu = fingerprint
+            .host_cpu
+            .as_deref()
+            .unwrap_or(&fingerprint.cpu_model);
+        pod::Placement::Cpu {
+            label: crate::cpu_label(cpu),
+            prefer: status.nodes,
+        }
+    };
     Ok(Plan::Run(pod::Vm {
         image: fingerprint.launcher_image,
         vcpus,
         cpu: cpu_request(&ctx.config, vcpus, &memory, status.disk.as_ref())?,
         memory,
-        nodes: Some(status.nodes),
+        placement,
+    }))
+}
+
+/// While `node`, where the sandbox's pod is, does not hold its checkpoint: the
+/// import `Transfer` from a store holding it (named after the sandbox and owned by
+/// it; created now if missing), and a message saying how it goes. `None` once the
+/// node holds the checkpoint, or when no store has it (the node agent fails the
+/// start then).
+async fn import(ctx: &Context, sandbox: &Sandbox, node: &str) -> Result<Option<String>, Error> {
+    let Some(name) = checkpoint_of(sandbox) else {
+        return Ok(None);
+    };
+    let namespace = sandbox.namespace().unwrap_or_default();
+    let Some(checkpoint) = Api::<Checkpoint>::namespaced(ctx.client.clone(), &namespace)
+        .get_opt(name)
+        .await?
+    else {
+        return Ok(None);
+    };
+    let status = checkpoint.status.clone().unwrap_or_default();
+    if status.nodes.iter().any(|holder| holder == node) {
+        return Ok(None);
+    }
+    let Some(store) = status.stores.first() else {
+        return Ok(None);
+    };
+    let transfers = Api::<Transfer>::namespaced(ctx.client.clone(), &namespace);
+    let sandbox_name = sandbox.name_any();
+    let transfer = match transfers.get_opt(&sandbox_name).await? {
+        Some(transfer) if !super::owned_by(&transfer, sandbox) => {
+            return Ok(Some(format!(
+                "waiting for the transfer of an earlier sandbox named {sandbox_name} to go away"
+            )));
+        }
+        Some(transfer) => transfer,
+        None => {
+            let owner = sandbox
+                .controller_owner_ref(&())
+                .ok_or_else(|| Error::PodSpec("the sandbox has no UID yet".into()))?;
+            let mut transfer = Transfer::new(
+                &sandbox_name,
+                TransferSpec {
+                    checkpoint: name.to_owned(),
+                    from: TransferEnd::store(store.as_str()),
+                    to: TransferEnd::node(node),
+                },
+            );
+            transfer.metadata.owner_references = Some(vec![owner]);
+            let params = PostParams {
+                field_manager: Some(MANAGER.into()),
+                ..PostParams::default()
+            };
+            match transfers.create(&params, &transfer).await {
+                Ok(created) => {
+                    tracing::info!(
+                        namespace,
+                        sandbox = sandbox_name,
+                        checkpoint = name,
+                        store,
+                        node,
+                        "importing"
+                    );
+                    super::publish(
+                        ctx,
+                        sandbox,
+                        EventType::Normal,
+                        "Importing",
+                        format!("importing checkpoint {name} from store {store} to node {node}"),
+                    )
+                    .await;
+                    created
+                }
+                // Created by an earlier reconcile the cache has not seen yet.
+                Err(kube::Error::Api(status)) if status.code == 409 => {
+                    return Ok(Some(format!("importing checkpoint {name} to node {node}")));
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+    };
+    let progress = transfer.status.unwrap_or_default();
+    let mib = |bytes: Option<u64>| bytes.unwrap_or(0) >> 20;
+    Ok(Some(match progress.phase {
+        TransferPhase::Pending => {
+            format!(
+                "importing checkpoint {name} from store {store} to node {node}: waiting for a transfer slot"
+            )
+        }
+        TransferPhase::Copying => format!(
+            "importing checkpoint {name} from store {store} to node {node}: {} of {} MiB",
+            mib(progress.bytes_done),
+            mib(progress.bytes_total)
+        ),
+        TransferPhase::Ready => format!("imported checkpoint {name} to node {node}"),
+        TransferPhase::Failed => format!(
+            "importing checkpoint {name} to node {node} failed: {}",
+            progress.message.unwrap_or_default()
+        ),
     }))
 }
 
@@ -363,7 +494,7 @@ fn observe(sandbox: &Sandbox, pod: &Pod, old: &SandboxStatus) -> SandboxStatus {
             .and_then(|c| c.message.clone())
             .map(|reason| match checkpoint_of(sandbox) {
                 Some(checkpoint) => {
-                    format!("no node holding checkpoint {checkpoint} can run the VM pod: {reason}")
+                    format!("no node that can restore checkpoint {checkpoint} can run the VM pod: {reason}")
                 }
                 None => format!("no node can run the VM pod: {reason}"),
             });

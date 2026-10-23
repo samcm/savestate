@@ -3129,6 +3129,7 @@ dependencies = [
  "rustls",
  "savestate-api",
  "savestate-guest-proto",
+ "savestate-objstore",
  "serde",
  "serde-saphyr 2.0.0",
  "serde_json",

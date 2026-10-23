@@ -501,7 +501,7 @@ with.
 
 The controller serves Prometheus metrics (`--metrics-listen`, default
 `0.0.0.0:9090`, at `/metrics`): reconcile counts, errors and durations per kind,
-sandbox phase transitions and TTL deletions. Logs are JSON lines from `tracing`.
+sandbox phase transitions, TTL deletions and store garbage collection. Logs are JSON lines from `tracing`.
 
 ## QEMU mechanics
 

@@ -35,6 +35,7 @@ prost.workspace = true
 rtnetlink.workspace = true
 rustls.workspace = true
 savestate-api.workspace = true
+savestate-objstore.workspace = true
 savestate-guest-proto = { workspace = true, features = ["client"] }
 serde.workspace = true
 serde-saphyr.workspace = true

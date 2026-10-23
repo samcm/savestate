@@ -1,7 +1,8 @@
-//! The controller (Deployment, one replica): creates one Pod per Sandbox, pins
-//! sandboxes started from checkpoints to a node holding the checkpoint, writes
-//! Sandbox status, enforces TTLs, and keeps the finalizer that protects checkpoints
-//! still in use. See "Controller" in `docs/design.md`.
+//! The controller (Deployment, one replica): creates one Pod per Sandbox, places
+//! sandboxes started from checkpoints on nodes that hold them or can import them,
+//! writes Sandbox status, creates export and import Transfers, enforces TTLs, keeps
+//! the finalizer that protects checkpoints still in use, and garbage-collects the
+//! object stores. See "Controller" in `docs/design.md`.
 //!
 //! It runs one sandbox and one checkpoint controller per namespace in the
 //! installation config; its permissions are bound per namespace, so it never
@@ -10,6 +11,7 @@
 mod checkpoint;
 mod pod;
 mod sandbox;
+mod stores;
 
 use std::{sync::Arc, time::Duration};
 
@@ -88,7 +90,11 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         controllers.push(sandbox::run(ctx.clone(), namespace.clone()).boxed());
         controllers.push(checkpoint::run(ctx.clone(), namespace.clone()).boxed());
     }
-    futures::future::join_all(controllers).await;
+    // The controllers stop on a signal; store garbage collection with them.
+    tokio::select! {
+        _ = futures::future::join_all(controllers) => {}
+        () = stores::run(ctx.clone()) => {}
+    }
     tracing::info!("controller stopped");
     Ok(())
 }
@@ -117,6 +123,16 @@ async fn own_image(client: &Client) -> anyhow::Result<String> {
         .map(|status| status.image_id.clone())
         .filter(|id| is_pinned(id))
         .context("own container's imageID has no repository digest")
+}
+
+/// Whether `child` belongs to `owner` (and not to an earlier object of the same
+/// name).
+fn owned_by(child: &impl ResourceExt, owner: &impl Resource) -> bool {
+    let uid = owner.meta().uid.as_deref();
+    child
+        .owner_references()
+        .iter()
+        .any(|reference| Some(reference.uid.as_str()) == uid)
 }
 
 fn is_pinned(image: &str) -> bool {

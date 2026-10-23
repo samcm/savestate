@@ -3,7 +3,7 @@
 # the controller reading nodes for placement.
 #
 #   controller  writes Sandbox status, creates VM pods and Transfers, enforces TTLs
-#               and finalizers.
+#               and finalizers, reads the object stores' credentials.
 #   node agent  reads everything about the sandboxes on its node and writes
 #               Checkpoint and Transfer status.
 #   VM pods     no service-account token and no permissions at all.
@@ -65,7 +65,8 @@ subjects:
     namespace: savestate-system
 ---
 # The controller reads its own pod to learn the image digest it runs, the default
-# launcher image.
+# launcher image, and the object stores' credential Secrets (`credentialsSecret`;
+# an installation may narrow this with resourceNames).
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -73,7 +74,7 @@ metadata:
   namespace: savestate-system
 rules:
   - apiGroups: [""]
-    resources: [pods]
+    resources: [pods, secrets]
     verbs: [get]
 ---
 apiVersion: rbac.authorization.k8s.io/v1

@@ -187,9 +187,9 @@ through RoleBindings; cluster-wide, the controller only reads nodes.
 
 Capacity accounting is plain Kubernetes: each VM is a Guaranteed pod whose memory
 request is guest RAM plus the installation's memory overhead (`vm.memoryOverhead`,
-default 512 MiB), so the scheduler and ResourceQuota work unchanged. The spike measured
-QEMU's own resident memory outside guest RAM at 30–60 MiB; the margin also covers KVM
-kernel memory and the launcher, which phase 1 measures in the pod's cgroup.
+default 512 MiB), so the scheduler and ResourceQuota work unchanged. The spike
+measured QEMU's own resident memory outside guest RAM at 30–60 MiB; the margin also
+covers KVM kernel memory and the launcher, which phase 1 measures in the pod's cgroup.
 
 ## Controller
 

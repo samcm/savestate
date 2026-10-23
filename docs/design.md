@@ -46,6 +46,7 @@ Guarantees and limits:
 | Memory | Every running sandbox costs its full memory size. Nothing shares or overcommits guest RAM; KSM stays off. |
 | Placement | A sandbox from a checkpoint starts on a node that holds the checkpoint. One from a checkpoint in an object store can start on any node that can run it (holders are preferred): that node first copies the checkpoint from the store while the sandbox waits in `WaitingForTransfer`. |
 | Durability | A checkpoint is taken on node-local disk. One held by no store is lost with its node, so that node is kept from cluster-autoscaler scale-down while it holds one. Export to an object store (per checkpoint, or for all by default) makes it independent of every node; node-local copies of exported checkpoints are then a cache the node may drop under disk pressure. |
+| Autoscaling | The upstream cluster autoscaler adds nodes for pending VM pods and removes nodes without VMs and without the only copy of a checkpoint. A VM pool needs at least one node: from zero, an autoscaler whose node templates lack `savestate.dev/vm` adds none. See "Running on an autoscaled cluster" in `deploy/README.md`. |
 | Lifetime | A checkpoint lives until its TTL expires or it is deleted, and cannot be deleted while a sandbox's disk still builds on it. Deleting it deletes its copies on nodes and in stores. |
 | Not provided | Network connections to the outside surviving a restore; restoring on a different QEMU build (the build is pinned per checkpoint automatically). |
 
@@ -651,7 +652,8 @@ Checkpoint (sandbox keeps running):
    2.5 s, at most 30 s. The guest runs meanwhile; only the RAM file shrinks. In the
    end-to-end test (1 GiB guest using 179 MiB plus 256 MiB of page cache) the RAM
    file went from 439 MiB to 186 MiB and the pause from 1.78 s to 0.70 s; the wait
-   was 6.8 s.
+   was 6.8 s. On a devnet guest with a large page cache the file went from 5.75 GiB
+   to 2.87 GiB; where the RAM is genuinely in use it changes little.
 2. `stop`.
 3. `blockdev-snapshot`: a new overlay becomes the sandbox's active disk; the previous
    top layer is now immutable and belongs to the checkpoint. The overlay is created
@@ -659,9 +661,11 @@ Checkpoint (sandbox keeps running):
    an explicit size, so `qemu-img` does not open the layer the running QEMU has open)
    and added with `blockdev-add` (`"backing": null`) before `blockdev-snapshot`.
 4. Migrate to a file with `multifd` + `mapped-ram` (with `direct-io` only if
-   `vm.memoryFileDirectIo`: through the page cache a save usually pauses for less,
-   about half as long in one measurement on a cloud disk, and concurrent restores of
-   one checkpoint share the cached file; on other disks O_DIRECT was faster), with
+   `vm.memoryFileDirectIo`: on cloud VMs' local disks a save through the page cache
+   wrote about 700 MB/s against 250 MB/s with O_DIRECT, pausing devnet guests 5.8 s
+   instead of 12.0 s (2.9 GiB file) and 8.1 s instead of 26.7 s (5.5 GiB), and
+   concurrent restores of one checkpoint share the cached file; on other disks
+   O_DIRECT can be faster), with
    `max-bandwidth` raised far above the disk's rate: QEMU's default of 128 MiB/s
    applies to a save to file too and otherwise dominates the pause. The RAM file is
    sparse (only non-zero pages are written) and written in parallel; the save runs at

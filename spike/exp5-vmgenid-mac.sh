@@ -15,6 +15,7 @@ MEM=${EXP5_MEM:-2G}
 c=$WORK/ckpt/exp5-ckpt
 MAC1=52:54:00:12:34:56
 MAC2=52:54:00:ab:cd:ef
+export NET=tap
 
 guest_mac='cat /sys/class/net/$(ls /sys/class/net | grep -v "^lo$" | head -1)/address'
 uevents='grep -c NEW_VMGENID=1 /run/uevents.log || true'

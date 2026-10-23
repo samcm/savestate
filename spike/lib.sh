@@ -9,10 +9,14 @@
 #   MULTIFD_CHANNELS  multifd channels for save and restore (default 4)
 #   MAX_BANDWIDTH     migration max-bandwidth in bytes/s (default 100 GiB/s; QEMU's own
 #                     default of 128 MiB/s throttles saves to file)
+#   NET               tap: the VM's NIC is on the NAT bridge (net.sh); default none: the
+#                     NIC is on an empty hub
 #   ACCEL             accelerator (default kvm; tcg only for dry runs of the QMP flows)
 set -euo pipefail
 
 SPIKE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=spike/net.sh
+source "$SPIKE/net.sh"
 : "${WORK:?set WORK}" "${OUT:?set OUT}"
 MACHINE=${MACHINE:-pc-q35-11.1}
 CPU_MODEL=${CPU_MODEL:-$(cat "$WORK/cpu-model" 2>/dev/null || echo EPYC-Rome-v4)}
@@ -81,7 +85,7 @@ vm_start() {
     -blockdev "driver=file,filename=$disk,node-name=disk-file"
     -blockdev "driver=qcow2,file=disk-file,node-name=disk"
     -device virtio-blk-pci,drive=disk,id=vd0
-    -netdev user,id=net0
+    -netdev "$(net_args "$name")"
     -device "virtio-net-pci,netdev=net0,id=nic0,mac=${MAC:-52:54:00:12:34:56}"
     -device vmgenid,guid=auto,id=vmgenid0
     -pidfile "$d/pid" -daemonize
@@ -234,7 +238,10 @@ cleanup() {
   for p in "$WORK"/vm/"$PREFIX"*/pid; do
     [ -f "$p" ] && kill -9 "$(cat "$p")" 2>/dev/null || true
   done
-  rm -rf "$WORK"/vm/"$PREFIX"* "$WORK"/ckpt/"$PREFIX"* "$LAYERS"/"$PREFIX"*
+  rm -rf "$WORK"/vm/"$PREFIX"* "$WORK"/ckpt/"$PREFIX"* "${LAYERS:?}"/"$PREFIX"*
+  for p in $(ip -o link show type tun 2>/dev/null | awk -F': ' '{ print $2 }' | grep "^t-$PREFIX" || true); do
+    ip link del "$p" || true
+  done
 }
 PREFIX=${PREFIX:-${EXP%%-*}-}
 trap cleanup EXIT

@@ -26,7 +26,8 @@
 #   --runtime R       how QEMU runs on the hosts: docker (default) or podman, both
 #                     through sudo, in the launcher image's QEMU (see --qemu-image), so
 #                     both hosts run the identical build; or host, which uses the hosts'
-#                     own QEMU 11.1, qemu-img, python3, jq, curl and genisoimage
+#                     own QEMU 11.1, qemu-img, python3, jq, curl, genisoimage, iproute2
+#                     and nftables (run as root)
 #   --qemu-image IMG  container image with the QEMU to test, already present on this
 #                     machine (default: build the `base-amd64` stage of this checkout's
 #                     Dockerfile, i.e. the launcher's QEMU 11.1.2). It is copied to both
@@ -40,7 +41,7 @@
 # Exit status 0 means the restore passed every check.
 set -euo pipefail
 
-FILES=(cross-cpu.sh lib.sh qmp.py prepare-guest.sh install-tools.sh)
+FILES=(cross-cpu.sh lib.sh net.sh qmp.py prepare-guest.sh install-tools.sh)
 
 # --- inside a host (or its container): save and restore --------------------------
 

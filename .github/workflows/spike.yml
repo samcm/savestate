@@ -103,7 +103,8 @@ jobs:
           cat ~/.ssh/id_ed25519.pub >>~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys
           ssh-keyscan -H localhost >>~/.ssh/known_hosts 2>/dev/null
           mkdir -p /var/tmp/xc-save/guest
-          sudo cp guest-image/base.* /var/tmp/xc-save/guest/ && sudo chown -R "$(id -u)" /var/tmp/xc-save
+          sudo cp guest-image/base.* /var/tmp/xc-save/guest/
+          sudo chown -R "$(id -u)" /var/tmp/xc-save
           spike/cross-cpu.sh --qemu-image savestate-qemu --cpu "$(cat "$SCRATCH/cpu-model")" --dir /var/tmp/xc-save --restore-dir /var/tmp/xc-restore \
             --image /var/tmp/xc-save/guest/base.qcow2 localhost localhost 2>&1 | tee cross-cpu-selftest.txt
           sudo mkdir -p spike-out && sudo cp cross-cpu-selftest.txt spike-out/

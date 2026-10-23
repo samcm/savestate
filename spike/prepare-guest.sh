@@ -7,13 +7,16 @@
 # The guest boots its own kernel and initrd directly (-kernel/-initrd), copied out of
 # the image's root partition: on the GitHub-hosted runners the image's GRUB hands over
 # to the kernel and the VM resets at once, while the same kernel boots fine directly.
-# Mounting the partition needs root.
+# Mounting the partition and the tap network (net.sh) need root. The image gets the
+# static address net.sh expects.
 #
 # Usage: prepare-guest.sh OUTPUT.qcow2
 #   writes OUTPUT.qcow2, OUTPUT.vmlinuz, OUTPUT.initrd and OUTPUT.info (what it is);
 #   does nothing if they exist
 # Environment: CPU_MODEL (default EPYC-Rome-v4), ACCEL (default kvm)
 set -euo pipefail
+# shellcheck source=spike/net.sh
+source "$(dirname "$0")/net.sh"
 
 out=$1
 base=${out%.qcow2}
@@ -41,7 +44,16 @@ runcmd:
   - touch /etc/cloud/cloud-init.disabled
 power_state: {mode: poweroff, condition: true}
 EOF
-genisoimage -quiet -output seed.iso -volid cidata -joliet -rock user-data meta-data
+cat >network-config <<EOF
+version: 2
+ethernets:
+  nic:
+    match: {driver: virtio_net}
+    addresses: [10.0.2.15/24]
+    routes: [{to: default, via: 10.0.2.2}]
+    nameservers: {addresses: [$(net_dns)]}
+EOF
+genisoimage -quiet -output seed.iso -volid cidata -joliet -rock user-data meta-data network-config
 
 # Copy the kernel and initrd out of the root partition (partition 1).
 qemu-img convert -O raw "$img" raw.img
@@ -58,7 +70,7 @@ timeout 900 qemu-system-x86_64 -machine "pc-q35-11.1,accel=${ACCEL:-kvm}" -cpu "
   -smp 2 -m 2G -nodefaults -no-user-config -display none -no-reboot -serial file:serial.log \
   -kernel vmlinuz -initrd initrd -append "root=/dev/vda1 console=ttyS0,115200" \
   -drive "file=$img,if=virtio,format=qcow2" -drive file=seed.iso,if=virtio,format=raw,readonly=on \
-  -netdev user,id=net0 -device virtio-net-pci,netdev=net0 ||
+  -netdev "$(NET=tap net_args prep)" -device virtio-net-pci,netdev=net0 ||
   { tail -50 serial.log; exit 1; }
 grep -q 'Cloud-init.*finished' serial.log || { tail -50 serial.log; echo "cloud-init did not finish" >&2; exit 1; }
 

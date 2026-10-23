@@ -4,7 +4,7 @@
 //! images/<hex>.qcow2              base images by manifest digest, read-only
 //! layers/<sandbox UID>-<n>.qcow2  disk layers; a sandbox's nth layer
 //! checkpoints/<UID>/              published checkpoint (Checkpoint UID): manifest.json, memory
-//! checkpoints/<UID>.tmp/          save in progress; complete once manifest.json exists
+//! checkpoints/<UID>.tmp/          save or import in progress; complete once manifest.json exists
 //! trash/                          delete-by-rename
 //! ```
 //!
@@ -91,6 +91,8 @@ pub struct Live {
     pub checkpoints: BTreeSet<String>,
     /// Image digests (hex) of sandboxes started from images.
     pub images: BTreeSet<String>,
+    /// Paths (as chains name them) that imports in progress are writing.
+    pub files: BTreeSet<String>,
 }
 
 /// Bytes on disk per kind, and free bytes on the state directory's filesystem.
@@ -140,13 +142,15 @@ impl Store {
             std::fs::create_dir_all(self.root.join(dir))?;
         }
         std::os::unix::fs::chown(self.layers(), Some(QEMU_UID), Some(QEMU_GID))?;
-        // Image pulls a restart interrupted.
-        for name in list(&self.root.join("images")) {
-            if Path::new(&name)
-                .extension()
-                .is_some_and(|ext| ext == "part")
-            {
-                std::fs::remove_file(self.root.join("images").join(name))?;
+        // Image pulls and imports a restart interrupted.
+        for dir in ["images", "layers"] {
+            for name in list(&self.root.join(dir)) {
+                if Path::new(&name)
+                    .extension()
+                    .is_some_and(|ext| ext == "part")
+                {
+                    std::fs::remove_file(self.root.join(dir).join(name))?;
+                }
             }
         }
         for entry in std::fs::read_dir(self.trash())? {
@@ -243,7 +247,11 @@ impl Store {
         }
         for id in &inventory.layers {
             let sandbox = id.rsplit_once('-').map_or(id.as_str(), |(uid, _)| uid);
-            if live.sandboxes.contains(sandbox) || chains.contains(&layer_path(id)) {
+            let path = layer_path(id);
+            if live.sandboxes.contains(sandbox)
+                || chains.contains(&path)
+                || live.files.contains(&path)
+            {
                 continue;
             }
             let path = self.layer(id);
@@ -251,7 +259,8 @@ impl Store {
             removed.push(path);
         }
         for hex in &inventory.images {
-            if live.images.contains(hex) || chains.contains(&image_path(hex)) {
+            let path = image_path(hex);
+            if live.images.contains(hex) || chains.contains(&path) || live.files.contains(&path) {
                 continue;
             }
             let path = self.image(hex);

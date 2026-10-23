@@ -19,6 +19,15 @@ pub(super) async fn run(ctx: Arc<Context>) {
         if let Err(error) = collect(&ctx).await {
             tracing::warn!(error = format!("{error:#}"), "garbage collection failed");
         }
+        if let Err(error) = super::cache::evict(&ctx).await {
+            tracing::warn!(error = format!("{error:#}"), "cache eviction failed");
+        }
+        if let Err(error) = super::cache::pin(&ctx).await {
+            tracing::warn!(
+                error = format!("{error:#}"),
+                "updating the scale-down annotation failed"
+            );
+        }
         report(&ctx);
         tokio::time::sleep(INTERVAL).await;
     }
@@ -43,6 +52,14 @@ async fn collect(ctx: &Context) -> anyhow::Result<()> {
         .collect();
 
     let mut live = Live::default();
+    // After the listing: what imports are writing now.
+    live.files.extend(
+        ctx.writing
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .cloned(),
+    );
     for namespace in &ctx.config.namespaces {
         let sandboxes = Api::<Sandbox>::namespaced(ctx.client.clone(), namespace)
             .list(&ListParams::default())

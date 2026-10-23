@@ -197,6 +197,13 @@ async fn ready(
         fingerprint: Some(manifest.fingerprint.clone()),
         message: None,
     };
+    // No store has it yet: keep the node from scale-down before it counts as Ready.
+    if let Err(error) = super::cache::set_scale_down(ctx, true).await {
+        tracing::warn!(
+            error = format!("{error:#}"),
+            "disabling scale-down of this node"
+        );
+    }
     write_status(ctx, checkpoint, &status).await?;
     let note = match &reply {
         Some(reply) => {
@@ -242,6 +249,48 @@ async fn failed(ctx: &Context, checkpoint: &Checkpoint, message: String) -> Resu
     metrics::counter!("savestate_node_checkpoints_total", "result" => "failed").increment(1);
     super::publish(ctx, checkpoint, EventType::Warning, "Failed", message).await;
     Ok(())
+}
+
+/// Changes the checkpoint's status with `change` (which says whether it changed
+/// anything), against its latest resource version, retrying on conflicts.
+pub(super) async fn update(
+    ctx: &Context,
+    checkpoint: &Checkpoint,
+    change: impl Fn(&mut CheckpointStatus) -> bool,
+) -> Result<(), Error> {
+    let api = Api::<Checkpoint>::namespaced(
+        ctx.client.clone(),
+        &checkpoint.namespace().unwrap_or_default(),
+    );
+    let name = checkpoint.name_any();
+    for _ in 0..10 {
+        let Some(current) = api.get_opt(&name).await? else {
+            return Ok(());
+        };
+        if current.uid() != checkpoint.uid() {
+            return Ok(());
+        }
+        let mut status = current.status.clone().unwrap_or_default();
+        if !change(&mut status) {
+            return Ok(());
+        }
+        let patch = json!({
+            "metadata": {"resourceVersion": current.metadata.resource_version},
+            "status": {"nodes": status.nodes, "stores": status.stores},
+        });
+        let params = PatchParams {
+            field_manager: Some(MANAGER.into()),
+            ..PatchParams::default()
+        };
+        match api.patch_status(&name, &params, &Patch::Merge(patch)).await {
+            Ok(_) => return Ok(()),
+            Err(kube::Error::Api(status)) if status.code == 409 => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Err(Error::Other(anyhow::anyhow!(
+        "checkpoint {name} kept changing; its status was not updated"
+    )))
 }
 
 async fn write_status(

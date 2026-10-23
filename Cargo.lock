@@ -3119,6 +3119,7 @@ dependencies = [
  "metrics-exporter-prometheus",
  "nftables",
  "nix 0.31.3",
+ "object_store",
  "oci-client",
  "orbd-qemu",
  "orbd-vm",

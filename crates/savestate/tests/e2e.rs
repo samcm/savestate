@@ -3,7 +3,9 @@
 //! two sandboxes start from the checkpoint (one with a frozen clock, one stepped),
 //! and each is shown to have resumed exactly the checkpoint's state, independently of
 //! the other and of the original, which carries on unaffected. A sandbox forked from
-//! a restored one carries both histories.
+//! a restored one carries both histories. A checkpoint exported to an object store
+//! outlives its node-local copy: a sandbox started from it once the node has
+//! dropped its copy imports it from the store and resumes exactly its state.
 //!
 //! Needs a disposable cluster in `KUBECONFIG` with savestate installed and at least
 //! three 1-vCPU VMs' room on one node (CI: kind on a KVM runner), and:
@@ -12,6 +14,12 @@
 //! - `SAVESTATE_NAMESPACE`: a sandbox namespace from the installation config
 //! - `SAVESTATE_E2E_ALLOWED`: `IP:PORT` the egress allowlist lets guests reach
 //! - `SAVESTATE_E2E_BLOCKED`: `IP:PORT` in a private range guests must not reach
+//! - `SAVESTATE_E2E_NODE`: the VM node, a Docker container (kind) whose state
+//!   directory the test looks into
+//! - `SAVESTATE_E2E_STORE`: a store from the installation config, whose node-local
+//!   copies the node agent drops as soon as they are unused (`cache.minFreePercent:
+//!   100`), and `SAVESTATE_E2E_S3_ENDPOINT`, `_BUCKET`, `_PREFIX`, `_ACCESS_KEY_ID`
+//!   and `_SECRET_ACCESS_KEY` to look into it
 
 // clippy.toml allows these in `#[test]` functions only, not in a test file's helpers.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -27,10 +35,10 @@ use k8s_openapi::api::{
     events::v1::Event,
 };
 use kube::{
-    Api, Client,
-    api::{AttachParams, ListParams},
+    Api, Client, ResourceExt as _,
+    api::{AttachParams, ListParams, Patch, PatchParams},
 };
-use savestate_api::Checkpoint;
+use savestate_api::{Checkpoint, SandboxPhase, Transfer, TransferPhase};
 
 #[tokio::test]
 #[ignore = "needs a cluster with savestate installed on KVM nodes; see the module docs"]
@@ -308,6 +316,194 @@ async fn checkpoint_fork_and_resume_exactly() {
     }
 }
 
+#[tokio::test]
+#[ignore = "needs a cluster with savestate installed on KVM nodes; see the module docs"]
+#[expect(clippy::too_many_lines, reason = "one scenario, read top to bottom")]
+async fn export_drop_the_local_copy_and_restore_from_the_store() {
+    let image = env("SAVESTATE_E2E_IMAGE");
+    let ns = env("SAVESTATE_NAMESPACE");
+    let node = env("SAVESTATE_E2E_NODE");
+    let store = env("SAVESTATE_E2E_STORE");
+    let client = Client::try_default().await.expect("KUBECONFIG");
+    let checkpoints: Api<Checkpoint> = Api::namespaced(client.clone(), &ns);
+    let transfers: Api<Transfer> = Api::namespaced(client.clone(), &ns);
+
+    savestate(&[
+        "create", "parked", "--image", &image, "--vcpus", "1", "--memory", "1Gi", "--disk", "4Gi",
+    ]);
+    sh(
+        "parked",
+        "setsid sh -c 'i=0; while :; do i=$((i+1)); echo \"$$ $i\" >/run/counter.new && mv /run/counter.new /run/counter; sleep 0.1; done' </dev/null >/dev/null 2>&1 &",
+    );
+    sh("parked", "echo kept >/root/state && sync");
+    std::thread::sleep(Duration::from_secs(2));
+
+    // Checkpointed but in no store: its node is kept from scale-down.
+    let (pid, at_checkpoint) = counter("parked");
+    savestate(&["checkpoint", "parked", "--name", "parked-1"]);
+    sh("parked", "echo later >/root/state && sync");
+    let uid = checkpoints.get("parked-1").await.unwrap().uid().unwrap();
+    assert_eq!(
+        scale_down(&client, &node).await.as_deref(),
+        Some("true"),
+        "a node holding the only copy of a checkpoint may be scaled down"
+    );
+
+    // Exported (asked for after the fact): the node may be scaled down again.
+    let started = Instant::now();
+    checkpoints
+        .patch(
+            "parked-1",
+            &PatchParams::default(),
+            &Patch::Merge(serde_json::json!({"spec": {"export": store}})),
+        )
+        .await
+        .unwrap();
+    wait_for("the export", 600, || async {
+        let status = checkpoints.get("parked-1").await.unwrap().status.unwrap();
+        status.stores.contains(&store)
+    })
+    .await;
+    let export = transfers
+        .get(&format!("parked-1-to-{store}"))
+        .await
+        .unwrap();
+    assert_eq!(export.spec.from.node.as_deref(), Some(node.as_str()));
+    report(&format!(
+        "export: spec.export set to Ready in {store} in {:.1} s (includes the 30 s settle); {}",
+        secs(started),
+        note(&client, &ns, &export.name_any(), "Copied").await
+    ));
+    wait_for("scale-down to be allowed again", 120, || async {
+        scale_down(&client, &node).await.is_none()
+    })
+    .await;
+    report(&format!("store objects: {}", store_objects(&uid).await));
+
+    // Parked: the sandbox goes, and the node drops its copy; only the store has it.
+    savestate(&["delete", "sandbox", "parked"]);
+    wait_for("the node to drop its copy", 300, || async {
+        let status = checkpoints.get("parked-1").await.unwrap().status.unwrap();
+        status.nodes.is_empty()
+    })
+    .await;
+    let local = format!("/var/lib/savestate/checkpoints/{uid}");
+    let gone = Command::new("docker")
+        .args(["exec", &node, "test", "!", "-e", &local])
+        .status()
+        .unwrap();
+    assert!(gone.success(), "{local} is still on {node}");
+    report(&format!(
+        "evicted: {}",
+        note(&client, &ns, "parked-1", "Evicted").await
+    ));
+
+    // Restored from the store: imported to the node, then resumed exactly.
+    let started = Instant::now();
+    savestate(&["create", "parked-back", "--from", "parked-1"]);
+    let import = transfers.get("parked-back").await.unwrap();
+    assert_eq!(import.spec.from.store.as_deref(), Some(store.as_str()));
+    assert_eq!(import.spec.to.node.as_deref(), Some(node.as_str()));
+    assert_eq!(import.status.unwrap().phase, TransferPhase::Ready);
+    report(&format!(
+        "restore from the store: create to Running in {:.1} s; {}; sandbox was {}",
+        secs(started),
+        note(&client, &ns, "parked-back", "Copied").await,
+        note(
+            &client,
+            &ns,
+            "parked-back",
+            &format!("{:?}", SandboxPhase::WaitingForTransfer)
+        )
+        .await,
+    ));
+    let (restored_pid, count) = counter("parked-back");
+    assert_eq!(restored_pid, pid, "the counting process was resumed");
+    assert!(
+        count >= at_checkpoint,
+        "count {count} is behind {at_checkpoint}, read before the checkpoint"
+    );
+    std::thread::sleep(Duration::from_secs(1));
+    assert!(counter("parked-back").1 > count, "the process runs");
+    assert_eq!(sh("parked-back", "cat /root/state"), "kept\n");
+    let status = checkpoints.get("parked-1").await.unwrap().status.unwrap();
+    assert_eq!(
+        status.nodes,
+        std::slice::from_ref(&node),
+        "the import is a node-local copy again"
+    );
+
+    savestate(&["delete", "sandbox", "parked-back"]);
+    savestate(&["delete", "checkpoint", "parked-1"]);
+}
+
+/// The node's scale-down annotation.
+async fn scale_down(client: &Client, node: &str) -> Option<String> {
+    Api::<Node>::all(client.clone())
+        .get(node)
+        .await
+        .unwrap()
+        .annotations()
+        .get("cluster-autoscaler.kubernetes.io/scale-down-disabled")
+        .cloned()
+}
+
+/// What the store holds for checkpoint `uid`: bytes per file, and the manifest.
+async fn store_objects(uid: &str) -> String {
+    use object_store::ObjectStore as _;
+    let endpoint = env("SAVESTATE_E2E_S3_ENDPOINT");
+    let store = object_store::aws::AmazonS3Builder::new()
+        .with_endpoint(&endpoint)
+        .with_bucket_name(env("SAVESTATE_E2E_S3_BUCKET"))
+        .with_region("us-east-1")
+        .with_access_key_id(env("SAVESTATE_E2E_S3_ACCESS_KEY_ID"))
+        .with_secret_access_key(env("SAVESTATE_E2E_S3_SECRET_ACCESS_KEY"))
+        .with_allow_http(endpoint.starts_with("http://"))
+        .build()
+        .unwrap();
+    let prefix = env("SAVESTATE_E2E_S3_PREFIX");
+    let objects: Vec<_> = futures::TryStreamExt::try_collect(
+        store.list(Some(&object_store::path::Path::from(prefix.as_str()))),
+    )
+    .await
+    .unwrap();
+    let mut files = std::collections::BTreeMap::<String, (u64, usize)>::new();
+    for object in objects {
+        let key = object.location.to_string();
+        let rest = key.strip_prefix(&format!("{prefix}/")).unwrap_or(&key);
+        let group = match rest
+            .strip_prefix("files/")
+            .and_then(|path| path.rsplit_once('/'))
+        {
+            Some((path, _)) => path.replace(uid, "<UID>"),
+            None => rest.replace(uid, "<UID>"),
+        };
+        let entry = files.entry(group).or_default();
+        entry.0 += object.size;
+        entry.1 += 1;
+    }
+    files
+        .iter()
+        .map(|(path, (bytes, objects))| {
+            format!("{path}: {:.1} MiB in {objects} objects", f64_mib(*bytes))
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+#[expect(clippy::cast_precision_loss, reason = "bytes as MiB for a report")]
+fn f64_mib(bytes: u64) -> f64 {
+    bytes as f64 / f64::from(1u32 << 20)
+}
+
+async fn wait_for<F: Future<Output = bool>>(what: &str, seconds: u64, done: impl Fn() -> F) {
+    let deadline = Instant::now() + Duration::from_secs(seconds);
+    while !done().await {
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
 fn env(name: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| panic!("{name} is not set"))
 }
@@ -370,6 +566,11 @@ fn describe(out: &Output) -> String {
 
 /// The node agent's `Saved` event on a checkpoint: how long the sandbox paused.
 async fn saved_note(client: &Client, ns: &str, checkpoint: &str) -> String {
+    note(client, ns, checkpoint, "Saved").await
+}
+
+/// The note of the latest event `reason` on the object named `name`.
+async fn note(client: &Client, ns: &str, name: &str, reason: &str) -> String {
     let events: Api<Event> = Api::namespaced(client.clone(), ns);
     events
         .list(&ListParams::default())
@@ -377,12 +578,13 @@ async fn saved_note(client: &Client, ns: &str, checkpoint: &str) -> String {
         .unwrap()
         .items
         .into_iter()
-        .find(|event| {
-            event.reason.as_deref() == Some("Saved")
-                && event.regarding.as_ref().and_then(|r| r.name.as_deref()) == Some(checkpoint)
+        .filter(|event| {
+            event.reason.as_deref() == Some(reason)
+                && event.regarding.as_ref().and_then(|r| r.name.as_deref()) == Some(name)
         })
+        .max_by_key(|event| event.metadata.creation_timestamp.clone().map(|time| time.0))
         .and_then(|event| event.note)
-        .unwrap_or_else(|| "no Saved event".into())
+        .unwrap_or_else(|| format!("no {reason} event"))
 }
 
 /// The peak memory of a VM pod's launcher container (QEMU, the launcher and the

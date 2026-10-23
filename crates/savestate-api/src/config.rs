@@ -102,8 +102,8 @@ pub struct Store {
 pub struct Cache {
     /// Node-local copies of checkpoints that a store holds are a cache: while the
     /// state directory's filesystem has less than this percentage free, the node
-    /// agent drops them, oldest first, except those a sandbox on the node was
-    /// restored from. Default: 10.
+    /// agent drops them, oldest first, except those a VM pod on the node starts or
+    /// runs from. Default: 10.
     #[serde(default = "default_min_free_percent")]
     pub min_free_percent: u8,
 }

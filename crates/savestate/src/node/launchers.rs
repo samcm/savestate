@@ -18,7 +18,7 @@ use kube::{
     runtime::{Controller, controller::Action, watcher},
 };
 use orbd_vm::fsutil;
-use savestate_api::{Checkpoint, Clock, Sandbox};
+use savestate_api::{Checkpoint, Clock, Sandbox, Transfer, TransferPhase};
 use tonic::transport::{Channel, Endpoint};
 
 use super::{Context, Error};
@@ -31,7 +31,7 @@ use crate::launcher::{
 };
 
 /// Labels on every VM pod.
-const LABELS: &str = "app.kubernetes.io/name=savestate,app.kubernetes.io/component=vm";
+pub(super) const LABELS: &str = "app.kubernetes.io/name=savestate,app.kubernetes.io/component=vm";
 
 /// First vsock context id handed out; low ids are often taken by other VMs on a host.
 const FIRST_CID: u32 = 100_000;
@@ -90,7 +90,9 @@ async fn reconcile(pod: Arc<Pod>, ctx: Arc<Context>) -> Result<Action, Error> {
         return Ok(Action::await_change());
     }
     let request = match plan(&ctx, &namespace, &sandbox, &dir).await {
-        Ok(request) => request,
+        Ok(Some(request)) => request,
+        // Its checkpoint is being imported here.
+        Ok(None) => return Ok(Action::requeue(Duration::from_secs(2))),
         Err(error) => {
             let message = format!("{error:#}");
             tracing::warn!(
@@ -113,28 +115,55 @@ async fn reconcile(pod: Arc<Pod>, ctx: Arc<Context>) -> Result<Action, Error> {
     Ok(Action::await_change())
 }
 
-/// What the launcher of `sandbox` starts.
+/// What the launcher of `sandbox` starts; `None` while its checkpoint is being
+/// imported to this node.
 async fn plan(
     ctx: &Context,
     namespace: &str,
     sandbox: &Sandbox,
     dir: &Path,
-) -> anyhow::Result<StartRequest> {
+) -> anyhow::Result<Option<StartRequest>> {
     let uid = sandbox.uid().unwrap_or_default();
     let spec = &sandbox.spec;
     let source = if let Some(from) = &spec.from {
+        // Evictions wait until this has looked: a VM pod here keeps its checkpoint.
+        let _restores = ctx.restores.lock().await;
         let checkpoint = Api::<Checkpoint>::namespaced(ctx.client.clone(), namespace)
             .get(&from.checkpoint)
             .await
             .with_context(|| format!("checkpoint {}", from.checkpoint))?;
         let id = checkpoint.uid().unwrap_or_default();
         let checkpoint_dir = ctx.store.checkpoints().published(&id);
-        anyhow::ensure!(
-            checkpoint_dir.is_dir(),
-            "checkpoint {} is not on node {}",
-            from.checkpoint,
-            ctx.node
-        );
+        if !checkpoint_dir.is_dir() {
+            let status = checkpoint.status.clone().unwrap_or_default();
+            let listed = status.nodes.contains(&ctx.node);
+            anyhow::ensure!(
+                !listed && !status.stores.is_empty(),
+                "checkpoint {} is not on node {}",
+                from.checkpoint,
+                ctx.node
+            );
+            // The controller imports it here, in a transfer named after the sandbox.
+            let import = Api::<Transfer>::namespaced(ctx.client.clone(), namespace)
+                .get_opt(&sandbox.name_any())
+                .await?
+                .filter(|transfer| {
+                    transfer
+                        .owner_references()
+                        .iter()
+                        .any(|owner| owner.uid == uid)
+                });
+            if let Some(status) = import.and_then(|transfer| transfer.status)
+                && status.phase == TransferPhase::Failed
+            {
+                anyhow::bail!(
+                    "importing checkpoint {} failed: {}",
+                    from.checkpoint,
+                    status.message.unwrap_or_default()
+                );
+            }
+            return Ok(None);
+        }
         Source::Restore(Restore {
             checkpoint_dir: checkpoint_dir.display().to_string(),
             checkpoint: from.checkpoint.clone(),
@@ -160,13 +189,13 @@ async fn plan(
             cpu_model: ctx.config.vm.cpu_model.clone(),
         })
     };
-    Ok(StartRequest {
+    Ok(Some(StartRequest {
         sandbox: sandbox.name_any(),
         state_dir: ctx.store.root().display().to_string(),
         layer_prefix: uid,
         vsock_cid: ctx.cids.allocate(&ctx.run_root, dir)?,
         source: Some(source),
-    })
+    }))
 }
 
 /// Connects to the launcher listening in `run_dir`. The socket is reached through

@@ -18,7 +18,7 @@ use kube::{
     Api, Client, ResourceExt,
     api::{AttachParams, DeleteParams, ListParams, Patch, PatchParams, PostParams},
 };
-use savestate_api::{Checkpoint, Config, Sandbox, SandboxPhase};
+use savestate_api::{Checkpoint, CheckpointPhase, Config, Sandbox, SandboxPhase};
 use serde_json::json;
 
 const IMAGE: &str =
@@ -166,6 +166,23 @@ async fn controller_runs_pins_fails_expires_and_protects() {
     tokio::time::sleep(Duration::from_secs(5)).await;
     let pod = pods.get("web-1").await.unwrap();
     assert_eq!(pod.uid(), pod_uid, "the failed VM pod was replaced");
+
+    // A checkpoint of a sandbox that is not running, or does not exist, fails rather
+    // than waiting forever for a node agent.
+    for (name, sandbox) in [("of-failed", "web-1"), ("of-missing", "web-9")] {
+        create(
+            &checkpoints,
+            json!({"metadata": {"name": name}, "spec": {"sandbox": sandbox}}),
+        )
+        .await;
+        let status = wait_for("the checkpoint to fail", || async {
+            let status = checkpoints.get(name).await.unwrap().status?;
+            (status.phase == CheckpointPhase::Failed).then_some(status)
+        })
+        .await;
+        let message = status.message.unwrap();
+        assert!(message.contains(sandbox), "{message}");
+    }
     assert_eq!(pod.status.unwrap().phase.as_deref(), Some("Failed"));
     let sandbox = sandboxes.get("web-1").await.unwrap();
     assert_eq!(sandbox.status.unwrap().phase, SandboxPhase::Failed);

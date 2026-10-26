@@ -40,8 +40,10 @@ const HOST_CPU: &str = "host";
 const QEMU_IMG: &str = "qemu-img";
 /// The guest kernel's command line (the guest contract in `guest/README.md`). No
 /// interface renaming: udev renaming the NIC while the launcher configures it fails
-/// the boot.
-const KERNEL_CMDLINE: &str = "console=ttyS0 root=/dev/vda rw net.ifnames=0";
+/// the boot. The root filesystem is mounted with `discard`, so blocks the guest
+/// frees leave its disk layer on the node (QEMU unmaps them) rather than staying
+/// allocated until the sandbox is deleted.
+const KERNEL_CMDLINE: &str = "console=ttyS0 root=/dev/vda rootflags=discard rw net.ifnames=0";
 /// multifd channels writing and reading the memory file.
 const MULTIFD_CHANNELS: u8 = 8;
 /// Migration bandwidth limit for saves, bytes/s: far above any disk's write rate.

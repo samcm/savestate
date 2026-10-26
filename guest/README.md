@@ -63,12 +63,15 @@ Keep these from the base:
 
 ## Host contract
 
-QEMU boots the kernel with `-kernel bzImage -append "console=ttyS0 root=/dev/vda rw net.ifnames=0"`
-(add `systemd.hostname=<name>` to name a fresh sandbox) and these guest devices:
+QEMU boots the kernel with `-kernel bzImage -append "console=ttyS0 root=/dev/vda rootflags=discard rw net.ifnames=0"`
+(add `systemd.hostname=<name>` to name a fresh sandbox) and these guest devices.
+`rootflags=discard` mounts the root filesystem with online discard, which a remount
+from `/etc/fstab` keeps: blocks the guest frees go back to the node (the disk is
+attached with `discard=unmap`). Do not add `nodiscard` to `/etc/fstab`.
 
 | Device | Why |
 | --- | --- |
-| virtio-blk, the first disk (`/dev/vda`) | The root filesystem: one ext4 filesystem, no partition table. A qcow2 overlay larger than the image is grown into at boot (`x-systemd.growfs`). |
+| virtio-blk, the first disk (`/dev/vda`) | The root filesystem: one ext4 filesystem, no partition table. A qcow2 overlay larger than the image is grown into at boot (`x-systemd.growfs`). Discards unmap the overlay's blocks. |
 | `vhost-vsock-pci,guest-cid=<cid>` | The guest agent, on vsock port 1024. Context ids are global on the host; a restored copy gets its own. |
 | `vmgenid,guid=auto` | A new generation id on every restore, so the guest kernel reseeds its RNG. |
 | serial port (ttyS0) | Kernel and agent log; a login prompt. |

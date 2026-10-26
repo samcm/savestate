@@ -382,6 +382,7 @@ async fn plan(sandbox: &Sandbox, ctx: &Context) -> Result<Plan, Error> {
             image: ctx.launcher_image.clone(),
             vcpus,
             cpu: cpu_request(&ctx.config, vcpus, memory, Some(disk))?,
+            disk: Some(disk_request(&ctx.config, vcpus, memory, disk)?),
             memory: memory.clone(),
             placement: pod::Placement::Any,
         }));
@@ -438,6 +439,11 @@ async fn plan(sandbox: &Sandbox, ctx: &Context) -> Result<Plan, Error> {
         image: fingerprint.launcher_image,
         vcpus,
         cpu: cpu_request(&ctx.config, vcpus, &memory, status.disk.as_ref())?,
+        disk: status
+            .disk
+            .as_ref()
+            .map(|disk| disk_request(&ctx.config, vcpus, &memory, disk))
+            .transpose()?,
         memory,
         placement,
     }))
@@ -709,6 +715,18 @@ fn cpu_request(
     }
     let per_vcpu = pod::parse(&config.vm.cpu_request_per_vcpu, "vm.cpuRequestPerVcpu")?;
     Ok((per_vcpu * vcpus).into())
+}
+
+/// The node disk a VM pod requests: its shape's `diskRequest`, else its disk.
+fn disk_request(
+    config: &Config,
+    vcpus: u32,
+    memory: &Quantity,
+    disk: &Quantity,
+) -> Result<Quantity, Error> {
+    Ok(offered(config, vcpus, memory, disk)?
+        .and_then(|shape| shape.disk_request.clone())
+        .unwrap_or_else(|| disk.clone()))
 }
 
 /// Sandbox status from its VM pod.

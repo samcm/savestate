@@ -44,6 +44,7 @@ Guarantees and limits:
 | Identity | Each restored sandbox gets a new machine-id, hostname and SSH host keys. Its in-guest IP and MAC are unchanged, which is safe because every sandbox has its own isolated network namespace. |
 | Network | A sandbox reaches the internet, and private addresses only where the installation allows. Nothing reaches it except the ports it exposes (`spec.ports`), from the sources the installation allows, and `port-forward` through the Kubernetes API. Every sandbox, forks included, is reachable on its own address and its own Service. |
 | Memory | Every running sandbox costs its full memory size. Nothing shares or overcommits guest RAM; KSM stays off. |
+| Disk | Every running sandbox reserves its full disk size on its node (unless the installation's shape reserves less), so the scheduler places no more disk than a node has. The guest's root filesystem is mounted with `discard`: what the guest deletes leaves the node's disk, so a sandbox occupies about what its guest holds, not everything it ever wrote. |
 | Placement | A sandbox from a checkpoint starts on a node that holds the checkpoint. One from a checkpoint in an object store can start on any node that can run it (holders are preferred): that node first copies the checkpoint from the store while the sandbox waits in `WaitingForTransfer`. |
 | Durability | A checkpoint is taken on node-local disk. One held by no store is lost with its node, so that node is kept from cluster-autoscaler scale-down while it holds one. Export to an object store (per checkpoint, or for all by default) makes it independent of every node; node-local copies of exported checkpoints are then a cache the node may drop under disk pressure. |
 | Autoscaling | The upstream cluster autoscaler adds nodes for pending VM pods and removes nodes without VMs and without the only copy of a checkpoint. A VM pool needs at least one node: from zero, an autoscaler whose node templates lack `savestate.dev/vm` adds none. See "Running on an autoscaled cluster" in `deploy/README.md`. |
@@ -298,8 +299,14 @@ their own namespace.
 
 Capacity accounting is plain Kubernetes: each VM is a pod whose memory request and
 limit are guest RAM plus the installation's memory overhead (`vm.memoryOverhead`,
-default 512 MiB) and whose CPU request is its vCPUs unless the installation reserves
-less (see "VM pods"), so the scheduler and ResourceQuota work unchanged. The spike
+default 512 MiB), whose CPU request is its vCPUs unless the installation reserves
+less (see "VM pods"), and whose `ephemeral-storage` request is its disk size unless
+the installation reserves less, so the scheduler, the cluster autoscaler and
+ResourceQuota work unchanged. The disk request matters because a sandbox's disk
+layer lives in the state directory, a `hostPath` that neither the scheduler nor the
+kubelet counts as the pod's: without it nodes take VMs whose disks, once their
+guests fill them, are larger than the node's, and the kubelet then evicts VMs for
+disk space. The spike
 measured QEMU's own resident memory outside guest RAM at 30–60 MiB. In the end-to-end
 test the VM pod's cgroup peak (QEMU, the launcher and KVM's kernel memory) was about
 250 MiB for a 1 GiB guest whose memory file held about 170 MiB, so everything outside
@@ -329,8 +336,10 @@ VM) and `savestate.dev/ports` (see "Exposed ports"):
 - resources: memory requests and limits are guest memory plus `vm.memoryOverhead`,
   never overcommitted; one `savestate.dev/vm`, the node agent's device plugin
   resource that brings `/dev/kvm`, `/dev/net/tun` and `/dev/vhost-vsock`; and the
-  CPU request below. For a sandbox from a checkpoint, shape comes from the
-  checkpoint's status.
+  CPU request below; and an `ephemeral-storage` request, the `diskRequest` of the
+  sandbox's shape, else its disk size (no limit: the layer is in a `hostPath`, which
+  the kubelet does not count). For a sandbox from a checkpoint, shape comes from the
+  checkpoint's status; one whose checkpoint records no disk requests none.
 - CPU: the request is the `cpuRequest` of the sandbox's shape (the `vm.shapes` entry
   with its vCPUs, memory and disk), else `vm.cpuRequestPerVcpu` per vCPU (default
   `1`). A request of a whole CPU per vCPU, the default, is also the CPU limit, so
@@ -914,7 +923,7 @@ Kubernetes objects; every field has a documented default or is required with a c
 error, and unknown fields are refused. The schema is `savestate_api::config::Config`:
 `namespaces` (required), `stateDir`, `kubeletDir`, `launcherImage`, `vm` (`cpuModel`
 required, `memoryOverhead`, `cpuRequestPerVcpu`, `shapes` with an optional
-`cpuRequest` each, `nodeSelector`, `nodeAffinity`, `tolerations`, `slotsPerNode`, `memoryFileDirectIo`), `network`
+`cpuRequest` and `diskRequest` each, `nodeSelector`, `nodeAffinity`, `tolerations`, `slotsPerNode`, `memoryFileDirectIo`), `network`
 (`egressAllow`, `dns`, `exposeFrom`), `images` (`registries`, `auth`, `plainHttp`, `prefetch`), `stores` (per name:
 `endpoint`, `bucket`, `region` and `credentialsSecret` required, `prefix`), `export`
 (a store name; default none), `cache.minFreePercent`, `transfers.perNode` and `ttl`

@@ -35,6 +35,9 @@ pub(super) struct Vm {
     pub vcpus: u32,
     pub cpu: Quantity,
     pub memory: Quantity,
+    /// Node disk requested (`ephemeral-storage`) for the guest's disk layer; none
+    /// for a sandbox from a checkpoint that does not record its disk.
+    pub disk: Option<Quantity>,
     pub placement: Placement,
 }
 
@@ -67,6 +70,12 @@ pub(super) fn build(sandbox: &Sandbox, vm: &Vm, config: &Config) -> Result<Pod, 
     let mut limits = json!({"memory": Quantity::from(memory), RESOURCE: "1"});
     let mut requests = limits.clone();
     requests["cpu"] = json!(vm.cpu);
+    // The guest's disk layer lives in the state directory (a hostPath), which the
+    // kubelet does not count as the pod's: the request is only what the scheduler
+    // and the cluster autoscaler reserve for it, so there is no limit to enforce.
+    if let Some(disk) = &vm.disk {
+        requests["ephemeral-storage"] = json!(disk);
+    }
     if parse(&vm.cpu, "CPU request")? >= parse(&Quantity(vm.vcpus.to_string()), "vcpus")? {
         limits["cpu"] = json!(vm.cpu);
     }

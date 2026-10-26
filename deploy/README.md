@@ -167,7 +167,8 @@ restarts; do not rely on it.) Where your provider takes node-template hints for
 extended resources and labels, advertise `savestate.dev/vm: <vm.slotsPerNode>`
 and, with a named CPU model, the label `savestate.dev/cpu: <first 16 hex digits of
 sha256(vm.cpuModel)>` (`printf %s EPYC-Rome-v4 | sha256sum | cut -c1-16`), and a
-pool can start at zero. CDI does not remove the need: Kubernetes hands a container
+pool can start at zero. The same holds for disk: VM pods request
+`ephemeral-storage`, which templates without it lack too. CDI does not remove the need: Kubernetes hands a container
 CDI devices only through a device plugin's allocation or through DRA, and both are
 node resources a template must carry.
 

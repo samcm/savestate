@@ -203,7 +203,9 @@ async fn serve(
     let code = tokio::select! {
         message = fatal_rx.recv() => fail(&message.unwrap_or_default()),
         _ = terminate.recv() => {
-            tracing::info!("terminated; stopping the VM");
+            let message = "the launcher was terminated with its pod; it stopped the VM";
+            tracing::info!(message);
+            let _ = std::fs::write("/dev/termination-log", message);
             ExitCode::SUCCESS
         }
         result = server => {

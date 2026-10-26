@@ -345,13 +345,16 @@ VM) and `savestate.dev/ports` (see "Exposed ports"):
   runAsUser: 0
   allowPrivilegeEscalation: false
   readOnlyRootFilesystem: true
-  capabilities: {drop: [ALL], add: [NET_ADMIN, CHOWN, SETUID, SETGID]}
+  capabilities: {drop: [ALL], add: [NET_ADMIN, CHOWN, SETUID, SETGID, KILL]}
   seccompProfile: {type: Localhost, localhostProfile: savestate/vm.json}
   ```
 
   The capabilities are what the launcher uses as root before it drops to the QEMU
-  user for good (see "Network and security"); the seccomp profile is the node
-  agent's (see "Devices and seccomp").
+  user for good (see "Network and security"), and `KILL`, with which the image's
+  init (`tini`, root) passes the pod's SIGTERM on to the launcher once that runs as
+  the QEMU user; without it the init dies on the signal and takes the VM down
+  without a word. The seccomp profile is the node agent's (see "Devices and
+  seccomp").
 - arguments `--egress-allow` and `--dns` from `network`, the node's addresses
   (`status.hostIPs`) in `SAVESTATE_HOST_IPS`, and `terminationMessagePolicy:
   FallbackToLogsOnError` (the launcher writes why its VM stopped to its termination
@@ -471,7 +474,7 @@ choice; `deploy/README.md` has an example.
 | on a node not holding its checkpoint | `WaitingForTransfer`; `node` set; message with the import's progress |
 | on a node, not Ready | `Booting` (from an image) or `Restoring` (from a checkpoint); `node` set; message from a waiting container (e.g. an image that cannot be pulled) |
 | Ready | `Running`, and it stays `Running` while the pod runs |
-| `Failed` or `Succeeded`, being deleted, or gone after placement | `Failed` with the launcher's exit code or the pod's reason |
+| `Failed` or `Succeeded`, being deleted, or gone after placement | `Failed` with the pod's reason where it has one (`Evicted`, `NodeShutdown`, …: the kubelet stopped it, whatever the launcher then reported), else the launcher's exit code and termination message |
 
 `Failed` is terminal: the pod is kept for its logs and never replaced.
 
@@ -505,7 +508,7 @@ no checkpoint of this cluster are garbage.
 | --- | --- |
 | Controller | VM pods (and their `savestate.dev/ports` annotation); Services and NetworkPolicies of sandboxes that expose ports; Sandbox `status` (all of it); TTL deletions; the Checkpoint finalizer; `Failed` on Checkpoints that cannot start; Transfers (exports and imports); deletions in stores |
 | Node agent | Checkpoint `status` (`phase`, `nodes`, `stores`, `vcpus`, `memory`, `disk`, sizes, `guestTime`, `parent`, `fingerprint`, `message`); Transfer `status`; files under `stateDir`; objects in stores; its node's `savestate.dev/cpu` label and scale-down annotation; removes run directories of sandboxes that are gone |
-| Launcher | listens on `/run/savestate/launcher.sock` in its pod (the run directory on the host); creates `/run/savestate/ready` once the VM runs and never removes it while the VM lives. A readiness probe (`test -e /run/savestate/ready`, every 2 s) turns that into the pod's Ready condition, which the controller reads. It exits non-zero when QEMU exits or the VM cannot start, and zero when its pod is deleted. |
+| Launcher | listens on `/run/savestate/launcher.sock` in its pod (the run directory on the host); creates `/run/savestate/ready` once the VM runs and never removes it while the VM lives. A readiness probe (`test -e /run/savestate/ready`, every 2 s) turns that into the pod's Ready condition, which the controller reads. It exits non-zero when QEMU exits or the VM cannot start, and zero when its pod is deleted or evicted (SIGTERM), after stopping QEMU; either way it writes why to its termination log. |
 
 The node agent finds a sandbox's launcher at
 `/run/savestate/<namespace>/<sandbox>/<sandbox UID>/launcher.sock` on its node, and a
@@ -876,8 +879,8 @@ checkpoint of its own cluster.
   service-account token. Its container is never privileged: devices come from the
   node agent's device plugin, and the container keeps only `NET_ADMIN` (the tap
   device, forwarding and nftables in its own network namespace), `CHOWN` (handing the
-  run directory to the QEMU user), `SETUID` and `SETGID` (becoming it), under
-  savestate's seccomp profile.
+  run directory to the QEMU user), `SETUID` and `SETGID` (becoming it) and `KILL`
+  (the init passing SIGTERM on to the launcher), under savestate's seccomp profile.
 - Exec, file copy and port-forward use Kubernetes `pods/exec` and `pods/portforward`
   RBAC; there is no separate API server. `savestate exec`, `ps`, `logs` and `cp` run
   `savestate guest` in the VM pod, which reaches the guest agent over vsock.

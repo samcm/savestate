@@ -132,6 +132,41 @@ async fn checkpoint_fork_and_resume_exactly() {
     );
     assert!(qemu.contains("-sandbox on"), "{qemu}");
 
+    // The pod reserves the sandbox's disk on the node, and what the guest deletes
+    // leaves the node's disk: a layer that kept every block ever written would fill
+    // the node until the kubelet evicts its VMs.
+    let requests = container
+        .resources
+        .as_ref()
+        .unwrap()
+        .requests
+        .as_ref()
+        .unwrap();
+    assert_eq!(requests["ephemeral-storage"].0, "4Gi");
+    let uid = json(&["get", "web", "-o", "json"])["metadata"]["uid"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let layer = format!("/var/lib/savestate/layers/{uid}-0.qcow2");
+    let allocated = || async {
+        let blocks = sh_pod(&client, &ns, "web", &format!("stat -c %b {layer}")).await;
+        blocks.trim().parse::<u64>().unwrap() * 512
+    };
+    sh("web", "head -c 256M /dev/urandom >/scratch && sync");
+    let written = allocated().await;
+    sh("web", "rm /scratch && sync");
+    wait_for(
+        "the deleted file's blocks to leave the layer",
+        30,
+        || async { allocated().await + (192 << 20) < written },
+    )
+    .await;
+    report(&format!(
+        "discard: layer {:.0} MiB with a 256 MiB file, {:.0} MiB after deleting it",
+        f64_mib(written),
+        f64_mib(allocated().await)
+    ));
+
     // A shape that requests less CPU than its vCPUs (setup.sh: 4 vCPUs, cpuRequest
     // 500m): the pod is Burstable with no CPU limit, memory is still request = limit,
     // and the guest has all four vCPUs. On a 4-CPU node that also runs the cluster,

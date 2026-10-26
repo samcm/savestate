@@ -190,6 +190,13 @@ pub struct Shape {
     /// `vcpus`. Default: `vcpus` × `vm.cpuRequestPerVcpu`.
     #[serde(default)]
     pub cpu_request: Option<Quantity>,
+    /// Node disk the VM pod of a sandbox of this shape requests as
+    /// `ephemeral-storage`, for the disk layer its guest writes in the state
+    /// directory: more than 0, at most `disk`. Default: `disk`, so the scheduler
+    /// never places more disk than a node has, as with memory. Less lets more VMs
+    /// share a node's disk, betting that their guests never fill their disks.
+    #[serde(default)]
+    pub disk_request: Option<Quantity>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -370,6 +377,17 @@ impl Config {
                     return Err(format!(
                         "vm.shapes: cpuRequest {:?} of the {}-vCPU shape must be more than 0 and at most {}",
                         request.0, shape.vcpus, shape.vcpus
+                    ));
+                }
+            }
+        }
+        for shape in &self.vm.shapes {
+            if let Some(request) = &shape.disk_request {
+                let parsed = cpu(request, "vm.shapes diskRequest")?;
+                if parsed <= zero || parsed > cpu(&shape.disk, "vm.shapes disk")? {
+                    return Err(format!(
+                        "vm.shapes: diskRequest {:?} of the {} disk shape must be more than 0 and at most its disk",
+                        request.0, shape.disk.0
                     ));
                 }
             }

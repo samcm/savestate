@@ -38,7 +38,10 @@ vm:
 
   # Shapes a sandbox from an image may use. Default: [] (any shape). cpuRequest
   # (more than 0, at most vcpus) is the CPU a sandbox of the shape requests.
-  # Default: vcpus × cpuRequestPerVcpu.
+  # Default: vcpus × cpuRequestPerVcpu. diskRequest (more than 0, at most disk) is
+  # the node disk it requests as ephemeral-storage. Default: disk, so a node never
+  # takes more VM disk than it has; less lets more VMs share a node, betting their
+  # guests never fill their disks.
   shapes:
     - {vcpus: 2, memory: 4Gi, disk: 30Gi}
     - {vcpus: 4, memory: 8Gi, disk: 60Gi, cpuRequest: 3500m}

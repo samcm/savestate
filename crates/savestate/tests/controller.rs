@@ -134,11 +134,17 @@ async fn controller_runs_pins_fails_expires_and_protects() {
     let container = &spec.containers[0];
     assert_eq!(container.image.as_deref(), Some(launcher.as_str()));
     let resources = serde_json::to_value(container.resources.as_ref().unwrap()).unwrap();
+    // The checkpoint's disk is reserved on the node; it is a request only (the
+    // layer is in a hostPath the kubelet does not count), so the pod stays
+    // Guaranteed.
     assert_eq!(
         resources["requests"],
+        json!({"cpu": "1", "ephemeral-storage": "1Gi", "memory": "96Mi", "savestate.dev/vm": "1"})
+    );
+    assert_eq!(
+        resources["limits"],
         json!({"cpu": "1", "memory": "96Mi", "savestate.dev/vm": "1"})
     );
-    assert_eq!(resources["limits"], resources["requests"]);
     let affinity = serde_json::to_value(spec.affinity.unwrap()).unwrap();
     assert_eq!(
         affinity["nodeAffinity"]["requiredDuringSchedulingIgnoredDuringExecution"]["nodeSelectorTerms"]

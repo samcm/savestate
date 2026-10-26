@@ -62,6 +62,8 @@ pub const RUN_DIR: &str = "/run/savestate";
 pub const SOCKET: &str = "launcher.sock";
 /// Created in the run directory once the VM runs; the pod's readiness probe.
 pub const READY: &str = "ready";
+/// The active qcow2 path in a VM pod whose disk is PVC-backed.
+pub(crate) const ACTIVE_DISK: &str = "/var/lib/savestate-active/disk.qcow2";
 /// The guest agent's vsock context id, in the run directory; written by the node
 /// agent, which allocates them per node.
 pub const CID: &str = "vsock-cid";
@@ -102,6 +104,8 @@ pub fn run(args: &Args) -> ExitCode {
 }
 
 fn launch(args: &Args) -> anyhow::Result<ExitCode> {
+    // A replacement pod may inherit its predecessor's readiness marker.
+    let _ = std::fs::remove_file(args.run_dir.join(READY));
     // The guest has IPv4 only.
     let dns: Vec<Ipv4Addr> = if args.dns.is_empty() {
         net::nameservers(&std::fs::read_to_string("/etc/resolv.conf").unwrap_or_default())

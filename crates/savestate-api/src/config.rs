@@ -145,6 +145,12 @@ pub struct Vm {
     #[serde(default = "default_cpu_request_per_vcpu")]
     pub cpu_request_per_vcpu: Quantity,
 
+    /// `StorageClass` for one filesystem PVC holding each sandbox's mutable active
+    /// disk. When set, `shapes` must be non-empty and every shape must set
+    /// `activeDiskSize`. Default: none, active disks remain in `stateDir`.
+    #[serde(default)]
+    pub active_disk_storage_class: Option<String>,
+
     /// Shapes a sandbox from an image may use; it must match one exactly.
     /// Default: empty, any shape.
     #[serde(default)]
@@ -207,6 +213,11 @@ pub struct Shape {
     /// share a node's disk, betting that their guests never fill their disks.
     #[serde(default)]
     pub disk_request: Option<Quantity>,
+    /// PVC capacity for this shape's active disk, including filesystem and qcow2
+    /// metadata headroom. Required when `vm.activeDiskStorageClass` is set and at
+    /// least `disk`.
+    #[serde(default)]
+    pub active_disk_size: Option<Quantity>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -395,6 +406,7 @@ impl Config {
                 }
             }
         }
+        self.check_active_disks(cpu)?;
         for shape in &self.vm.shapes {
             if let Some(request) = &shape.disk_request {
                 let parsed = cpu(request, "vm.shapes diskRequest")?;
@@ -433,6 +445,38 @@ impl Config {
                 && default.duration() > max.duration()
             {
                 return Err(format!("ttl.{kind}: default {default} exceeds max {max}"));
+            }
+        }
+        Ok(())
+    }
+
+    fn check_active_disks(
+        &self,
+        parse: impl Fn(&Quantity, &str) -> Result<ParsedQuantity, String>,
+    ) -> Result<(), String> {
+        let Some(class) = &self.vm.active_disk_storage_class else {
+            return Ok(());
+        };
+        if class.is_empty() {
+            return Err("vm.activeDiskStorageClass: must not be empty".into());
+        }
+        if self.vm.shapes.is_empty() {
+            return Err(
+                "vm.shapes: list the offered shapes and each activeDiskSize when vm.activeDiskStorageClass is set".into(),
+            );
+        }
+        for shape in &self.vm.shapes {
+            let size = shape.active_disk_size.as_ref().ok_or_else(|| {
+                format!(
+                    "vm.shapes: activeDiskSize is required for the {} vCPU/{}/{} shape when vm.activeDiskStorageClass is set",
+                    shape.vcpus, shape.memory.0, shape.disk.0
+                )
+            })?;
+            if parse(size, "vm.shapes activeDiskSize")? < parse(&shape.disk, "vm.shapes disk")? {
+                return Err(format!(
+                    "vm.shapes: activeDiskSize {:?} of the {} disk shape must be at least its disk",
+                    size.0, shape.disk.0
+                ));
             }
         }
         Ok(())
@@ -491,5 +535,24 @@ mod tests {
     #[test]
     fn example_config_is_valid() {
         Config::from_yaml(include_str!("../../../deploy/base/config.yaml")).unwrap();
+    }
+
+    /// Enabling PVC disks without explicit per-shape capacity would let a qcow2
+    /// fill its filesystem before the guest reaches its advertised disk size.
+    #[test]
+    fn pvc_disks_require_capacity_for_every_shape() {
+        let error = Config::from_yaml(
+            r"
+namespaces: [sandboxes]
+vm:
+  cpuModel: host
+  activeDiskStorageClass: block
+  shapes:
+    - {vcpus: 2, memory: 4Gi, disk: 30Gi}
+",
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("activeDiskSize is required"));
     }
 }

@@ -25,6 +25,7 @@ pub(super) use crate::SANDBOX_UID;
 /// (`RUN_DIR/<namespace>/<sandbox>/<sandbox UID>/`), mounted at the same path,
 /// `RUN_DIR`, in the VM pod.
 pub(super) const RUN_DIR: &str = "/run/savestate";
+pub(super) const ACTIVE_DISK_DIR: &str = "/var/lib/savestate-active";
 
 /// What the pod runs: the launcher image, the VM's size and the CPU its pod
 /// requests, and where it may run.
@@ -36,6 +37,8 @@ pub(super) struct Vm {
     /// Node disk requested (`ephemeral-storage`) for the guest's disk layer; none
     /// for a sandbox from a checkpoint that does not record its disk.
     pub disk: Option<Quantity>,
+    /// Capacity of the sandbox's active-disk PVC.
+    pub active_disk: Option<Quantity>,
     pub placement: Placement,
 }
 
@@ -71,7 +74,9 @@ pub(super) fn build(sandbox: &Sandbox, vm: &Vm, config: &Config) -> Result<Pod, 
     // The guest's disk layer lives in the state directory (a hostPath), which the
     // kubelet does not count as the pod's: the request is only what the scheduler
     // and the cluster autoscaler reserve for it, so there is no limit to enforce.
-    if let Some(disk) = &vm.disk {
+    if vm.active_disk.is_none()
+        && let Some(disk) = &vm.disk
+    {
         requests["ephemeral-storage"] = json!(disk);
     }
     if parse(&vm.cpu, "CPU request")? >= parse(&Quantity(vm.vcpus.to_string()), "vcpus")? {
@@ -102,6 +107,31 @@ pub(super) fn build(sandbox: &Sandbox, vm: &Vm, config: &Config) -> Result<Pod, 
     let state_dir = config.state_dir.display().to_string();
     let (ports_dir, ports_file) = ports::FILE.rsplit_once('/').unwrap_or_default();
 
+    let mut mounts = vec![
+        json!({"name": "state", "mountPath": state_dir}),
+        json!({"name": "run", "mountPath": RUN_DIR}),
+        json!({"name": "pod", "mountPath": ports_dir, "readOnly": true}),
+    ];
+    let mut volumes = vec![
+        json!({"name": "state", "hostPath": {"path": state_dir, "type": "DirectoryOrCreate"}}),
+        json!({"name": "run", "hostPath": {
+            "path": format!("{RUN_DIR}/{namespace}/{}/{uid}", sandbox.name_any()),
+            "type": "DirectoryOrCreate",
+        }}),
+        // The exposed ports, which the kubelet updates as the annotation changes.
+        json!({"name": "pod", "downwardAPI": {"items": [{
+            "path": ports_file,
+            "fieldRef": {"fieldPath": format!("metadata.annotations['{}']", ports::ANNOTATION)},
+        }]}}),
+    ];
+    add_active_disk_volume(sandbox, vm, &mut mounts, &mut volumes);
+
+    // The CSI-mounted filesystem has to be writable by QEMU after the launcher
+    // drops privileges. Do not apply this to the legacy host paths: the node agent
+    // owns their modes and changing them on every pod start would change the
+    // existing hostPath contract.
+    let pod_security = active_disk_security(vm);
+
     let pod = json!({
         "apiVersion": "v1",
         "kind": "Pod",
@@ -114,7 +144,8 @@ pub(super) fn build(sandbox: &Sandbox, vm: &Vm, config: &Config) -> Result<Pod, 
                 SANDBOX_UID: uid,
             },
             "annotations": {
-                // Evicting a VM pod destroys its VM.
+                // Avoid voluntary eviction: the disk survives replacement, but RAM
+                // does not unless the user took a checkpoint.
                 "cluster-autoscaler.kubernetes.io/safe-to-evict": "false",
                 // Changed by the controller as `spec.ports` changes.
                 ports::ANNOTATION: ports::format(&sandbox.spec.ports),
@@ -125,8 +156,10 @@ pub(super) fn build(sandbox: &Sandbox, vm: &Vm, config: &Config) -> Result<Pod, 
             // The launcher has no Kubernetes credentials.
             "automountServiceAccountToken": false,
             "enableServiceLinks": false,
-            // A VM that stops is never restarted: its sandbox becomes Failed.
+            // A launcher/QEMU exit is terminal. The controller only replaces a pod
+            // removed by infrastructure when its active disk is PVC-backed.
             "restartPolicy": "Never",
+            "securityContext": pod_security,
             "nodeSelector": config.vm.node_selector,
             "tolerations": config.vm.tolerations,
             "affinity": affinity,
@@ -146,27 +179,37 @@ pub(super) fn build(sandbox: &Sandbox, vm: &Vm, config: &Config) -> Result<Pod, 
                     "exec": {"command": ["test", "-e", format!("{RUN_DIR}/ready")]},
                     "periodSeconds": 2,
                 },
-                "volumeMounts": [
-                    {"name": "state", "mountPath": state_dir},
-                    {"name": "run", "mountPath": RUN_DIR},
-                    {"name": "pod", "mountPath": ports_dir, "readOnly": true},
-                ],
+                "volumeMounts": mounts,
             }],
-            "volumes": [
-                {"name": "state", "hostPath": {"path": state_dir, "type": "DirectoryOrCreate"}},
-                {"name": "run", "hostPath": {
-                    "path": format!("{RUN_DIR}/{namespace}/{}/{uid}", sandbox.name_any()),
-                    "type": "DirectoryOrCreate",
-                }},
-                // The exposed ports, which the kubelet updates as the annotation changes.
-                {"name": "pod", "downwardAPI": {"items": [{
-                    "path": ports_file,
-                    "fieldRef": {"fieldPath": format!("metadata.annotations['{}']", ports::ANNOTATION)},
-                }]}},
-            ],
+            "volumes": volumes,
         },
     });
     serde_json::from_value(pod).map_err(|error| Error::PodSpec(error.to_string()))
+}
+
+fn add_active_disk_volume(
+    sandbox: &Sandbox,
+    vm: &Vm,
+    mounts: &mut Vec<serde_json::Value>,
+    volumes: &mut Vec<serde_json::Value>,
+) {
+    if vm.active_disk.is_some() {
+        mounts.push(json!({
+            "name": "active-disk", "mountPath": ACTIVE_DISK_DIR,
+        }));
+        volumes.push(json!({
+            "name": "active-disk", "persistentVolumeClaim": {"claimName": sandbox.name_any()},
+        }));
+    }
+}
+
+fn active_disk_security(vm: &Vm) -> Option<serde_json::Value> {
+    vm.active_disk.as_ref().map(|_| {
+        json!({
+            "fsGroup": crate::store::QEMU_GID,
+            "fsGroupChangePolicy": "OnRootMismatch",
+        })
+    })
 }
 
 /// Node affinity for `placement`, within the installation's `vm.nodeAffinity`, and the
@@ -246,6 +289,86 @@ pub(super) fn parse(quantity: &Quantity, what: &str) -> Result<ParsedQuantity, E
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sandbox() -> Sandbox {
+        serde_json::from_value(json!({
+            "apiVersion": "savestate.dev/v1alpha1",
+            "kind": "Sandbox",
+            "metadata": {"name": "web", "namespace": "sandboxes", "uid": "sandbox-uid"},
+            "spec": {
+                "image": "ghcr.io/example/base@sha256:00",
+                "vcpus": 2,
+                "memory": "3Gi",
+                "disk": "20Gi",
+            },
+        }))
+        .unwrap()
+    }
+
+    fn config(active: bool) -> Config {
+        let active = if active {
+            "  activeDiskStorageClass: block\n  shapes:\n    - {vcpus: 2, memory: 3Gi, disk: 20Gi, activeDiskSize: 24Gi}\n"
+        } else {
+            ""
+        };
+        Config::from_yaml(&format!(
+            "namespaces: [sandboxes]\nvm:\n  cpuModel: host\n{active}"
+        ))
+        .unwrap()
+    }
+
+    fn vm(active: bool) -> Vm {
+        Vm {
+            image: "ghcr.io/example/savestate@sha256:00".into(),
+            vcpus: 2,
+            cpu: Quantity("500m".into()),
+            memory: Quantity("3Gi".into()),
+            disk: Some(Quantity("20Gi".into())),
+            active_disk: active.then(|| Quantity("24Gi".into())),
+            placement: Placement::Any,
+        }
+    }
+
+    /// PVC mode mounts the sandbox's claim for QEMU and reserves no node-local
+    /// ephemeral storage. Legacy mode keeps its hostPath and resource contract.
+    #[test]
+    fn active_disk_volume_is_opt_in() {
+        let durable = build(&sandbox(), &vm(true), &config(true)).unwrap();
+        let spec = durable.spec.unwrap();
+        let security = spec.security_context.unwrap();
+        assert_eq!(security.fs_group, Some(i64::from(crate::store::QEMU_GID)));
+        assert_eq!(
+            security.fs_group_change_policy.as_deref(),
+            Some("OnRootMismatch")
+        );
+        let volumes = serde_json::to_value(spec.volumes).unwrap();
+        assert!(volumes.as_array().unwrap().iter().any(|volume| {
+            volume["name"] == "active-disk" && volume["persistentVolumeClaim"]["claimName"] == "web"
+        }));
+        let container = &spec.containers[0];
+        let mounts = serde_json::to_value(&container.volume_mounts).unwrap();
+        assert!(mounts.as_array().unwrap().iter().any(|mount| {
+            mount["name"] == "active-disk" && mount["mountPath"] == ACTIVE_DISK_DIR
+        }));
+        let requests = container
+            .resources
+            .as_ref()
+            .and_then(|resources| resources.requests.as_ref())
+            .unwrap();
+        assert!(!requests.contains_key("ephemeral-storage"));
+
+        let legacy = build(&sandbox(), &vm(false), &config(false)).unwrap();
+        let spec = legacy.spec.unwrap();
+        assert!(spec.security_context.is_none());
+        let volumes = serde_json::to_value(spec.volumes).unwrap();
+        assert!(!volumes.to_string().contains("active-disk"));
+        let requests = spec.containers[0]
+            .resources
+            .as_ref()
+            .and_then(|resources| resources.requests.as_ref())
+            .unwrap();
+        assert_eq!(requests["ephemeral-storage"].0, "20Gi");
+    }
 
     /// A sandbox from a checkpoint must land on a node that holds the checkpoint
     /// and that the installation allows, under every alternative term: a pin added

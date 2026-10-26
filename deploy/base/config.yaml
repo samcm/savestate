@@ -36,15 +36,22 @@ vm:
   # in docs/design.md). Memory is always request = limit.
   # cpuRequestPerVcpu: 1
 
+  # StorageClass for one filesystem PVC per sandbox, holding its mutable active
+  # qcow2. With this set, shapes must be listed and every shape must set an
+  # activeDiskSize large enough for its guest disk plus filesystem/qcow2 metadata.
+  # Without it, mutable layers remain in stateDir on the VM's node.
+  # activeDiskStorageClass: example-block-storage
+
   # Shapes a sandbox from an image may use. Default: [] (any shape). cpuRequest
   # (more than 0, at most vcpus) is the CPU a sandbox of the shape requests.
   # Default: vcpus × cpuRequestPerVcpu. diskRequest (more than 0, at most disk) is
   # the node disk it requests as ephemeral-storage. Default: disk, so a node never
   # takes more VM disk than it has; less lets more VMs share a node, betting their
-  # guests never fill their disks.
+  # guests never fill their disks. activeDiskSize is required when
+  # activeDiskStorageClass is set, and is the capacity of that shape's PVC.
   shapes:
-    - {vcpus: 2, memory: 4Gi, disk: 30Gi}
-    - {vcpus: 4, memory: 8Gi, disk: 60Gi, cpuRequest: 3500m}
+    - {vcpus: 2, memory: 4Gi, disk: 30Gi, activeDiskSize: 34Gi}
+    - {vcpus: 4, memory: 8Gi, disk: 60Gi, cpuRequest: 3500m, activeDiskSize: 68Gi}
 
   # Where VM pods run. The node-agent DaemonSet in node.yaml must select the same
   # nodes. Default: any node.

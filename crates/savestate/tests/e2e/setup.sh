@@ -32,6 +32,13 @@ echo "a8345bd40f74e812c7f2e13c40a841d4d6c7b1fc22e245750116072807a0f4ba  $work/ne
 sed -i 's|image: registry.k8s.io/networking/kube-network-policies:.*|image: registry.k8s.io/networking/kube-network-policies:v1.1.2@sha256:c671f98e444825d57c590c92da1b5e66070917c4d3dff1f9279775e6b73254fe|' "$work/netpol.yaml"
 kubectl apply -f "$work/netpol.yaml"
 kubectl -n kube-system rollout status daemonset/kube-network-policies --timeout=3m
+# Dynamic filesystem claims for active disks in this disposable cluster. Production
+# chooses its own CSI StorageClass; the test only needs the same RWO filesystem API.
+curl -fsSL -o "$work/local-path.yaml" https://raw.githubusercontent.com/rancher/local-path-provisioner/v0.0.34/deploy/local-path-storage.yaml
+echo "fab8d6e8933e44f8af7398603fb63122e4ea6490f0af83549108d68647edd9e9  $work/local-path.yaml" | sha256sum -c
+sed -i 's|image: rancher/local-path-provisioner:v0.0.34|image: rancher/local-path-provisioner:v0.0.34@sha256:6ff68ebe98bc623b45ad22c28be84f8a08214982710f3247d5862e9bccce73ef|' "$work/local-path.yaml"
+kubectl apply -f "$work/local-path.yaml"
+kubectl -n local-path-storage rollout status deployment/local-path-provisioner --timeout=3m
 # Clients the sandboxes' exposed ports admit (network.exposeFrom).
 kubectl create namespace clients
 kubectl label node "$node" savestate.dev/node=true
@@ -78,9 +85,10 @@ namespaces: [$ns]
 launcherImage: $pinned
 vm:
   cpuModel: "$cpu"
+  activeDiskStorageClass: local-path
   shapes:
-    - {vcpus: 1, memory: 1Gi, disk: 4Gi}
-    - {vcpus: 4, memory: 1Gi, disk: 4Gi, cpuRequest: 500m}
+    - {vcpus: 1, memory: 1Gi, disk: 4Gi, activeDiskSize: 6Gi}
+    - {vcpus: 4, memory: 1Gi, disk: 4Gi, cpuRequest: 500m, activeDiskSize: 6Gi}
   nodeSelector:
     savestate.dev/node: "true"
   # The runner's disk is shared with everything else on it; how full it is says

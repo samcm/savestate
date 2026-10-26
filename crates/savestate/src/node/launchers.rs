@@ -198,6 +198,11 @@ async fn plan(
         sandbox: sandbox.name_any(),
         state_dir: ctx.store.root().display().to_string(),
         layer_prefix: uid,
+        active_disk: if ctx.config.vm.active_disk_storage_class.is_some() {
+            launcher::ACTIVE_DISK.into()
+        } else {
+            String::new()
+        },
         vsock_cid: ctx.cids.allocate(&ctx.run_root, dir)?,
         memory_file_direct_io: ctx.config.vm.memory_file_direct_io,
         source: Some(source),

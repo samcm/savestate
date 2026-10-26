@@ -39,6 +39,9 @@ message StartRequest {
   // Write and read checkpoint memory files with O_DIRECT (`vm.memoryFileDirectIo`),
   // where the state directory's filesystem supports it.
   bool memory_file_direct_io = 5;
+  // The active qcow2's path when it is on persistent storage; empty for a
+  // node-local layer.
+  string active_disk = 6;
   oneof source {
     Boot boot = 10;
     Restore restore = 11;

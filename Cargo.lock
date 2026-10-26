@@ -2235,7 +2235,7 @@ checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 [[package]]
 name = "orbd-guest"
 version = "0.1.0"
-source = "git+https://github.com/samcm/orbd?rev=5c7658c834713db11642208eb2ac2d1036df4b2d#5c7658c834713db11642208eb2ac2d1036df4b2d"
+source = "git+https://github.com/samcm/orbd?rev=9151e285608ea706aed22be8804776a972a82afe#9151e285608ea706aed22be8804776a972a82afe"
 dependencies = [
  "libc",
  "orbd-proto",
@@ -2246,7 +2246,7 @@ dependencies = [
 [[package]]
 name = "orbd-proto"
 version = "0.1.0"
-source = "git+https://github.com/samcm/orbd?rev=5c7658c834713db11642208eb2ac2d1036df4b2d#5c7658c834713db11642208eb2ac2d1036df4b2d"
+source = "git+https://github.com/samcm/orbd?rev=9151e285608ea706aed22be8804776a972a82afe#9151e285608ea706aed22be8804776a972a82afe"
 dependencies = [
  "prost",
  "prost-build",
@@ -2256,7 +2256,7 @@ dependencies = [
 [[package]]
 name = "orbd-qemu"
 version = "0.1.0"
-source = "git+https://github.com/samcm/orbd?rev=5c7658c834713db11642208eb2ac2d1036df4b2d#5c7658c834713db11642208eb2ac2d1036df4b2d"
+source = "git+https://github.com/samcm/orbd?rev=9151e285608ea706aed22be8804776a972a82afe#9151e285608ea706aed22be8804776a972a82afe"
 dependencies = [
  "fail",
  "futures",
@@ -2272,7 +2272,7 @@ dependencies = [
 [[package]]
 name = "orbd-vm"
 version = "0.1.0"
-source = "git+https://github.com/samcm/orbd?rev=5c7658c834713db11642208eb2ac2d1036df4b2d#5c7658c834713db11642208eb2ac2d1036df4b2d"
+source = "git+https://github.com/samcm/orbd?rev=9151e285608ea706aed22be8804776a972a82afe#9151e285608ea706aed22be8804776a972a82afe"
 dependencies = [
  "fail",
  "hex",

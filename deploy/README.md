@@ -86,7 +86,8 @@ Everything below describes one installation and comes from your overlay; nothing
 | External exposure | Your choice of Ingress or `LoadBalancer`; see [Exposing a sandbox outside the cluster](#exposing-a-sandbox-outside-the-cluster). |
 | State directory | `stateDir` (default `/var/lib/savestate`) and the node agent's `hostPath` must agree, on a disk large enough for your checkpoints. |
 | Object stores | `stores`: per store an S3-compatible `endpoint`, `bucket`, `region`, `prefix` (one prefix per installation) and `credentialsSecret`, a Secret in `savestate-system` with `accessKeyId` and `secretAccessKey`. `export` names the store every checkpoint is exported to (default: only checkpoints with `spec.export`). Without stores, checkpoints live only on the node that took them. |
-| Cache eviction | `cache.minFreePercent` (default 10): below that much free space on the state directory's filesystem, nodes drop their copies of exported checkpoints. |
+| Cache eviction | `cache.minFreePercent` (default 25): below that much free space on the state directory's filesystem, nodes drop their copies of exported checkpoints. |
+| Disk guard | `vm.minFreeDiskPercent` (default 20): below that much free space, a node takes no new VMs (status taint `status-taint.cluster-autoscaler.kubernetes.io/savestate-disk`). Keep it above the kubelet's `imagefs.available` eviction threshold. |
 | TTL limits, transfer concurrency | `ttl` and `transfers.perNode` (defaults: no limits, four transfers per node; each buffers up to 256 MiB in the node agent, whose memory limit in `base/node.yaml` allows four). |
 
 [`base/config.yaml`](base/config.yaml) is the example config; every field is
@@ -154,7 +155,9 @@ managed autoscaler does too.
   once every local checkpoint is in a store or gone. Set `export` so that lasts only
   as long as an export takes.
 - Startup taints (prefix `startup-taint.cluster-autoscaler.kubernetes.io/`), if you
-  use the one below.
+  use the one below, and status taints (prefix
+  `status-taint.cluster-autoscaler.kubernetes.io/`): the node agent sets one while
+  its node is short of disk.
 
 **At least one node per VM pool.** VM pods request `savestate.dev/vm`, the node
 agent's device-plugin resource. To decide whether a new node would fit a pending

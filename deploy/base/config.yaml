@@ -68,6 +68,13 @@ vm:
   # share the cached file; measure on your nodes' disks before turning it on.
   # memoryFileDirectIo: false
 
+  # While less than this percentage of a node's state directory filesystem is free
+  # (after dropping cached checkpoint copies), the node agent taints the node
+  # status-taint.cluster-autoscaler.kubernetes.io/savestate-disk (NoSchedule) so it
+  # takes no new VMs, until 5 points more are free. Keep it above the kubelet's
+  # imagefs.available eviction threshold (15% by default); 0 turns it off.
+  # minFreeDiskPercent: 20
+
 network:
   # Cluster, node, link-local and private destinations guests may still reach;
   # the rest of those ranges is dropped. Default: [].
@@ -114,9 +121,10 @@ images:
 
 # Local copies of exported checkpoints are a cache, dropped (oldest first, never
 # one a sandbox on the node was restored from) while the state directory's
-# filesystem has less than this percentage free.
+# filesystem has less than this percentage free. Keep it above
+# vm.minFreeDiskPercent, so cached copies go before the node turns VMs away.
 # cache:
-#   minFreePercent: 10
+#   minFreePercent: 25
 
 # Transfers (exports and imports) each node runs at a time; a free slot goes to
 # an import, which a sandbox waits for, before an export. Each buffers up to

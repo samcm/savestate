@@ -56,6 +56,9 @@ struct Context {
     restores: tokio::sync::Mutex<()>,
     /// `transfers.perNode`.
     transfer_slots: transfers::Slots,
+    /// Wakes garbage collection early: a VM pod on this node has stopped, and its
+    /// disk layer may be what the node needs back.
+    collect_now: tokio::sync::Notify,
     recorder: Recorder,
 }
 
@@ -104,6 +107,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         transfer_slots: transfers::Slots::new(
             usize::try_from(config.transfers.per_node).unwrap_or(1),
         ),
+        collect_now: tokio::sync::Notify::new(),
         recorder,
         config,
     });

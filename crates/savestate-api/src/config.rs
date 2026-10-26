@@ -109,7 +109,8 @@ pub struct Cache {
     /// Node-local copies of checkpoints that a store holds are a cache: while the
     /// state directory's filesystem has less than this percentage free, the node
     /// agent drops them, oldest first, except those a VM pod on the node starts or
-    /// runs from. Default: 10.
+    /// runs from. Default: 25, above `vm.minFreeDiskPercent`, so cached copies go
+    /// before the node turns VMs away.
     #[serde(default = "default_min_free_percent")]
     pub min_free_percent: u8,
 }
@@ -178,6 +179,15 @@ pub struct Vm {
     /// the cached file; measure both on your nodes' disks before turning it on.
     #[serde(default)]
     pub memory_file_direct_io: bool,
+
+    /// While less than this percentage of a node's state directory filesystem is
+    /// free (after dropping cached checkpoint copies), its node agent taints the node
+    /// `status-taint.cluster-autoscaler.kubernetes.io/savestate-disk` (`NoSchedule`),
+    /// so it takes no new VMs, and removes the taint once 5 points more are free.
+    /// Keep it above the kubelet's disk eviction threshold for that filesystem
+    /// (`imagefs.available`, 15% by default). 0 turns it off. Default: 20.
+    #[serde(default = "default_min_free_disk_percent")]
+    pub min_free_disk_percent: u8,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -311,7 +321,11 @@ fn default_transfers_per_node() -> u32 {
 }
 
 fn default_min_free_percent() -> u8 {
-    10
+    25
+}
+
+fn default_min_free_disk_percent() -> u8 {
+    20
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -407,6 +421,9 @@ impl Config {
         self.check_stores()?;
         if self.cache.min_free_percent > 100 {
             return Err("cache.minFreePercent: at most 100".into());
+        }
+        if self.vm.min_free_disk_percent > 95 {
+            return Err("vm.minFreeDiskPercent: at most 95".into());
         }
         for (kind, limit) in [
             ("sandbox", &self.ttl.sandbox),

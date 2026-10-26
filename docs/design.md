@@ -516,7 +516,7 @@ no checkpoint of this cluster are garbage.
 | Who | Writes |
 | --- | --- |
 | Controller | VM pods (and their `savestate.dev/ports` annotation); Services and NetworkPolicies of sandboxes that expose ports; Sandbox `status` (all of it); TTL deletions; the Checkpoint finalizer; `Failed` on Checkpoints that cannot start; Transfers (exports and imports); deletions in stores |
-| Node agent | Checkpoint `status` (`phase`, `nodes`, `stores`, `vcpus`, `memory`, `disk`, sizes, `guestTime`, `parent`, `fingerprint`, `message`); Transfer `status`; files under `stateDir`; objects in stores; its node's `savestate.dev/cpu` label and scale-down annotation; removes run directories of sandboxes that are gone |
+| Node agent | Checkpoint `status` (`phase`, `nodes`, `stores`, `vcpus`, `memory`, `disk`, sizes, `guestTime`, `parent`, `fingerprint`, `message`); Transfer `status`; files under `stateDir`; objects in stores; its node's `savestate.dev/cpu` label, scale-down annotation and disk taint; removes run directories of sandboxes that are gone |
 | Launcher | listens on `/run/savestate/launcher.sock` in its pod (the run directory on the host); creates `/run/savestate/ready` once the VM runs and never removes it while the VM lives. A readiness probe (`test -e /run/savestate/ready`, every 2 s) turns that into the pod's Ready condition, which the controller reads. It exits non-zero when QEMU exits or the VM cannot start, and zero when its pod is deleted or evicted (SIGTERM), after stopping QEMU; either way it writes why to its termination log. |
 
 The node agent finds a sandbox's launcher at
@@ -587,7 +587,7 @@ before marking a new checkpoint `Ready`.
 
 **Cache eviction.** A local copy of a checkpoint that a store holds is a cache.
 When the state directory's filesystem has less than `cache.minFreePercent` free
-(default 10), the node agent drops such copies, oldest checkpoint first, until it
+(default 25), the node agent drops such copies, oldest checkpoint first, until it
 has enough: it removes its node from `status.nodes` (with the checkpoint's resource
 version), then the files; the next garbage collection removes the layers and images
 nothing else uses. A copy that the sandbox of a VM pod on this node starts or runs
@@ -596,16 +596,38 @@ VM pods and drops copies, under one lock, so a restore never starts from a copy
 being dropped. Imports' files are kept from garbage collection until they are
 published.
 
-**Garbage collection.** Every minute the node agent lists its files, then the
-Sandboxes and Checkpoints of its namespaces (fresh), and removes checkpoints (and
-saves) whose object is gone, layers no existing sandbox owns and no remaining
-checkpoint's chain (including a complete save's) uses, images no sandbox boots, no
+**Garbage collection.** Every minute, and as soon as a VM pod on its node stops,
+the node agent lists its files, then the Sandboxes and Checkpoints of its namespaces
+and the VM pods on its node (fresh), and removes checkpoints (and saves) whose
+object is gone, layers owned by no sandbox whose VM may still run (one that exists,
+is not `Failed` and whose pod here has not stopped) and used by no remaining
+checkpoint's chain (including a complete save's), images no sandbox boots, no
 chain uses and no sandbox booted from in the last hour (a boot from a cached image
 records its use as the file's modification time, so deleting a sandbox and creating
 it again pulls nothing), and run directories of sandboxes that are gone. Files are listed first, so
-a file created meanwhile is never taken for garbage. It reports bytes per kind and
+a file created meanwhile is never taken for garbage. A stopped VM's own layer goes
+at once because nothing can run, checkpoint or read it again, and because on a node
+short of disk it is the space the kubelet's eviction of a VM pod is meant to free:
+the layer is in a `hostPath`, so the eviction itself frees nothing, and the kubelet
+would go on evicting VMs until the node is empty. It reports bytes per kind and
 free bytes as metrics (`savestate_node_disk_bytes`, `savestate_node_disk_free_bytes`)
 on `--metrics-listen` (default `0.0.0.0:9090`).
+
+**Disk guard.** After each garbage collection and cache eviction, while less than
+`vm.minFreeDiskPercent` (default 20) of the state directory's filesystem is free,
+the node agent taints its node
+`status-taint.cluster-autoscaler.kubernetes.io/savestate-disk=true:NoSchedule`, so
+it takes no new VM, and removes the taint once 5 points more are free; it sets the
+taint again in the next pass if something else removed it, and reports it as
+`savestate_node_disk_short`. Running VMs are not touched. The cluster autoscaler
+treats a status taint as part of the node's state, not of its node group: the node
+still counts as ready, and its templates leave the taint out, so VM pods that no
+untainted node fits add a node. Disk requests (see "VM pods") keep the scheduler
+from placing more VM disk than a node has; the guard covers what requests do not
+(checkpoints, images, a shape that reserves less than its disk) and must stay above
+the kubelet's eviction threshold for that filesystem (`imagefs.available`, 15% by
+default). The node agent runs at `system-node-critical` priority, so the kubelet
+still admits it under disk pressure and evicts it last.
 
 **Joining a node.** Before the node agent starts, its pod's init containers load
 `vhost_vsock` where `/dev/vhost-vsock` is missing (`load-modules`, privileged, with
@@ -923,7 +945,7 @@ Kubernetes objects; every field has a documented default or is required with a c
 error, and unknown fields are refused. The schema is `savestate_api::config::Config`:
 `namespaces` (required), `stateDir`, `kubeletDir`, `launcherImage`, `vm` (`cpuModel`
 required, `memoryOverhead`, `cpuRequestPerVcpu`, `shapes` with an optional
-`cpuRequest` and `diskRequest` each, `nodeSelector`, `nodeAffinity`, `tolerations`, `slotsPerNode`, `memoryFileDirectIo`), `network`
+`cpuRequest` and `diskRequest` each, `nodeSelector`, `nodeAffinity`, `tolerations`, `slotsPerNode`, `memoryFileDirectIo`, `minFreeDiskPercent`), `network`
 (`egressAllow`, `dns`, `exposeFrom`), `images` (`registries`, `auth`, `plainHttp`, `prefetch`), `stores` (per name:
 `endpoint`, `bucket`, `region` and `credentialsSecret` required, `prefix`), `export`
 (a store name; default none), `cache.minFreePercent`, `transfers.perNode` and `ttl`

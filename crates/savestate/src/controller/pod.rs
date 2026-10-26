@@ -19,9 +19,7 @@ use crate::{
 /// `NetworkPolicy` in `deploy/base/sandboxes.yaml` selects them.
 pub(super) const LABELS: &str = "app.kubernetes.io/name=savestate,app.kubernetes.io/component=vm";
 
-/// Label holding the UID of a VM pod's sandbox, which its Service and
-/// `NetworkPolicy` select.
-pub(super) const SANDBOX_UID: &str = "savestate.dev/sandbox-uid";
+pub(super) use crate::SANDBOX_UID;
 
 /// Host directory holding one directory per sandbox for the launcher's socket
 /// (`RUN_DIR/<namespace>/<sandbox>/<sandbox UID>/`), mounted at the same path,

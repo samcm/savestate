@@ -1,15 +1,18 @@
-//! Garbage collection and disk use: every minute the node agent removes checkpoints
-//! whose objects are gone, layers and images nothing uses any more, and run
-//! directories of sandboxes that are gone, then reports what its state directory
-//! holds. Files are listed before the objects that keep them, so a file created
-//! meanwhile is never mistaken for garbage.
+//! Garbage collection and disk use: every minute, and as soon as a VM pod on this
+//! node stops, the node agent removes checkpoints whose objects are gone, layers and
+//! images nothing uses any more (a sandbox whose VM has stopped for good, `Failed`
+//! or with a stopped pod, uses none), and run directories of sandboxes that are gone,
+//! then reports what its state directory holds. Files are listed before the objects
+//! that keep them, so a file created meanwhile is never mistaken for garbage.
 
-use std::{path::Path, sync::Arc, time::Duration};
+use std::{collections::BTreeSet, path::Path, sync::Arc, time::Duration};
 
+use k8s_openapi::api::core::v1::Pod;
 use kube::{Api, ResourceExt, api::ListParams};
-use savestate_api::{Checkpoint, Sandbox};
+use savestate_api::{Checkpoint, Sandbox, SandboxPhase};
 
 use super::{Context, launchers};
+use crate::SANDBOX_UID;
 use crate::store::Live;
 
 const INTERVAL: Duration = Duration::from_secs(60);
@@ -28,8 +31,17 @@ pub(super) async fn run(ctx: Arc<Context>) {
                 "updating the scale-down annotation failed"
             );
         }
+        if let Err(error) = super::cache::guard(&ctx).await {
+            tracing::warn!(
+                error = format!("{error:#}"),
+                "updating the disk taint failed"
+            );
+        }
         report(&ctx);
-        tokio::time::sleep(INTERVAL).await;
+        tokio::select! {
+            () = tokio::time::sleep(INTERVAL) => {}
+            () = ctx.collect_now.notified() => {}
+        }
     }
 }
 
@@ -69,6 +81,24 @@ async fn collect(ctx: &Context) -> anyhow::Result<()> {
             .cloned(),
     );
     for namespace in &ctx.config.namespaces {
+        // Sandboxes whose VM pod here has stopped: their VM never runs again, and
+        // the controller may not have marked them `Failed` yet.
+        let stopped: BTreeSet<String> = Api::<Pod>::namespaced(ctx.client.clone(), namespace)
+            .list(
+                &ListParams::default()
+                    .labels(launchers::LABELS)
+                    .fields(&format!("spec.nodeName={}", ctx.node)),
+            )
+            .await?
+            .into_iter()
+            .filter(|pod| {
+                pod.status
+                    .as_ref()
+                    .and_then(|status| status.phase.as_deref())
+                    .is_some_and(|phase| matches!(phase, "Failed" | "Succeeded"))
+            })
+            .filter_map(|pod| pod.labels().get(SANDBOX_UID).cloned())
+            .collect();
         let sandboxes = Api::<Sandbox>::namespaced(ctx.client.clone(), namespace)
             .list(&ListParams::default())
             .await?;
@@ -81,7 +111,19 @@ async fn collect(ctx: &Context) -> anyhow::Result<()> {
             {
                 live.images.insert(hex.1.to_owned());
             }
-            live.sandboxes.extend(sandbox.uid());
+            let failed = sandbox
+                .status
+                .as_ref()
+                .is_some_and(|status| status.phase == SandboxPhase::Failed);
+            // A stopped VM's layer goes: nothing can run, checkpoint or read it
+            // again, and on a node short of disk it is what the kubelet's evictions
+            // must free, or they go on until the node is empty.
+            if let Some(uid) = sandbox.uid()
+                && !failed
+                && !stopped.contains(&uid)
+            {
+                live.sandboxes.insert(uid);
+            }
         }
         let checkpoints = Api::<Checkpoint>::namespaced(ctx.client.clone(), namespace)
             .list(&ListParams::default())

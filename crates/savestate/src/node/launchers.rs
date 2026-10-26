@@ -60,6 +60,10 @@ async fn reconcile(pod: Arc<Pod>, ctx: Arc<Context>) -> Result<Action, Error> {
         .as_ref()
         .and_then(|status| status.phase.as_deref())
         .is_some_and(|phase| matches!(phase, "Failed" | "Succeeded"));
+    if terminal {
+        // Its VM is gone for good, and so is the use of its disk layer.
+        ctx.collect_now.notify_one();
+    }
     if pod.metadata.deletion_timestamp.is_some() || terminal {
         return Ok(Action::await_change());
     }

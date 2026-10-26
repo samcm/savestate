@@ -30,6 +30,10 @@ use std::path::Path;
 use anyhow::Context;
 use savestate_api::Config;
 
+/// Label holding the UID of a VM pod's sandbox; its Service and `NetworkPolicy`
+/// select by it, and the node agent finds a stopped pod's sandbox by it.
+pub const SANDBOX_UID: &str = "savestate.dev/sandbox-uid";
+
 /// Label on every VM node: [`cpu_label`] of the CPU guests get there.
 pub const CPU_LABEL: &str = "savestate.dev/cpu";
 

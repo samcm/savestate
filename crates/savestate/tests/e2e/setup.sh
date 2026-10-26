@@ -83,6 +83,9 @@ vm:
     - {vcpus: 4, memory: 1Gi, disk: 4Gi, cpuRequest: 500m}
   nodeSelector:
     savestate.dev/node: "true"
+  # The runner's disk is shared with everything else on it; how full it is says
+  # nothing about savestate, so the node never turns VMs away for it here.
+  minFreeDiskPercent: 0
 network:
   egressAllow: [$registry/32]
   exposeFrom:

@@ -605,6 +605,53 @@ async fn checkpoint_fork_and_resume_exactly() {
         saved_note(&client, &ns, checkpoint).await
     ));
 
+    // A VM that stops fails its sandbox, and its disk layer leaves the node at once
+    // (nothing can use it again; on a node short of disk it is what an eviction must
+    // free). The layers of running sandboxes and of checkpoints stay.
+    let layers = || async { sh_pod(&client, &ns, "web", "ls /var/lib/savestate/layers").await };
+    let frozen_uid = json(&["get", "web-frozen", "-o", "json"])["metadata"]["uid"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let web_uid = json(&["get", "web", "-o", "json"])["metadata"]["uid"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    // web-frozen's first layer belongs to the checkpoint forked from it; its second
+    // is its own.
+    let (frozen_by_checkpoint, own) = (
+        format!("{frozen_uid}-0.qcow2"),
+        format!("{frozen_uid}-1.qcow2"),
+    );
+    assert!(layers().await.contains(&own));
+    let stopped_at = Instant::now();
+    let _ = exec("web-frozen", "systemctl poweroff");
+    let sandboxes: Api<savestate_api::Sandbox> = Api::namespaced(client.clone(), &ns);
+    wait_for("web-frozen to fail", 60, || async {
+        sandboxes
+            .get("web-frozen")
+            .await
+            .unwrap()
+            .status
+            .is_some_and(|status| status.phase == SandboxPhase::Failed)
+    })
+    .await;
+    wait_for("web-frozen's layer to leave the node", 30, || async {
+        !layers().await.contains(&own)
+    })
+    .await;
+    report(&format!(
+        "stopped VM: its layer was gone {:.1} s after the guest powered off",
+        secs(stopped_at)
+    ));
+    let left = layers().await;
+    assert!(
+        left.contains(&frozen_by_checkpoint)
+            && left.contains(&format!("{web_uid}-0.qcow2"))
+            && left.contains(&format!("{web_uid}-1.qcow2")),
+        "a layer still in use is gone: {left}"
+    );
+
     for sandbox in ["web", "web-frozen", grandchild.as_str()] {
         savestate(&["delete", "sandbox", sandbox]);
     }

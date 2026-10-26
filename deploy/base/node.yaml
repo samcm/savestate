@@ -19,6 +19,9 @@ spec:
         app.kubernetes.io/component: node
     spec:
       serviceAccountName: savestate-node
+      # Critical, so the kubelet still admits the node agent on a node under disk
+      # pressure (where it frees what stopped VMs left) and evicts it last.
+      priorityClassName: system-node-critical
       # The nodes that run VMs: the same selection as `vm.nodeSelector` (and
       # `vm.nodeAffinity` and `vm.tolerations`) in config.yaml.
       nodeSelector:

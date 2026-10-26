@@ -146,6 +146,77 @@ pub(super) async fn evict(ctx: &Context) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Taint keeping new VMs off a node short of disk. A status taint to the cluster
+/// autoscaler: the node still counts as ready, and the taint is left out of the
+/// node templates it simulates scale-ups with, so pending VM pods add a node.
+const DISK_TAINT: &str = "status-taint.cluster-autoscaler.kubernetes.io/savestate-disk";
+
+/// Points of free disk above `vm.minFreeDiskPercent` before the taint goes, so a
+/// node near the threshold does not flap.
+const DISK_HYSTERESIS: f64 = 5.0;
+
+/// Taints this node with [`DISK_TAINT`] while less than `vm.minFreeDiskPercent` of
+/// the state directory's filesystem is free, and removes it once
+/// [`DISK_HYSTERESIS`] points more are. The taint is checked every pass and set
+/// again if something else removed it (a platform may reset node taints to its
+/// pool's). Running VMs stay; only new ones go elsewhere.
+pub(super) async fn guard(ctx: &Context) -> anyhow::Result<()> {
+    let min = f64::from(ctx.config.vm.min_free_disk_percent);
+    let free = free_percent(ctx)?;
+    let nodes = Api::<Node>::all(ctx.client.clone());
+    let node = nodes.get(&ctx.node).await?;
+    let taints = node
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.taints.clone())
+        .unwrap_or_default();
+    let tainted = taints.iter().any(|taint| taint.key == DISK_TAINT);
+    let short = min > 0.0 && (free < min || (tainted && free < min + DISK_HYSTERESIS));
+    metrics::gauge!("savestate_node_disk_short").set(if short { 1.0 } else { 0.0 });
+    if short == tainted {
+        return Ok(());
+    }
+    let mut kept: Vec<_> = taints
+        .into_iter()
+        .filter(|taint| taint.key != DISK_TAINT)
+        .collect();
+    if short {
+        kept.push(k8s_openapi::api::core::v1::Taint {
+            key: DISK_TAINT.into(),
+            value: Some("true".into()),
+            effect: "NoSchedule".into(),
+            time_added: None,
+        });
+        tracing::warn!(
+            node = ctx.node,
+            free_percent = free,
+            min_percent = min,
+            "the state directory is short of disk: tainted the node so it takes no new VMs"
+        );
+    } else {
+        tracing::info!(
+            node = ctx.node,
+            free_percent = free,
+            "the state directory has disk again: removed the taint"
+        );
+    }
+    // The resource version makes it a replace of the taints read above, not of
+    // whatever another writer has set since.
+    let patch = json!({
+        "metadata": {"resourceVersion": node.metadata.resource_version},
+        "spec": {"taints": kept},
+    });
+    let params = PatchParams {
+        field_manager: Some(MANAGER.into()),
+        ..PatchParams::default()
+    };
+    nodes
+        .patch(&ctx.node, &params, &Patch::Merge(patch))
+        .await
+        .with_context(|| format!("patching node {}'s taints", ctx.node))?;
+    Ok(())
+}
+
 /// `(namespace, checkpoint)` that the sandboxes of VM pods on this node start from.
 async fn in_use(ctx: &Context) -> anyhow::Result<BTreeSet<(String, String)>> {
     let mut in_use = BTreeSet::new();

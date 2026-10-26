@@ -44,7 +44,7 @@ use std::{
 };
 
 use k8s_openapi::api::{
-    core::v1::{Node, Pod, Service},
+    core::v1::{Node, PersistentVolumeClaim, Pod, Service},
     events::v1::Event,
 };
 use kube::{
@@ -63,6 +63,8 @@ async fn checkpoint_fork_and_resume_exactly() {
     let blocked = env("SAVESTATE_E2E_BLOCKED");
     let client = Client::try_default().await.expect("KUBECONFIG");
     let checkpoints: Api<Checkpoint> = Api::namespaced(client.clone(), &ns);
+    let claims: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), &ns);
+    let sandboxes: Api<savestate_api::Sandbox> = Api::namespaced(client.clone(), &ns);
 
     // A sandbox from the base image.
     let started = Instant::now();
@@ -91,7 +93,8 @@ async fn checkpoint_fork_and_resume_exactly() {
         .get("web")
         .await
         .unwrap();
-    let container = &pod.spec.unwrap().containers[0];
+    let pod_spec = pod.spec.as_ref().unwrap();
+    let container = &pod_spec.containers[0];
     let security = serde_json::to_value(&container.security_context).unwrap();
     report(&format!("VM pod security context: {security}"));
     // Not privileged: devices come from the node agent's device plugin, and the
@@ -132,9 +135,8 @@ async fn checkpoint_fork_and_resume_exactly() {
     );
     assert!(qemu.contains("-sandbox on"), "{qemu}");
 
-    // The pod reserves the sandbox's disk on the node, and what the guest deletes
-    // leaves the node's disk: a layer that kept every block ever written would fill
-    // the node until the kubelet evicts its VMs.
+    // The active qcow2 is on the Sandbox-owned RWO filesystem claim, so the pod
+    // requests no node-local ephemeral disk.
     let requests = container
         .resources
         .as_ref()
@@ -142,12 +144,48 @@ async fn checkpoint_fork_and_resume_exactly() {
         .requests
         .as_ref()
         .unwrap();
-    assert_eq!(requests["ephemeral-storage"].0, "4Gi");
+    assert!(!requests.contains_key("ephemeral-storage"));
     let uid = json(&["get", "web", "-o", "json"])["metadata"]["uid"]
         .as_str()
         .unwrap()
         .to_owned();
-    let layer = format!("/var/lib/savestate/layers/{uid}-0.qcow2");
+    let claim = claims.get("web").await.unwrap();
+    assert_eq!(claim.owner_references().len(), 1);
+    let owner = &claim.owner_references()[0];
+    assert_eq!(
+        (owner.kind.as_str(), owner.name.as_str(), owner.uid.as_str()),
+        ("Sandbox", "web", uid.as_str())
+    );
+    let claim_spec = claim.spec.unwrap();
+    assert_eq!(claim_spec.storage_class_name.as_deref(), Some("local-path"));
+    assert_eq!(
+        claim_spec.access_modes.as_deref(),
+        Some(&["ReadWriteOnce".to_owned()][..])
+    );
+    assert_eq!(claim_spec.volume_mode.as_deref(), Some("Filesystem"));
+    assert_eq!(
+        claim_spec.resources.unwrap().requests.unwrap()["storage"].0,
+        "6Gi"
+    );
+    let volumes = serde_json::to_value(pod_spec.volumes.as_ref()).unwrap();
+    assert!(volumes.as_array().unwrap().iter().any(|volume| {
+        volume["name"] == "active-disk" && volume["persistentVolumeClaim"]["claimName"] == "web"
+    }));
+    let mounts = serde_json::to_value(&container.volume_mounts).unwrap();
+    assert!(mounts.as_array().unwrap().iter().any(|mount| {
+        mount["name"] == "active-disk" && mount["mountPath"] == "/var/lib/savestate-active"
+    }));
+    let layer = "/var/lib/savestate-active/disk.qcow2";
+    assert_eq!(
+        sh_pod(
+            &client,
+            &ns,
+            "web",
+            &format!("test -f {layer}; echo mounted")
+        )
+        .await,
+        "mounted\n"
+    );
     let allocated = || async {
         let blocks = sh_pod(&client, &ns, "web", &format!("stat -c %b {layer}")).await;
         blocks.trim().parse::<u64>().unwrap() * 512
@@ -192,7 +230,7 @@ async fn checkpoint_fork_and_resume_exactly() {
     assert_eq!(pod.status.unwrap().qos_class.as_deref(), Some("Burstable"));
     assert_eq!(sh("burst", "nproc").trim(), "4");
     let node = Api::<Node>::all(client.clone())
-        .get(pod.spec.unwrap().node_name.as_deref().unwrap())
+        .get(pod.spec.as_ref().unwrap().node_name.as_deref().unwrap())
         .await
         .unwrap();
     let node_name = node.metadata.name.clone().unwrap();
@@ -411,6 +449,39 @@ async fn checkpoint_fork_and_resume_exactly() {
     assert_eq!(ready.vcpus, Some(1));
     assert_eq!(ready.memory.unwrap().0, "1Gi");
     assert_eq!(ready.parent, None);
+    // PVC checkpoints retain the existing portable format: base image plus one
+    // node-local, self-contained full qcow2 layer and the RAM file in the manifest.
+    let checkpoint_uid = checkpoints.get("web-1").await.unwrap().uid().unwrap();
+    let manifest: serde_json::Value = serde_json::from_str(
+        &sh_pod(
+            &client,
+            &ns,
+            "web",
+            &format!("cat /var/lib/savestate/checkpoints/{checkpoint_uid}/manifest.json"),
+        )
+        .await,
+    )
+    .unwrap();
+    let chain = manifest["chain"].as_array().unwrap();
+    assert_eq!(chain.len(), 2, "{manifest}");
+    assert!(
+        chain[0].as_str().unwrap().starts_with("images/"),
+        "{manifest}"
+    );
+    let frozen = chain[1].as_str().unwrap();
+    assert!(frozen.starts_with("layers/"), "{manifest}");
+    let info: serde_json::Value = serde_json::from_str(
+        &sh_pod(
+            &client,
+            &ns,
+            "web",
+            &format!("qemu-img info --output=json /var/lib/savestate/{frozen}"),
+        )
+        .await,
+    )
+    .unwrap();
+    assert_eq!(info["format"], "qcow2", "{info}");
+    assert_eq!(info.get("backing-filename"), None, "{info}");
     // The sandbox's labels, overridden where the checkpoint says otherwise.
     assert_eq!(
         labels(&json(&["get", "web-1", "-o", "json"])),
@@ -426,6 +497,7 @@ async fn checkpoint_fork_and_resume_exactly() {
         "the original carries on after the checkpoint"
     );
     sh("web", "echo after >/root/state && sync");
+    sh("web", "echo durable >/root/after-checkpoint && sync");
     // Let host time pass, so a frozen clock shows.
     std::thread::sleep(Duration::from_secs(20));
 
@@ -469,6 +541,11 @@ async fn checkpoint_fork_and_resume_exactly() {
         );
         // The disk as of the checkpoint, and its own identity.
         assert_eq!(sh(fork, "cat /root/state"), "before\n", "{fork}");
+        assert_eq!(
+            exec(fork, "test ! -e /root/after-checkpoint").status.code(),
+            Some(0),
+            "{fork}: post-checkpoint disk state leaked into the restore"
+        );
         assert_eq!(sh(fork, "cat /proc/sys/kernel/hostname").trim(), fork);
         assert_ne!(sh(fork, "cat /etc/machine-id"), machine_id, "{fork}");
     }
@@ -605,28 +682,50 @@ async fn checkpoint_fork_and_resume_exactly() {
         saved_note(&client, &ns, checkpoint).await
     ));
 
-    // A VM that stops fails its sandbox, and its disk layer leaves the node at once
-    // (nothing can use it again; on a node short of disk it is what an eviction must
-    // free). The layers of running sandboxes and of checkpoints stay.
-    let layers = || async { sh_pod(&client, &ns, "web", "ls /var/lib/savestate/layers").await };
-    let frozen_uid = json(&["get", "web-frozen", "-o", "json"])["metadata"]["uid"]
-        .as_str()
-        .unwrap()
-        .to_owned();
-    let web_uid = json(&["get", "web", "-o", "json"])["metadata"]["uid"]
-        .as_str()
-        .unwrap()
-        .to_owned();
-    // web-frozen's first layer belongs to the checkpoint forked from it; its second
-    // is its own.
-    let (frozen_by_checkpoint, own) = (
-        format!("{frozen_uid}-0.qcow2"),
-        format!("{frozen_uid}-1.qcow2"),
+    // The PVC follows an infrastructure replacement. The replacement cold-boots
+    // rather than replaying checkpoint RAM, but sees every synchronized disk write
+    // made after the checkpoint.
+    let pods = Api::<Pod>::namespaced(client.clone(), &ns);
+    let first_pod_uid = pods.get("web").await.unwrap().uid().unwrap();
+    let claim_uid = claims.get("web").await.unwrap().uid().unwrap();
+    pods.delete("web", &DeleteParams::default()).await.unwrap();
+    wait_for("web to cold-boot in a replacement pod", 180, || async {
+        let pod = pods.get_opt("web").await.unwrap();
+        let replaced = pod
+            .as_ref()
+            .and_then(kube::ResourceExt::uid)
+            .is_some_and(|new| new != first_pod_uid);
+        let running = sandboxes
+            .get("web")
+            .await
+            .unwrap()
+            .status
+            .is_some_and(|status| status.phase == SandboxPhase::Running);
+        replaced && running
+    })
+    .await;
+    assert_eq!(
+        claims.get("web").await.unwrap().uid().as_deref(),
+        Some(claim_uid.as_str())
     );
-    assert!(layers().await.contains(&own));
-    let stopped_at = Instant::now();
+    assert_eq!(
+        sh("web", "cat /root/state /root/after-checkpoint"),
+        "after\ndurable\n"
+    );
+    assert_eq!(
+        exec("web", "test ! -e /run/counter").status.code(),
+        Some(0),
+        "replacement replayed checkpoint RAM instead of cold-booting the active disk"
+    );
+    report(
+        "PVC replacement: same claim, new pod, post-checkpoint guest disk marker survived cold boot",
+    );
+
+    // A launcher/QEMU stop is terminal even though its active disk is durable: the
+    // failed pod and claim remain for diagnosis rather than being replaced.
+    let frozen_pod_uid = pods.get("web-frozen").await.unwrap().uid().unwrap();
+    let frozen_claim_uid = claims.get("web-frozen").await.unwrap().uid().unwrap();
     let _ = exec("web-frozen", "systemctl poweroff");
-    let sandboxes: Api<savestate_api::Sandbox> = Api::namespaced(client.clone(), &ns);
     wait_for("web-frozen to fail", 60, || async {
         sandboxes
             .get("web-frozen")
@@ -636,20 +735,14 @@ async fn checkpoint_fork_and_resume_exactly() {
             .is_some_and(|status| status.phase == SandboxPhase::Failed)
     })
     .await;
-    wait_for("web-frozen's layer to leave the node", 30, || async {
-        !layers().await.contains(&own)
-    })
-    .await;
-    report(&format!(
-        "stopped VM: its layer was gone {:.1} s after the guest powered off",
-        secs(stopped_at)
-    ));
-    let left = layers().await;
-    assert!(
-        left.contains(&frozen_by_checkpoint)
-            && left.contains(&format!("{web_uid}-0.qcow2"))
-            && left.contains(&format!("{web_uid}-1.qcow2")),
-        "a layer still in use is gone: {left}"
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert_eq!(
+        pods.get("web-frozen").await.unwrap().uid().as_deref(),
+        Some(frozen_pod_uid.as_str())
+    );
+    assert_eq!(
+        claims.get("web-frozen").await.unwrap().uid().as_deref(),
+        Some(frozen_claim_uid.as_str())
     );
 
     for sandbox in ["web", "web-frozen", grandchild.as_str()] {

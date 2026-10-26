@@ -299,14 +299,15 @@ their own namespace.
 
 Capacity accounting is plain Kubernetes: each VM is a pod whose memory request and
 limit are guest RAM plus the installation's memory overhead (`vm.memoryOverhead`,
-default 512 MiB), whose CPU request is its vCPUs unless the installation reserves
-less (see "VM pods"), and whose `ephemeral-storage` request is its disk size unless
-the installation reserves less, so the scheduler, the cluster autoscaler and
-ResourceQuota work unchanged. The disk request matters because a sandbox's disk
-layer lives in the state directory, a `hostPath` that neither the scheduler nor the
-kubelet counts as the pod's: without it nodes take VMs whose disks, once their
-guests fill them, are larger than the node's, and the kubelet then evicts VMs for
-disk space. The spike
+default 512 MiB), and whose CPU request is its vCPUs unless the installation reserves
+less (see "VM pods"), so the scheduler, the cluster autoscaler and ResourceQuota work
+unchanged. With node-local active disks, its `ephemeral-storage` request is its disk
+size unless the installation reserves less. The disk request matters because a
+sandbox's disk layer then lives in the state directory, a `hostPath` that neither the
+scheduler nor the kubelet counts as the pod's: without it nodes take VMs whose disks,
+once their guests fill them, are larger than the node's, and the kubelet then evicts
+VMs for disk space. With PVC-backed active disks, capacity is instead the shape's
+`activeDiskSize` request on one Sandbox-owned filesystem PVC. The spike
 measured QEMU's own resident memory outside guest RAM at 30–60 MiB. In the end-to-end
 test the VM pod's cgroup peak (QEMU, the launcher and KVM's kernel memory) was about
 250 MiB for a 1 GiB guest whose memory file held about 170 MiB, so everything outside
@@ -331,15 +332,15 @@ VM) and `savestate.dev/ports` (see "Exposed ports"):
   for a sandbox from an image, the checkpoint's `fingerprint.launcherImage` for a
   sandbox from a checkpoint. The pod spec is the record of which image a sandbox
   runs; the controller never changes an existing pod except its
-  `savestate.dev/ports` annotation (and replaces only an unscheduled one, see
-  "Re-placing a pinned pod").
+  `savestate.dev/ports` annotation (replacement is described below).
 - resources: memory requests and limits are guest memory plus `vm.memoryOverhead`,
   never overcommitted; one `savestate.dev/vm`, the node agent's device plugin
   resource that brings `/dev/kvm`, `/dev/net/tun` and `/dev/vhost-vsock`; and the
-  CPU request below; and an `ephemeral-storage` request, the `diskRequest` of the
-  sandbox's shape, else its disk size (no limit: the layer is in a `hostPath`, which
-  the kubelet does not count). For a sandbox from a checkpoint, shape comes from the
-  checkpoint's status; one whose checkpoint records no disk requests none.
+  CPU request below. With a node-local active disk it also has an
+  `ephemeral-storage` request, the `diskRequest` of the sandbox's shape, else its disk
+  size (no limit: the layer is in a `hostPath`, which the kubelet does not count).
+  PVC-backed disks omit this request. For a sandbox from a checkpoint, shape comes
+  from the checkpoint's status; one whose checkpoint records no disk requests none.
 - CPU: the request is the `cpuRequest` of the sandbox's shape (the `vm.shapes` entry
   with its vCPUs, memory and disk), else `vm.cpuRequestPerVcpu` per vCPU (default
   `1`). A request of a whole CPU per vCPU, the default, is also the CPU limit, so
@@ -382,9 +383,14 @@ VM) and `savestate.dev/ports` (see "Exposed ports"):
   score, and both plugins weigh the same by default, so packing can at most tie with
   the holder preference (where a holder runs no VM at all) and decides among the
   nodes that are not holders.
-- host paths: `stateDir` at the same path, and the sandbox's run directory
+- `stateDir` as a host path at the same path, and the sandbox's run directory
   `/run/savestate/<namespace>/<sandbox>/<sandbox UID>/` at `/run/savestate`. The UID
-  keeps a later sandbox of the same name from meeting an earlier one's files.
+  keeps a later sandbox of the same name from meeting an earlier one's files. When
+  `vm.activeDiskStorageClass` is set, the pod also mounts the Sandbox-owned RWO
+  filesystem PVC named after the Sandbox at `/var/lib/savestate-active`; its active
+  qcow2 is `disk.qcow2`. The matching shape's `activeDiskSize` is the PVC request and
+  must leave filesystem and qcow2 metadata headroom above the guest's virtual disk.
+  Without that setting the active layer stays in node-local `stateDir`.
 - a downward API volume at `/etc/savestate/pod` holding the pod's
   `savestate.dev/ports` annotation as the file `ports`.
 
@@ -427,14 +433,20 @@ being deleted, or `Ready` without fingerprint, vCPUs or memory. It waits (sandbo
 is on no node and in no store. A pod of the same name owned by an earlier sandbox
 is waited out.
 
-**Re-placing a pinned pod.** A pod pinned to the holders of a checkpoint no store
+**Replacing pods.** A pod pinned to the holders of a checkpoint no store
 had when it was created, which the scheduler finds no room for (`PodScheduled`
 `False`, `Unschedulable`), is deleted once a store holds the checkpoint (with its UID
 and resource version as preconditions, so a pod bound meanwhile stays), with a
 `Replaced` event; the next pod may run on any node that runs the checkpoint's CPU,
 including one the cluster autoscaler adds for it. An unscheduled pod has started
-nothing, and the API server removes it at once. This is the only pod the controller
-replaces.
+nothing, and the API server removes it at once.
+
+With a PVC-backed active disk, the controller also replaces a pod removed by
+infrastructure (including eviction and node shutdown) while keeping the same
+Sandbox and PVC. The replacement may run on another eligible node and cold-boots
+the existing active qcow2: disk state survives, but RAM and open connections do not.
+A launcher or QEMU failure remains terminal and its pod remains for diagnosis. A
+hostPath-backed sandbox cannot be replaced because its active disk was on its node.
 
 **Imports.** When the VM pod of a sandbox from a checkpoint is scheduled onto a node
 not in the checkpoint's `status.nodes`, the controller creates an import `Transfer`
@@ -483,7 +495,8 @@ choice; `deploy/README.md` has an example.
 | on a node not holding its checkpoint | `WaitingForTransfer`; `node` set; message with the import's progress |
 | on a node, not Ready | `Booting` (from an image) or `Restoring` (from a checkpoint); `node` set; message from a waiting container (e.g. an image that cannot be pulled) |
 | Ready | `Running`, and it stays `Running` while the pod runs |
-| `Failed` or `Succeeded`, being deleted, or gone after placement | `Failed` with the pod's reason where it has one (`Evicted`, `NodeShutdown`, …: the kubelet stopped it, whatever the launcher then reported), else the launcher's exit code and termination message |
+| PVC-backed pod being deleted, evicted or stopped by node shutdown | `Pending` while the controller replaces it; the replacement cold-boots its durable active disk |
+| launcher/QEMU failed, or a hostPath-backed pod stopped or disappeared after placement | `Failed` with the pod's reason where it has one, else the launcher's exit code and termination message |
 
 `Failed` is terminal: the pod is kept for its logs and never replaced.
 
@@ -515,9 +528,9 @@ no checkpoint of this cluster are garbage.
 
 | Who | Writes |
 | --- | --- |
-| Controller | VM pods (and their `savestate.dev/ports` annotation); Services and NetworkPolicies of sandboxes that expose ports; Sandbox `status` (all of it); TTL deletions; the Checkpoint finalizer; `Failed` on Checkpoints that cannot start; Transfers (exports and imports); deletions in stores |
+| Controller | VM pods (and their `savestate.dev/ports` annotation); active-disk PVCs; Services and NetworkPolicies of sandboxes that expose ports; Sandbox `status` (all of it); TTL deletions; the Checkpoint finalizer; `Failed` on Checkpoints that cannot start; Transfers (exports and imports); deletions in stores |
 | Node agent | Checkpoint `status` (`phase`, `nodes`, `stores`, `vcpus`, `memory`, `disk`, sizes, `guestTime`, `parent`, `fingerprint`, `message`); Transfer `status`; files under `stateDir`; objects in stores; its node's `savestate.dev/cpu` label, scale-down annotation and disk taint; removes run directories of sandboxes that are gone |
-| Launcher | listens on `/run/savestate/launcher.sock` in its pod (the run directory on the host); creates `/run/savestate/ready` once the VM runs and never removes it while the VM lives. A readiness probe (`test -e /run/savestate/ready`, every 2 s) turns that into the pod's Ready condition, which the controller reads. It exits non-zero when QEMU exits or the VM cannot start, and zero when its pod is deleted or evicted (SIGTERM), after stopping QEMU; either way it writes why to its termination log. |
+| Launcher | listens on `/run/savestate/launcher.sock` in its pod (the run directory on the host); removes a previous pod's `/run/savestate/ready`, then creates it once its own VM runs. A readiness probe (`test -e /run/savestate/ready`, every 2 s) turns that into the pod's Ready condition, which the controller reads. It exits non-zero when QEMU exits or the VM cannot start, and zero when its pod is deleted or evicted (SIGTERM), after stopping QEMU; either way it writes why to its termination log. |
 
 The node agent finds a sandbox's launcher at
 `/run/savestate/<namespace>/<sandbox>/<sandbox UID>/launcher.sock` on its node, and a

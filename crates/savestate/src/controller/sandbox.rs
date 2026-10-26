@@ -5,7 +5,7 @@ use std::{sync::Arc, time::Duration};
 
 use k8s_openapi::{
     api::{
-        core::v1::{Pod, Service},
+        core::v1::{PersistentVolumeClaim, Pod, Service},
         networking::v1::NetworkPolicy,
     },
     apimachinery::pkg::api::resource::Quantity,
@@ -35,6 +35,10 @@ pub(super) async fn run(ctx: Arc<Context>, namespace: String) {
         .owns(
             Api::<Pod>::namespaced(client.clone(), &namespace),
             watcher::Config::default().labels(pod::LABELS),
+        )
+        .owns(
+            Api::<PersistentVolumeClaim>::namespaced(client.clone(), &namespace),
+            watcher::Config::default(),
         )
         // Import progress.
         .owns(
@@ -120,6 +124,16 @@ async fn reconcile(sandbox: Arc<Sandbox>, ctx: Arc<Context>) -> Result<Action, E
             retry = Some(Duration::from_secs(1));
             waiting(&sandbox, message)
         }
+        Some(pod) if replaceable(pod, &ctx.config) => {
+            if pod.metadata.deletion_timestamp.is_none() {
+                delete_pod(&pods, pod).await?;
+            }
+            retry = Some(Duration::from_secs(1));
+            waiting(
+                &sandbox,
+                "replacing the VM pod; its durable disk is preserved".to_owned(),
+            )
+        }
         Some(pod) => {
             let mut status = observe(&sandbox, pod, &old);
             if status.phase == SandboxPhase::Restoring
@@ -131,37 +145,23 @@ async fn reconcile(sandbox: Arc<Sandbox>, ctx: Arc<Context>) -> Result<Action, E
             }
             status
         }
-        // Placed once, so the VM ran or started there: its state is gone.
+        // A durable active disk survives a pod disappearing. Its replacement cold
+        // boots that disk; RAM state is intentionally not replayed.
+        None if old.node.is_some() && ctx.config.vm.active_disk_storage_class.is_some() => {
+            match plan(&sandbox, &ctx).await? {
+                Plan::Wait(message) => waiting(&sandbox, message),
+                Plan::Refuse(message) => failed(&sandbox, None, message),
+                Plan::Run(vm) => create_vm(&ctx, &sandbox, &pods, vm).await?,
+            }
+        }
+        // Placed once in hostPath mode, so the VM and its active disk are gone.
         None if old.node.is_some() => {
             failed(&sandbox, old.node.clone(), "the VM pod was deleted".into())
         }
         None => match plan(&sandbox, &ctx).await? {
             Plan::Wait(message) => waiting(&sandbox, message),
             Plan::Refuse(message) => failed(&sandbox, None, message),
-            Plan::Run(vm) => {
-                let pod = pod::build(&sandbox, &vm, &ctx.config)?;
-                let params = PostParams {
-                    field_manager: Some(MANAGER.into()),
-                    ..PostParams::default()
-                };
-                match pods.create(&params, &pod).await {
-                    Ok(_) => {
-                        super::publish(
-                            &ctx,
-                            &*sandbox,
-                            EventType::Normal,
-                            "Created",
-                            format!("created VM pod {name} running {}", vm.image),
-                        )
-                        .await;
-                        tracing::info!(namespace, name, image = vm.image, "created VM pod");
-                    }
-                    // Created by an earlier reconcile the cache has not seen yet.
-                    Err(kube::Error::Api(status)) if status.code == 409 => {}
-                    Err(error) => return Err(error.into()),
-                }
-                waiting(&sandbox, None)
-            }
+            Plan::Run(vm) => create_vm(&ctx, &sandbox, &pods, vm).await?,
         },
     };
 
@@ -184,6 +184,171 @@ async fn reconcile(sandbox: Arc<Sandbox>, ctx: Arc<Context>) -> Result<Action, E
         transition(&ctx, &sandbox, &old, &status).await;
     }
     Ok(retry.map_or_else(|| super::requeue(left), Action::requeue))
+}
+
+async fn create_vm(
+    ctx: &Context,
+    sandbox: &Sandbox,
+    pods: &Api<Pod>,
+    vm: pod::Vm,
+) -> Result<SandboxStatus, Error> {
+    ensure_active_disk(ctx, sandbox, vm.active_disk.as_ref()).await?;
+    let pod = pod::build(sandbox, &vm, &ctx.config)?;
+    let params = PostParams {
+        field_manager: Some(MANAGER.into()),
+        ..PostParams::default()
+    };
+    match pods.create(&params, &pod).await {
+        Ok(_) => {
+            super::publish(
+                ctx,
+                sandbox,
+                EventType::Normal,
+                "Created",
+                format!("created VM pod {} running {}", sandbox.name_any(), vm.image),
+            )
+            .await;
+            tracing::info!(
+                namespace = sandbox.namespace(),
+                name = sandbox.name_any(),
+                image = vm.image,
+                "created VM pod"
+            );
+        }
+        // Created by an earlier reconcile the cache has not seen yet.
+        Err(kube::Error::Api(status)) if status.code == 409 => {}
+        Err(error) => return Err(error.into()),
+    }
+    Ok(waiting(sandbox, None))
+}
+
+/// Whether infrastructure stopped this PVC-backed VM pod. A launcher or QEMU
+/// failure has no pod-level reason and remains terminal for diagnosis.
+fn replaceable(pod: &Pod, config: &Config) -> bool {
+    if config.vm.active_disk_storage_class.is_none() {
+        return false;
+    }
+    if pod.metadata.deletion_timestamp.is_some() {
+        return true;
+    }
+    pod.status
+        .as_ref()
+        .and_then(|s| s.reason.as_deref())
+        .is_some_and(|reason| matches!(reason, "Evicted" | "NodeShutdown" | "Shutdown"))
+}
+
+async fn delete_pod(pods: &Api<Pod>, pod: &Pod) -> Result<(), Error> {
+    let params = DeleteParams {
+        preconditions: Some(Preconditions {
+            uid: pod.uid(),
+            resource_version: pod.resource_version(),
+        }),
+        ..DeleteParams::default()
+    };
+    match pods.delete(&pod.name_any(), &params).await {
+        Ok(_) => Ok(()),
+        Err(kube::Error::Api(status)) if status.code == 404 || status.code == 409 => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+async fn ensure_active_disk(
+    ctx: &Context,
+    sandbox: &Sandbox,
+    size: Option<&Quantity>,
+) -> Result<(), Error> {
+    let (Some(class), Some(size)) = (&ctx.config.vm.active_disk_storage_class, size) else {
+        return Ok(());
+    };
+    let owner = sandbox
+        .controller_owner_ref(&())
+        .ok_or_else(|| Error::PodSpec("the sandbox has no UID yet".into()))?;
+    let claim = json!({
+        "apiVersion": "v1",
+        "kind": "PersistentVolumeClaim",
+        "metadata": {
+            "name": sandbox.name_any(),
+            "namespace": sandbox.namespace(),
+            "ownerReferences": [owner],
+        },
+        "spec": {
+            "accessModes": ["ReadWriteOnce"],
+            "storageClassName": class,
+            "volumeMode": "Filesystem",
+            "resources": {"requests": {"storage": size}},
+        },
+    });
+    let claims = Api::<PersistentVolumeClaim>::namespaced(
+        ctx.client.clone(),
+        &sandbox.namespace().unwrap_or_default(),
+    );
+    match claims
+        .create(
+            &PostParams {
+                field_manager: Some(MANAGER.into()),
+                ..PostParams::default()
+            },
+            &serde_json::from_value(claim).map_err(|error| Error::PodSpec(error.to_string()))?,
+        )
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(kube::Error::Api(status)) if status.code == 409 => {
+            let existing = claims.get(&sandbox.name_any()).await?;
+            if !super::owned_by(&existing, sandbox) {
+                return Err(Error::PodSpec(format!(
+                    "a PersistentVolumeClaim named {} that this sandbox does not own exists",
+                    sandbox.name_any()
+                )));
+            }
+            let spec = existing
+                .spec
+                .ok_or_else(|| Error::PodSpec("the active-disk PVC has no spec".into()))?;
+            if !spec
+                .access_modes
+                .iter()
+                .flatten()
+                .any(|mode| mode == "ReadWriteOnce")
+            {
+                return Err(Error::PodSpec(
+                    "the active-disk PVC does not allow ReadWriteOnce access".into(),
+                ));
+            }
+            if spec
+                .volume_mode
+                .as_deref()
+                .is_some_and(|mode| mode != "Filesystem")
+            {
+                return Err(Error::PodSpec(
+                    "the active-disk PVC is not a filesystem volume".into(),
+                ));
+            }
+            let actual_class = spec.storage_class_name.as_deref().unwrap_or_default();
+            if actual_class != class {
+                return Err(Error::PodSpec(format!(
+                    "the active-disk PVC uses StorageClass {actual_class:?}, not {class:?}"
+                )));
+            }
+            let actual_size = spec
+                .resources
+                .as_ref()
+                .and_then(|resources| resources.requests.as_ref())
+                .and_then(|requests| requests.get("storage"))
+                .ok_or_else(|| {
+                    Error::PodSpec("the active-disk PVC has no storage request".into())
+                })?;
+            if pod::parse(actual_size, "active-disk PVC storage")?
+                < pod::parse(size, "active-disk size")?
+            {
+                return Err(Error::PodSpec(format!(
+                    "the active-disk PVC requests {}, less than the required {}",
+                    actual_size.0, size.0
+                )));
+            }
+            Ok(())
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 
 /// The VM pod's ports annotation, the sandbox's `NetworkPolicy` and its Service, in
@@ -383,6 +548,7 @@ async fn plan(sandbox: &Sandbox, ctx: &Context) -> Result<Plan, Error> {
             vcpus,
             cpu: cpu_request(&ctx.config, vcpus, memory, Some(disk))?,
             disk: Some(disk_request(&ctx.config, vcpus, memory, disk)?),
+            active_disk: active_disk_size(&ctx.config, vcpus, memory, disk)?,
             memory: memory.clone(),
             placement: pod::Placement::Any,
         }));
@@ -444,6 +610,12 @@ async fn plan(sandbox: &Sandbox, ctx: &Context) -> Result<Plan, Error> {
             .as_ref()
             .map(|disk| disk_request(&ctx.config, vcpus, &memory, disk))
             .transpose()?,
+        active_disk: status
+            .disk
+            .as_ref()
+            .map(|disk| active_disk_size(&ctx.config, vcpus, &memory, disk))
+            .transpose()?
+            .flatten(),
         memory,
         placement,
     }))
@@ -729,6 +901,22 @@ fn disk_request(
         .unwrap_or_else(|| disk.clone()))
 }
 
+fn active_disk_size(
+    config: &Config,
+    vcpus: u32,
+    memory: &Quantity,
+    disk: &Quantity,
+) -> Result<Option<Quantity>, Error> {
+    if config.vm.active_disk_storage_class.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(
+        offered(config, vcpus, memory, disk)?
+            .and_then(|shape| shape.active_disk_size.clone())
+            .unwrap_or_else(|| disk.clone()),
+    ))
+}
+
 /// Sandbox status from its VM pod.
 fn observe(sandbox: &Sandbox, pod: &Pod, old: &SandboxStatus) -> SandboxStatus {
     let from = sandbox.spec.from.clone();
@@ -837,6 +1025,55 @@ fn join(parts: &[Option<&str>]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn config(active: bool) -> Config {
+        let active = if active {
+            "  activeDiskStorageClass: block\n  shapes:\n    - {vcpus: 1, memory: 1Gi, disk: 4Gi, activeDiskSize: 6Gi}\n"
+        } else {
+            ""
+        };
+        Config::from_yaml(&format!(
+            "namespaces: [sandboxes]\nvm:\n  cpuModel: host\n{active}"
+        ))
+        .unwrap()
+    }
+
+    fn pod(phase: &str, reason: Option<&str>, deleting: bool) -> Pod {
+        serde_json::from_value(json!({
+            "metadata": {
+                "name": "web",
+                "deletionTimestamp": deleting.then_some("2026-10-26T00:00:00Z"),
+                "finalizers": deleting.then_some(["test"]),
+            },
+            "spec": {"containers": [{"name": "launcher", "image": "example"}]},
+            "status": {"phase": phase, "reason": reason},
+        }))
+        .unwrap()
+    }
+
+    /// Infrastructure may remove a pod whose disk is independently durable, but a
+    /// launcher/QEMU exit is retained for diagnosis and hostPath disks cannot move.
+    #[test]
+    fn only_infrastructure_loss_with_a_pvc_is_replaceable() {
+        let durable = config(true);
+        let host_path = config(false);
+
+        assert!(replaceable(
+            &pod("Failed", Some("Evicted"), false),
+            &durable
+        ));
+        assert!(replaceable(
+            &pod("Failed", Some("NodeShutdown"), false),
+            &durable
+        ));
+        assert!(replaceable(&pod("Running", None, true), &durable));
+        assert!(!replaceable(&pod("Succeeded", None, false), &durable));
+        assert!(!replaceable(&pod("Failed", None, false), &durable));
+        assert!(!replaceable(
+            &pod("Failed", Some("Evicted"), false),
+            &host_path
+        ));
+    }
 
     /// A VM pod the kubelet evicted for disk space must fail its sandbox with the
     /// eviction, not with the launcher's exit and the serial console's tail (which

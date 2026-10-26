@@ -16,8 +16,9 @@ use std::{future::Future, time::Duration};
 
 use k8s_openapi::{
     api::{
-        core::v1::{Namespace, Node, Pod, Service},
+        core::v1::{Namespace, Node, PersistentVolume, PersistentVolumeClaim, Pod, Service},
         networking::v1::NetworkPolicy,
+        storage::v1::StorageClass,
     },
     apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition,
 };
@@ -55,9 +56,37 @@ async fn controller_runs_pins_fails_expires_and_protects() {
         .unwrap()
         .items[0]
         .name_any();
+    let storage_class = format!("savestate-test-{}", std::process::id());
+    create(
+        &Api::<StorageClass>::all(client.clone()),
+        json!({
+            "metadata": {"name": storage_class},
+            "provisioner": "kubernetes.io/no-provisioner",
+            "volumeBindingMode": "Immediate",
+        }),
+    )
+    .await;
+    let persistent_volumes = Api::<PersistentVolume>::all(client.clone());
+    for index in 0..4 {
+        create(
+            &persistent_volumes,
+            json!({
+                "metadata": {"name": format!("{storage_class}-{index}")},
+                "spec": {
+                    "capacity": {"storage": "2Gi"},
+                    "accessModes": ["ReadWriteOnce"],
+                    "persistentVolumeReclaimPolicy": "Retain",
+                    "storageClassName": storage_class,
+                    "volumeMode": "Filesystem",
+                    "hostPath": {"path": format!("/tmp/{storage_class}-{index}"), "type": "DirectoryOrCreate"},
+                },
+            }),
+        )
+        .await;
+    }
 
     let config = Config::from_yaml(&format!(
-        "namespaces: [{ns}]\nlauncherImage: {launcher}\nvm:\n  cpuModel: EPYC-Rome-v4\n  memoryOverhead: 32Mi\n"
+        "namespaces: [{ns}]\nlauncherImage: {launcher}\nvm:\n  cpuModel: EPYC-Rome-v4\n  memoryOverhead: 32Mi\n  activeDiskStorageClass: {storage_class}\n  shapes:\n    - {{vcpus: 1, memory: 64Mi, disk: 1Gi, activeDiskSize: 2Gi}}\n"
     ))
     .unwrap();
     tokio::spawn(savestate::controller::run(config));
@@ -65,6 +94,7 @@ async fn controller_runs_pins_fails_expires_and_protects() {
     let sandboxes: Api<Sandbox> = Api::namespaced(client.clone(), &ns);
     let checkpoints: Api<Checkpoint> = Api::namespaced(client.clone(), &ns);
     let pods: Api<Pod> = Api::namespaced(client.clone(), &ns);
+    let claims: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), &ns);
 
     // Playing the node agent: `base` is Ready on this node, and `child` was taken
     // from a sandbox started from `base`, so its disk builds on `base`.
@@ -114,12 +144,13 @@ async fn controller_runs_pins_fails_expires_and_protects() {
         running.then_some(sandbox)
     })
     .await;
-    let status = sandbox.status.unwrap();
+    let status = sandbox.status.as_ref().unwrap();
     assert_eq!(status.node.as_deref(), Some(node.as_str()));
-    assert_eq!(status.from.unwrap().checkpoint, "child");
+    assert_eq!(status.from.as_ref().unwrap().checkpoint, "child");
     let pod = pods.get("web-1").await.unwrap();
-    let pod_uid = pod.uid();
-    assert_eq!(pod.owner_references()[0].uid, sandbox.metadata.uid.unwrap());
+    let first_pod_uid = pod.uid().unwrap();
+    let sandbox_uid = sandbox.uid().unwrap();
+    assert_eq!(pod.owner_references()[0].uid, sandbox_uid);
     assert_eq!(
         pod.status.as_ref().unwrap().qos_class.as_deref(),
         Some("Guaranteed")
@@ -134,12 +165,10 @@ async fn controller_runs_pins_fails_expires_and_protects() {
     let container = &spec.containers[0];
     assert_eq!(container.image.as_deref(), Some(launcher.as_str()));
     let resources = serde_json::to_value(container.resources.as_ref().unwrap()).unwrap();
-    // The checkpoint's disk is reserved on the node; it is a request only (the
-    // layer is in a hostPath the kubelet does not count), so the pod stays
-    // Guaranteed.
+    // PVC mode reserves disk through the claim, not ephemeral storage on the node.
     assert_eq!(
         resources["requests"],
-        json!({"cpu": "1", "ephemeral-storage": "1Gi", "memory": "96Mi", "savestate.dev/vm": "1"})
+        json!({"cpu": "1", "memory": "96Mi", "savestate.dev/vm": "1"})
     );
     assert_eq!(
         resources["limits"],
@@ -157,6 +186,74 @@ async fn controller_runs_pins_fails_expires_and_protects() {
             ["topologyKey"],
         "kubernetes.io/hostname",
         "{affinity}"
+    );
+    let claim = claims.get("web-1").await.unwrap();
+    let claim_uid = claim.uid().unwrap();
+    assert_eq!(claim.owner_references().len(), 1);
+    let owner = &claim.owner_references()[0];
+    assert_eq!(
+        (owner.kind.as_str(), owner.name.as_str(), owner.uid.as_str()),
+        ("Sandbox", "web-1", sandbox_uid.as_str())
+    );
+    let claim_spec = claim.spec.as_ref().unwrap();
+    assert_eq!(
+        claim_spec.storage_class_name.as_deref(),
+        Some(storage_class.as_str())
+    );
+    assert_eq!(
+        claim_spec.access_modes.as_deref(),
+        Some(&["ReadWriteOnce".to_owned()][..])
+    );
+    assert_eq!(claim_spec.volume_mode.as_deref(), Some("Filesystem"));
+    assert_eq!(
+        claim_spec
+            .resources
+            .as_ref()
+            .unwrap()
+            .requests
+            .as_ref()
+            .unwrap()["storage"]
+            .0,
+        "2Gi"
+    );
+    assert!(volumes.as_array().unwrap().iter().any(|volume| {
+        volume["name"] == "active-disk" && volume["persistentVolumeClaim"]["claimName"] == "web-1"
+    }));
+    let mounts = serde_json::to_value(&container.volume_mounts).unwrap();
+    assert!(mounts.as_array().unwrap().iter().any(|mount| {
+        mount["name"] == "active-disk" && mount["mountPath"] == "/var/lib/savestate-active"
+    }));
+
+    // Infrastructure loss replaces the pod while the exact same Sandbox-owned
+    // claim survives. This is a cold boot; a launcher failure below stays terminal.
+    pods.delete("web-1", &DeleteParams::default())
+        .await
+        .unwrap();
+    let replacement = wait_for("web-1's VM pod to be replaced", || async {
+        let pod = pods.get_opt("web-1").await.unwrap()?;
+        (pod.uid().as_deref() != Some(first_pod_uid.as_str())
+            && pod
+                .status
+                .as_ref()?
+                .conditions
+                .as_ref()?
+                .iter()
+                .any(|condition| condition.type_ == "Ready" && condition.status == "True"))
+        .then_some(pod)
+    })
+    .await;
+    let pod_uid = replacement.uid().unwrap();
+    assert_eq!(
+        claims.get("web-1").await.unwrap().uid().as_deref(),
+        Some(claim_uid.as_str())
+    );
+    let volumes = serde_json::to_value(replacement.spec.unwrap().volumes).unwrap();
+    assert!(
+        volumes
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|volume| { volume["persistentVolumeClaim"]["claimName"] == "web-1" })
     );
 
     // A fork pinned to holders that cannot take it (here a node that is gone) moves
@@ -306,7 +403,11 @@ async fn controller_runs_pins_fails_expires_and_protects() {
     assert!(message.contains("exited with code 1"), "{message}");
     tokio::time::sleep(Duration::from_secs(5)).await;
     let pod = pods.get("web-1").await.unwrap();
-    assert_eq!(pod.uid(), pod_uid, "the failed VM pod was replaced");
+    assert_eq!(
+        pod.uid().as_deref(),
+        Some(pod_uid.as_str()),
+        "the failed VM pod was replaced"
+    );
 
     // A checkpoint of a sandbox that is not running, or does not exist, fails rather
     // than waiting forever for a node agent.

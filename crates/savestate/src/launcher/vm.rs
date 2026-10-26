@@ -30,7 +30,10 @@ use tokio::sync::mpsc;
 
 use super::{
     net,
-    proto::{Boot, CheckpointReply, CheckpointRequest, StartRequest, start_request::Source},
+    proto::{
+        Boot, CheckpointReply, CheckpointRequest, Restore as RestoreSource, StartRequest,
+        start_request::Source,
+    },
 };
 use crate::store::{self, MEMORY, Manifest, Store};
 
@@ -89,6 +92,9 @@ pub struct Vm {
     next_layer: u32,
     machine_args: Vec<String>,
     migration: FileMigration,
+    /// Whether the mutable disk is one self-contained file on a PVC.
+    active_disk: bool,
+    /// Direct I/O support in the node-local state directory (checkpoint targets).
     direct_io: bool,
     vcpus: u32,
     memory_mib: u64,
@@ -122,37 +128,114 @@ pub async fn start(ctx: &Context, request: StartRequest) -> anyhow::Result<Vm> {
     let store = Store::new(PathBuf::from(&request.state_dir));
     let qemu_version = probe::qemu_version(Path::new(QEMU)).context("qemu --version")?;
     let machine_type = probe::q35_machine(Path::new(QEMU)).map_err(anyhow::Error::msg)?;
-    // Disks bypass the page cache where the filesystem allows; memory files only if
-    // the installation asks.
+    // Checkpoint files bypass the page cache where the node-local filesystem allows;
+    // memory files only if the installation asks. A PVC may be a different
+    // filesystem, so probe its directory separately for QEMU's active disk.
     let direct_io = probe::direct_io(&store.layers());
     let memory_direct_io = request.memory_file_direct_io && direct_io;
     let layer0 = store::layer_id(&request.layer_prefix, 0);
-    let layer0_path = store.layer(&layer0);
+    let active_disk =
+        (!request.active_disk.is_empty()).then(|| PathBuf::from(&request.active_disk));
+    let active_exists = active_disk.as_ref().is_some_and(|path| path.is_file());
+    let layer0_path = active_disk.clone().unwrap_or_else(|| store.layer(&layer0));
+    let disk_direct_io = active_disk
+        .as_deref()
+        .and_then(Path::parent)
+        .map_or(direct_io, probe::direct_io);
 
     let (machine, restore) = match source {
         Source::Boot(boot) => {
-            let machine = boot_machine(ctx, &store, &boot, &machine_type, &layer0_path).await?;
+            let machine = boot_machine(
+                ctx,
+                &store,
+                &boot,
+                &machine_type,
+                &layer0_path,
+                active_disk.is_some(),
+                active_exists,
+            )
+            .await?;
             (machine, None)
         }
         Source::Restore(restore) => {
             let dir = PathBuf::from(&restore.checkpoint_dir);
             let manifest = store::read_manifest(&dir)?;
-            let machine =
-                restore_machine(&manifest, &qemu_version, &machine_type, &layer0_path).await?;
-            (machine, Some((restore, dir, manifest)))
+            let machine = restore_machine(
+                &store,
+                &manifest,
+                &qemu_version,
+                &machine_type,
+                &layer0_path,
+                active_disk.is_some(),
+                active_exists,
+            )
+            .await?;
+            // A replacement pod cold-boots the durable disk. Loading the source
+            // checkpoint's RAM again would discard everything done since restore.
+            let restore = (!active_exists).then_some((restore, dir, manifest));
+            (machine, restore)
         }
     };
-    let qmp = spawn_qemu(ctx, &request, &machine, &layer0_path, direct_io).await?;
+    let qmp = spawn_qemu(ctx, &request, &machine, &layer0_path, disk_direct_io).await?;
     let guest = Client::vsock(request.vsock_cid);
-    let hostname = hostname(&request.sandbox);
+    ready_guest(
+        ctx,
+        &request,
+        &qmp,
+        &guest,
+        restore.as_ref(),
+        memory_direct_io,
+    )
+    .await?;
 
+    let mut chain = machine.chain;
+    if active_disk.is_none() {
+        chain.push(store::layer_path(&layer0));
+    }
+    Ok(Vm {
+        qmp,
+        qemu_pid: ctx.qemu_pid.load(Ordering::SeqCst),
+        guest,
+        store,
+        layer_prefix: request.layer_prefix,
+        image: machine.image,
+        top_node: "disk0".into(),
+        chain,
+        next_layer: 1,
+        machine_args: machine.machine_args,
+        migration: FileMigration {
+            multifd_channels: MULTIFD_CHANNELS,
+            direct_io: memory_direct_io,
+        },
+        active_disk: active_disk.is_some(),
+        direct_io,
+        vcpus: machine.vcpus,
+        memory_mib: machine.memory_mib,
+        disk_bytes: machine.disk_bytes,
+        sandbox: request.sandbox,
+        qemu_version,
+        machine_type,
+        cpu_model: machine.cpu_model,
+        done: HashMap::new(),
+    })
+}
+
+async fn ready_guest(
+    ctx: &Context,
+    request: &StartRequest,
+    qmp: &Qmp,
+    guest: &Client,
+    restore: Option<&(RestoreSource, PathBuf, Manifest)>,
+    memory_direct_io: bool,
+) -> anyhow::Result<()> {
+    let hostname = hostname(&request.sandbox);
     let started = Instant::now();
-    if let Some((restore, dir, manifest)) = &restore {
+    if let Some((restore, dir, manifest)) = restore {
         let migration = FileMigration {
             multifd_channels: manifest.migration.multifd_channels,
             direct_io: memory_direct_io,
         };
-        migration::load_from_file(&qmp, &dir.join(MEMORY), migration, POLL)
+        migration::load_from_file(qmp, &dir.join(MEMORY), migration, POLL)
             .await
             .context("loading the checkpoint's memory")?;
         qmp.cont().await?;
@@ -160,7 +243,7 @@ pub async fn start(ctx: &Context, request: StartRequest) -> anyhow::Result<Vm> {
             loaded_ms = started.elapsed().as_millis(),
             "restored; guest running"
         );
-        wait_for_agent(&guest, RESTORE_TIMEOUT).await?;
+        wait_for_agent(guest, RESTORE_TIMEOUT).await?;
         let wall_clock_unix_ns = if restore.stepped {
             i64::try_from(jiff::Timestamp::now().as_nanosecond()).unwrap_or(i64::MAX)
         } else {
@@ -178,8 +261,8 @@ pub async fn start(ctx: &Context, request: StartRequest) -> anyhow::Result<Vm> {
             .context("post-restore fixups timed out")?
             .context("post-restore fixups")?;
     } else {
-        wait_for_agent(&guest, BOOT_TIMEOUT).await?;
-        sh(&guest, &net::guest_script(&ctx.dns, &hostname))
+        wait_for_agent(guest, BOOT_TIMEOUT).await?;
+        sh(guest, &net::guest_script(&ctx.dns, &hostname))
             .await
             .context("configuring the guest's network")?;
     }
@@ -188,33 +271,7 @@ pub async fn start(ctx: &Context, request: StartRequest) -> anyhow::Result<Vm> {
         "guest agent ready"
     );
 
-    let mut chain = machine.chain;
-    chain.push(store::layer_path(&layer0));
-    Ok(Vm {
-        qmp,
-        qemu_pid: ctx.qemu_pid.load(Ordering::SeqCst),
-        guest,
-        store,
-        layer_prefix: request.layer_prefix,
-        image: machine.image,
-        top_node: "disk0".into(),
-        chain,
-        next_layer: 1,
-        machine_args: machine.machine_args,
-        migration: FileMigration {
-            multifd_channels: MULTIFD_CHANNELS,
-            direct_io: memory_direct_io,
-        },
-        direct_io,
-        vcpus: machine.vcpus,
-        memory_mib: machine.memory_mib,
-        disk_bytes: machine.disk_bytes,
-        sandbox: request.sandbox,
-        qemu_version,
-        machine_type,
-        cpu_model: machine.cpu_model,
-        done: HashMap::new(),
-    })
+    Ok(())
 }
 
 /// A fresh machine on a first layer over the base image.
@@ -224,22 +281,30 @@ async fn boot_machine(
     boot: &Boot,
     machine_type: &str,
     layer0: &Path,
+    active_disk: bool,
+    active_exists: bool,
 ) -> anyhow::Result<Planned> {
     let image = store.root().join(&boot.image);
     ensure!(image.exists(), "base image {} is missing", image.display());
-    qemu_img(&[
-        "create",
-        "-q",
-        "-f",
-        "qcow2",
-        "-F",
-        "qcow2",
-        "-b",
-        &format!("../{}", boot.image),
-        &layer0.display().to_string(),
-        &boot.disk_bytes.to_string(),
-    ])
-    .await?;
+    if active_disk {
+        if !active_exists {
+            materialize_disk(&image, layer0, boot.disk_bytes).await?;
+        }
+    } else {
+        qemu_img(&[
+            "create",
+            "-q",
+            "-f",
+            "qcow2",
+            "-F",
+            "qcow2",
+            "-b",
+            &format!("../{}", boot.image),
+            &layer0.display().to_string(),
+            &boot.disk_bytes.to_string(),
+        ])
+        .await?;
+    }
     // A named model must run in full on this host, never silently weakened.
     let cpu = if boot.cpu_model == HOST_CPU {
         HOST_CPU.to_owned()
@@ -278,10 +343,13 @@ async fn boot_machine(
 
 /// The checkpoint's machine, on a first layer over the checkpoint's frozen layer.
 async fn restore_machine(
+    store: &Store,
     manifest: &Manifest,
     qemu_version: &str,
     machine_type: &str,
     layer0: &Path,
+    active_disk: bool,
+    active_exists: bool,
 ) -> anyhow::Result<Planned> {
     let fingerprint = &manifest.fingerprint;
     ensure!(
@@ -300,22 +368,32 @@ async fn restore_machine(
     let frozen = manifest
         .chain
         .last()
-        .and_then(|layer| layer.strip_prefix("layers/"))
         .context("the checkpoint's chain has no layer")?;
-    qemu_img(&[
-        "create",
-        "-q",
-        "-f",
-        "qcow2",
-        "-F",
-        "qcow2",
-        "-b",
-        frozen,
-        &layer0.display().to_string(),
-    ])
-    .await?;
+    if active_disk {
+        if !active_exists {
+            materialize_disk(&store.root().join(frozen), layer0, manifest.disk_bytes).await?;
+        }
+    } else {
+        let frozen = frozen.strip_prefix("layers/").unwrap_or(frozen);
+        qemu_img(&[
+            "create",
+            "-q",
+            "-f",
+            "qcow2",
+            "-F",
+            "qcow2",
+            "-b",
+            frozen,
+            &layer0.display().to_string(),
+        ])
+        .await?;
+    }
     Ok(Planned {
-        kind: LaunchKind::Restore { generation: 0 },
+        kind: if active_exists {
+            LaunchKind::Boot
+        } else {
+            LaunchKind::Restore { generation: 0 }
+        },
         machine_args: manifest.machine_args.clone(),
         image: manifest.image.clone(),
         chain: manifest.chain.clone(),
@@ -324,6 +402,47 @@ async fn restore_machine(
         disk_bytes: manifest.disk_bytes,
         cpu_model: fingerprint.cpu_model.clone(),
     })
+}
+
+/// Atomically creates a self-contained qcow2 active disk from `source`. A partial
+/// conversion is never mistaken for a durable disk by a replacement pod.
+async fn materialize_disk(
+    source: &Path,
+    destination: &Path,
+    disk_bytes: u64,
+) -> anyhow::Result<()> {
+    let part = destination.with_extension("qcow2.part");
+    let _ = std::fs::remove_file(&part);
+    let result = async {
+        qemu_img(&[
+            "convert",
+            "-q",
+            "-f",
+            "qcow2",
+            "-O",
+            "qcow2",
+            &source.display().to_string(),
+            &part.display().to_string(),
+        ])
+        .await?;
+        qemu_img(&[
+            "resize",
+            "-q",
+            "-f",
+            "qcow2",
+            &part.display().to_string(),
+            &disk_bytes.to_string(),
+        ])
+        .await?;
+        std::fs::File::open(&part)?.sync_all()?;
+        fsutil::rename_durable(&part, destination)?;
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    if result.is_err() {
+        let _ = std::fs::remove_file(&part);
+    }
+    result
 }
 
 /// Starts QEMU (its serial console on a FIFO the launcher copies to stdout), has the
@@ -427,6 +546,22 @@ impl Vm {
 
         let paused = Instant::now();
         self.qmp.stop().await?;
+        if self.active_disk {
+            let saved = self
+                .save_active_disk(&dir, request, guest_time_unix_ns, paused)
+                .await;
+            // save_active_disk resumes as soon as the memory file is complete so
+            // its block backup can finish in the background. Earlier failures
+            // (creating or attaching the target, or starting the job) happen while
+            // QEMU is still stopped, so resume here as a best effort. Calling cont
+            // on an already running VM is harmless and its error is intentionally
+            // ignored on an error path.
+            if saved.is_err() {
+                let _ = migration::cancel_outgoing(&self.qmp, POLL).await;
+                let _ = self.qmp.cont().await;
+            }
+            return saved;
+        }
         let saved = self.save_stopped(&dir, request, guest_time_unix_ns).await;
         if saved.is_err() {
             let _ = migration::cancel_outgoing(&self.qmp, POLL).await;
@@ -438,6 +573,158 @@ impl Vm {
         let pause_ms = millis(paused.elapsed());
         tracing::info!(id = request.id, pause_ms, save_ms, "checkpoint saved");
         Ok(CheckpointReply { pause_ms, save_ms })
+    }
+
+    /// Saves a PVC-backed disk without making it a backing chain. The full block
+    /// backup starts while the VM is stopped, fixing its point in time; after RAM is
+    /// saved the guest resumes while QEMU finishes copying unchanged blocks.
+    async fn save_active_disk(
+        &mut self,
+        dir: &Path,
+        request: &CheckpointRequest,
+        guest_time_unix_ns: Option<i64>,
+        paused: Instant,
+    ) -> anyhow::Result<CheckpointReply> {
+        let (id, path) = loop {
+            let id = store::layer_id(&self.layer_prefix, self.next_layer);
+            let path = self.store.layer(&id);
+            if !path.exists() {
+                break (id, path);
+            }
+            self.next_layer += 1;
+        };
+        let created = qemu_img(&[
+            "create",
+            "-q",
+            "-f",
+            "qcow2",
+            &path.display().to_string(),
+            &self.disk_bytes.to_string(),
+        ])
+        .await;
+        if let Err(error) = created {
+            let _ = std::fs::remove_file(&path);
+            return Err(error);
+        }
+        let node = format!("checkpoint-disk{}", self.next_layer);
+        let job = format!("checkpoint-backup{}", self.next_layer);
+        let cache = serde_json::json!({ "direct": self.direct_io });
+        let added = self
+            .qmp
+            .blockdev_add(serde_json::json!({
+                "driver": "qcow2",
+                "node-name": node,
+                "discard": "unmap",
+                "cache": cache,
+                "file": {
+                    "driver": "file",
+                    "filename": path,
+                    "aio": if self.direct_io { "native" } else { "threads" },
+                    "cache": cache,
+                },
+            }))
+            .await;
+        if let Err(error) = added {
+            let _ = std::fs::remove_file(&path);
+            return Err(error.into());
+        }
+        if let Err(error) = self.qmp.blockdev_backup(&job, &self.top_node, &node).await {
+            let _ = self.qmp.blockdev_del(&node).await;
+            let _ = std::fs::remove_file(&path);
+            return Err(error.into());
+        }
+
+        let memory = dir.join(MEMORY);
+        let started = Instant::now();
+        let saved = migration::save_to_file(&self.qmp, &memory, POLL, |_| Ok(())).await;
+        let save_ms = millis(started.elapsed());
+        if saved.is_err() {
+            let _ = migration::cancel_outgoing(&self.qmp, POLL).await;
+        }
+        let resumed = self.qmp.cont().await;
+        let pause_ms = millis(paused.elapsed());
+        if let Err(error) = saved {
+            self.cancel_backup(&job, &node, &path).await;
+            return Err(error.into());
+        }
+        if let Err(error) = resumed {
+            self.cancel_backup(&job, &node, &path).await;
+            return Err(error.into());
+        }
+
+        if let Err(error) = self.wait_for_backup(&job).await {
+            self.cancel_backup(&job, &node, &path).await;
+            return Err(error);
+        }
+        if let Err(error) = self.qmp.job_dismiss(&job).await {
+            self.cancel_backup(&job, &node, &path).await;
+            return Err(error.into());
+        }
+        if let Err(error) = self.qmp.blockdev_del(&node).await {
+            self.cancel_backup(&job, &node, &path).await;
+            return Err(error.into());
+        }
+        if let Err(error) = std::fs::File::open(&path).and_then(|file| file.sync_all()) {
+            let _ = std::fs::remove_file(&path);
+            return Err(error.into());
+        }
+        set_read_only(&path);
+        self.next_layer += 1;
+
+        let base = self.chain.first().cloned().context("empty chain")?;
+        let chain = vec![base, store::layer_path(&id)];
+        self.write_manifest(dir, request, guest_time_unix_ns, chain, &memory, &path)?;
+        tracing::info!(id = request.id, pause_ms, save_ms, "checkpoint saved");
+        Ok(CheckpointReply { pause_ms, save_ms })
+    }
+
+    async fn wait_for_backup(&self, job: &str) -> anyhow::Result<()> {
+        loop {
+            let jobs = self.qmp.query_jobs().await?;
+            let info = jobs
+                .iter()
+                .find(|info| info.id == job)
+                .with_context(|| format!("block backup job {job} disappeared"))?;
+            match info.status.as_str() {
+                "created" | "running" | "waiting" | "pending" => {}
+                "concluded" => {
+                    ensure!(
+                        info.error.is_none(),
+                        "block backup job {job}: {}",
+                        info.error.as_deref().unwrap_or_default()
+                    );
+                    return Ok(());
+                }
+                status => {
+                    bail!(
+                        "block backup job {job} entered unexpected state {status}: {}",
+                        info.error.as_deref().unwrap_or("no error reported")
+                    );
+                }
+            }
+            tokio::time::sleep(POLL).await;
+        }
+    }
+
+    async fn cancel_backup(&self, job: &str, node: &str, path: &Path) {
+        let _ = self.qmp.job_cancel(job).await;
+        loop {
+            match self.qmp.query_jobs().await {
+                Ok(jobs) => {
+                    let Some(info) = jobs.iter().find(|info| info.id == job) else {
+                        break;
+                    };
+                    if info.status == "concluded" {
+                        let _ = self.qmp.job_dismiss(job).await;
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+            tokio::time::sleep(POLL).await;
+        }
+        let _ = self.qmp.blockdev_del(node).await;
+        let _ = std::fs::remove_file(path);
     }
 
     /// The part of a checkpoint during which the guest is paused, up to the memory
@@ -453,6 +740,7 @@ impl Vm {
         let id = store::layer_id(&self.layer_prefix, self.next_layer);
         let path = self.store.layer(&id);
         let frozen = self.chain.last().cloned().context("empty chain")?;
+        let checkpoint_chain = self.chain.clone();
         let frozen_file = frozen.strip_prefix("layers/").unwrap_or(&frozen);
         // -u: the current layer is open for writing; the size is given instead.
         qemu_img(&[
@@ -489,7 +777,6 @@ impl Vm {
         self.qmp.blockdev_snapshot(&self.top_node, &node).await?;
         self.top_node = node;
         self.next_layer += 1;
-        let chain = self.chain.clone();
         self.chain.push(store::layer_path(&id));
         let frozen_path = self.store.root().join(&frozen);
         set_read_only(&frozen_path);
@@ -498,6 +785,26 @@ impl Vm {
         let started = Instant::now();
         migration::save_to_file(&self.qmp, &memory, POLL, |_| Ok(())).await?;
         let save_ms = millis(started.elapsed());
+        self.write_manifest(
+            dir,
+            request,
+            guest_time_unix_ns,
+            checkpoint_chain,
+            &memory,
+            &frozen_path,
+        )?;
+        Ok(save_ms)
+    }
+
+    fn write_manifest(
+        &self,
+        dir: &Path,
+        request: &CheckpointRequest,
+        guest_time_unix_ns: Option<i64>,
+        chain: Vec<String>,
+        memory: &Path,
+        layer: &Path,
+    ) -> anyhow::Result<()> {
         let fingerprint = Fingerprint {
             launcher_image: request.launcher_image.clone(),
             qemu: self.qemu_version.clone(),
@@ -519,13 +826,13 @@ impl Vm {
             chain,
             machine_args: self.machine_args.clone(),
             migration: self.migration,
-            memory_bytes: store::allocated(&memory),
-            layer_bytes: store::allocated(&frozen_path),
+            memory_bytes: store::allocated(memory),
+            layer_bytes: store::allocated(layer),
             fingerprint,
         };
         // Last: its presence marks the save complete.
         fsutil::write_json_atomic(&dir.join(orbd_vm::checkpoint::MANIFEST), &manifest)?;
-        Ok(save_ms)
+        Ok(())
     }
 }
 

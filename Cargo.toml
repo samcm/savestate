@@ -52,9 +52,9 @@ savestate-guest-proto = { path = "crates/savestate-guest-proto", default-feature
 savestate-objstore = { path = "crates/savestate-objstore" }
 
 # orbd's shared QEMU and guest-agent crates, pinned to one revision.
-orbd-guest = { git = "https://github.com/samcm/orbd", rev = "5c7658c834713db11642208eb2ac2d1036df4b2d" }
-orbd-qemu = { git = "https://github.com/samcm/orbd", rev = "5c7658c834713db11642208eb2ac2d1036df4b2d" }
-orbd-vm = { git = "https://github.com/samcm/orbd", rev = "5c7658c834713db11642208eb2ac2d1036df4b2d" }
+orbd-guest = { git = "https://github.com/samcm/orbd", rev = "9151e285608ea706aed22be8804776a972a82afe" }
+orbd-qemu = { git = "https://github.com/samcm/orbd", rev = "9151e285608ea706aed22be8804776a972a82afe" }
+orbd-vm = { git = "https://github.com/samcm/orbd", rev = "9151e285608ea706aed22be8804776a972a82afe" }
 
 anyhow = "1"
 base64 = "0.23"

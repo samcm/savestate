@@ -453,7 +453,7 @@ async fn checkpoint_fork_and_resume_exactly() {
     // node-local, self-contained full qcow2 layer and the RAM file in the manifest.
     let checkpoint_uid = checkpoints.get("web-1").await.unwrap().uid().unwrap();
     let manifest: serde_json::Value = serde_json::from_str(
-        &sh_pod(
+        &sh_pod_ok(
             &client,
             &ns,
             "web",
@@ -471,7 +471,7 @@ async fn checkpoint_fork_and_resume_exactly() {
     let frozen = chain[1].as_str().unwrap();
     assert!(frozen.starts_with("layers/"), "{manifest}");
     let info: serde_json::Value = serde_json::from_str(
-        &sh_pod(
+        &sh_pod_ok(
             &client,
             &ns,
             "web",
@@ -1363,6 +1363,25 @@ async fn sh_pod(client: &Client, ns: &str, pod: &str, script: &str) -> String {
         .unwrap();
     process.join().await.unwrap();
     out
+}
+
+/// Like [`sh_pod`], but includes stderr and fails with the command's output when the
+/// shell command fails. Kubernetes exec does not otherwise expose the shell's status
+/// through kube-rs's joined process.
+async fn sh_pod_ok(client: &Client, ns: &str, pod: &str, script: &str) -> String {
+    const MARKER: &str = "__SAVESTATE_E2E_STATUS=";
+    let checked = format!("{{ {script}; }} 2>&1\nstatus=$?\nprintf '\\n{MARKER}%s\\n' \"$status\"");
+    let output = sh_pod(client, ns, pod, &checked).await;
+    let (stdout, status) = output
+        .rsplit_once(MARKER)
+        .unwrap_or_else(|| panic!("command did not report its status: {script:?}: {output:?}"));
+    assert_eq!(
+        status.trim(),
+        "0",
+        "command failed in pod {pod}: {script:?}: {}",
+        stdout.trim()
+    );
+    stdout.strip_suffix('\n').unwrap_or(stdout).to_owned()
 }
 
 fn secs(since: Instant) -> f64 {

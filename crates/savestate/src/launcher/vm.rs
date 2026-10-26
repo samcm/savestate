@@ -550,11 +550,9 @@ impl Vm {
             let saved = self
                 .save_active_disk(&dir, request, guest_time_unix_ns, paused)
                 .await;
-            // save_active_disk resumes as soon as the memory file is complete so
-            // its block backup can finish in the background. Earlier failures
-            // (creating or attaching the target, or starting the job) happen while
-            // QEMU is still stopped, so resume here as a best effort. Calling cont
-            // on an already running VM is harmless and its error is intentionally
+            // save_active_disk normally resumes the VM. On any earlier failure it
+            // leaves QEMU stopped, so resume here as a best effort. Calling cont on
+            // an already running VM is harmless and its error is intentionally
             // ignored on an error path.
             if saved.is_err() {
                 let _ = migration::cancel_outgoing(&self.qmp, POLL).await;
@@ -576,8 +574,9 @@ impl Vm {
     }
 
     /// Saves a PVC-backed disk without making it a backing chain. The full block
-    /// backup starts while the VM is stopped, fixing its point in time; after RAM is
-    /// saved the guest resumes while QEMU finishes copying unchanged blocks.
+    /// backup and RAM save both finish while the VM is stopped, so they describe the
+    /// same point in time. QEMU cannot inactivate its block graph at RAM migration's
+    /// switchover while a backup job is still using it.
     async fn save_active_disk(
         &mut self,
         dir: &Path,
@@ -634,24 +633,6 @@ impl Vm {
             return Err(error.into());
         }
 
-        let memory = dir.join(MEMORY);
-        let started = Instant::now();
-        let saved = migration::save_to_file(&self.qmp, &memory, POLL, |_| Ok(())).await;
-        let save_ms = millis(started.elapsed());
-        if saved.is_err() {
-            let _ = migration::cancel_outgoing(&self.qmp, POLL).await;
-        }
-        let resumed = self.qmp.cont().await;
-        let pause_ms = millis(paused.elapsed());
-        if let Err(error) = saved {
-            self.cancel_backup(&job, &node, &path).await;
-            return Err(error.into());
-        }
-        if let Err(error) = resumed {
-            self.cancel_backup(&job, &node, &path).await;
-            return Err(error.into());
-        }
-
         if let Err(error) = self.wait_for_backup(&job).await {
             self.cancel_backup(&job, &node, &path).await;
             return Err(error);
@@ -669,6 +650,24 @@ impl Vm {
             return Err(error.into());
         }
         set_read_only(&path);
+
+        let memory = dir.join(MEMORY);
+        let started = Instant::now();
+        let saved = migration::save_to_file(&self.qmp, &memory, POLL, |_| Ok(())).await;
+        let save_ms = millis(started.elapsed());
+        if saved.is_err() {
+            let _ = migration::cancel_outgoing(&self.qmp, POLL).await;
+        }
+        let resumed = self.qmp.cont().await;
+        let pause_ms = millis(paused.elapsed());
+        if let Err(error) = saved {
+            let _ = std::fs::remove_file(&path);
+            return Err(error.into());
+        }
+        if let Err(error) = resumed {
+            let _ = std::fs::remove_file(&path);
+            return Err(error.into());
+        }
         self.next_layer += 1;
 
         let base = self.chain.first().cloned().context("empty chain")?;

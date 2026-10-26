@@ -732,11 +732,18 @@ Checkpoint (sandbox keeps running):
    was 6.8 s. On a devnet guest with a large page cache the file went from 5.75 GiB
    to 2.87 GiB; where the RAM is genuinely in use it changes little.
 2. `stop`.
-3. `blockdev-snapshot`: a new overlay becomes the sandbox's active disk; the previous
-   top layer is now immutable and belongs to the checkpoint. The overlay is created
-   with `qemu-img create -f qcow2 -u -b <top layer> -F qcow2 <new> <size>` (`-u` and
-   an explicit size, so `qemu-img` does not open the layer the running QEMU has open)
+3. With a node-local active disk, `blockdev-snapshot`: a new overlay becomes the
+   sandbox's active disk; the previous top layer is now immutable and belongs to the
+   checkpoint. The overlay is created with
+   `qemu-img create -f qcow2 -u -b <top layer> -F qcow2 <new> <size>` (`-u` and an
+   explicit size, so `qemu-img` does not open the layer the running QEMU has open)
    and added with `blockdev-add` (`"backing": null`) before `blockdev-snapshot`.
+   With a PVC-backed active disk, `blockdev-backup` instead makes a full point-in-time
+   qcow2 copy on the node-local state disk. The full job finishes while the guest is
+   stopped: QEMU cannot inactivate the block graph at RAM migration's switchover while
+   a backup job is using it, and finishing both saves under one pause keeps RAM and
+   disk from exactly the same point in time. The copied qcow2 has no backing file, so
+   manifests, exports, imports and restores retain the existing portable format.
 4. Migrate to a file with `multifd` + `mapped-ram` (with `direct-io` only if
    `vm.memoryFileDirectIo`: on cloud VMs' local disks a save through the page cache
    wrote about 700 MB/s against 250 MB/s with O_DIRECT, pausing devnet guests 5.8 s

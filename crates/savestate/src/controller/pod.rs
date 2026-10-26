@@ -73,13 +73,15 @@ pub(super) fn build(sandbox: &Sandbox, vm: &Vm, config: &Config) -> Result<Pod, 
     // Root with exactly what the launcher uses before it drops to the QEMU user for
     // good: NET_ADMIN for the tap device, forwarding and nftables in its own network
     // namespace; CHOWN to hand its run directory to the QEMU user; SETUID and SETGID
-    // to become it. The seccomp profile, installed by the node agent, is the runtime's
-    // default plus AF_VSOCK sockets, the guest agent's channel.
+    // to become it. KILL lets the image's init (root) pass SIGTERM on to the launcher,
+    // which then runs as the QEMU user, so it stops QEMU and says why it stopped. The
+    // seccomp profile, installed by the node agent, is the runtime's default plus
+    // AF_VSOCK sockets, the guest agent's channel.
     let security = json!({
         "runAsUser": 0,
         "allowPrivilegeEscalation": false,
         "readOnlyRootFilesystem": true,
-        "capabilities": {"drop": ["ALL"], "add": ["NET_ADMIN", "CHOWN", "SETUID", "SETGID"]},
+        "capabilities": {"drop": ["ALL"], "add": ["NET_ADMIN", "CHOWN", "SETUID", "SETGID", "KILL"]},
         "seccompProfile": {"type": "Localhost", "localhostProfile": SECCOMP_PROFILE},
     });
     let mut args = vec!["launcher".to_owned()];

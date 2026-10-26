@@ -725,17 +725,25 @@ fn observe(sandbox: &Sandbox, pod: &Pod, old: &SandboxStatus) -> SandboxStatus {
         .flatten()
         .find(|c| c.name == "launcher");
     if matches!(status.phase.as_deref(), Some("Failed" | "Succeeded")) {
-        let exit = container
-            .and_then(|c| c.state.as_ref()?.terminated.as_ref())
-            .map(|t| {
-                format!(
-                    "the launcher exited with code {} ({})",
-                    t.exit_code,
-                    join(&[t.reason.as_deref(), t.message.as_deref()])
-                )
-            });
-        let reason = join(&[status.reason.as_deref(), status.message.as_deref()]);
-        let message = exit.unwrap_or(format!("the VM pod stopped ({reason})"));
+        let terminated = container.and_then(|c| c.state.as_ref()?.terminated.as_ref());
+        // A reason on the pod (`Evicted`, `NodeShutdown`, …) is why the kubelet
+        // stopped it; the launcher's exit and its termination message (which falls
+        // back to the serial console's tail) only follow from that.
+        let message = match (status.reason.as_deref(), terminated) {
+            (Some(reason), _) => format!(
+                "the VM pod stopped ({})",
+                join(&[Some(reason), status.message.as_deref()])
+            ),
+            (None, Some(t)) => format!(
+                "the launcher exited with code {} ({})",
+                t.exit_code,
+                join(&[t.reason.as_deref(), t.message.as_deref()])
+            ),
+            (None, None) => format!(
+                "the VM pod stopped ({})",
+                status.message.as_deref().unwrap_or("no reason given")
+            ),
+        };
         return failed(sandbox, node, message);
     }
 
@@ -806,4 +814,49 @@ fn join(parts: &[Option<&str>]) -> String {
         .copied()
         .collect::<Vec<_>>()
         .join(": ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A VM pod the kubelet evicted for disk space must fail its sandbox with the
+    /// eviction, not with the launcher's exit and the serial console's tail (which
+    /// may show an earlier, harmless guest OOM kill) that it falls back to.
+    #[test]
+    fn an_evicted_pod_fails_its_sandbox_with_the_eviction() {
+        let sandbox: Sandbox = serde_json::from_value(json!({
+            "apiVersion": "savestate.dev/v1alpha1", "kind": "Sandbox",
+            "metadata": {"name": "web-1", "namespace": "sandboxes", "uid": "u1"},
+            "spec": {"image": "ghcr.io/example/base@sha256:00", "vcpus": 1, "memory": "1Gi", "disk": "4Gi"},
+        }))
+        .unwrap();
+        let pod: Pod = serde_json::from_value(json!({
+            "metadata": {"name": "web-1"},
+            "spec": {"nodeName": "node-a", "containers": []},
+            "status": {
+                "phase": "Failed",
+                "reason": "Evicted",
+                "message": "The node was low on resource: ephemeral-storage.",
+                "containerStatuses": [{
+                    "name": "launcher", "image": "i", "imageID": "", "ready": false, "restartCount": 0,
+                    "state": {"terminated": {"exitCode": 1, "reason": "Error",
+                        "message": "[ 4407.2] Out of memory: Killed process 216 (node)"}},
+                }],
+            },
+        }))
+        .unwrap();
+        let running = SandboxStatus {
+            phase: SandboxPhase::Running,
+            ..SandboxStatus::default()
+        };
+
+        let status = observe(&sandbox, &pod, &running);
+
+        assert_eq!(status.phase, SandboxPhase::Failed);
+        assert_eq!(
+            status.message.as_deref(),
+            Some("the VM pod stopped (Evicted: The node was low on resource: ephemeral-storage.)")
+        );
+    }
 }

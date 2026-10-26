@@ -11,7 +11,7 @@ Nodes that run VMs need KVM, `/dev/net/tun`, `/dev/vhost-vsock` (the node agent'
 `load-modules` init container runs `modprobe vhost_vsock` where it is missing, from
 the host's `/lib/modules`), and a disk for `stateDir`. VM pods are never privileged: the node
 agent hands them those devices as a kubelet device plugin. Their launcher container
-runs as root with only `NET_ADMIN`, `CHOWN`, `SETUID` and `SETGID`, no privilege
+runs as root with only `NET_ADMIN`, `CHOWN`, `SETUID`, `SETGID` and `KILL`, no privilege
 escalation, a read-only root filesystem and the seccomp profile
 `savestate/vm.json` (the container runtime's default plus `AF_VSOCK` sockets), and
 drops to uid 65532 before starting QEMU, which applies its own seccomp filter.

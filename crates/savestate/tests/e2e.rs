@@ -94,6 +94,7 @@ async fn checkpoint_fork_and_resume_exactly() {
         .await
         .unwrap();
     let pod_spec = pod.spec.as_ref().unwrap();
+    let web_node = pod_spec.node_name.as_deref().unwrap().to_owned();
     let container = &pod_spec.containers[0];
     let security = serde_json::to_value(&container.security_context).unwrap();
     report(&format!("VM pod security context: {security}"));
@@ -453,10 +454,9 @@ async fn checkpoint_fork_and_resume_exactly() {
     // node-local, self-contained full qcow2 layer and the RAM file in the manifest.
     let checkpoint_uid = checkpoints.get("web-1").await.unwrap().uid().unwrap();
     let manifest: serde_json::Value = serde_json::from_str(
-        &sh_pod_ok(
+        &sh_node_ok(
             &client,
-            &ns,
-            "web",
+            &web_node,
             &format!("cat /var/lib/savestate/checkpoints/{checkpoint_uid}/manifest.json"),
         )
         .await,
@@ -471,10 +471,9 @@ async fn checkpoint_fork_and_resume_exactly() {
     let frozen = chain[1].as_str().unwrap();
     assert!(frozen.starts_with("layers/"), "{manifest}");
     let info: serde_json::Value = serde_json::from_str(
-        &sh_pod_ok(
+        &sh_node_ok(
             &client,
-            &ns,
-            "web",
+            &web_node,
             &format!("qemu-img info --output=json /var/lib/savestate/{frozen}"),
         )
         .await,
@@ -1354,8 +1353,18 @@ async fn peak_mib(client: &Client, ns: &str, pod: &str) -> u64 {
 
 /// `sh -c script` in a VM pod's launcher container (not the guest); its stdout.
 async fn sh_pod(client: &Client, ns: &str, pod: &str, script: &str) -> String {
+    sh_container(client, ns, pod, "launcher", script).await
+}
+
+async fn sh_container(
+    client: &Client,
+    ns: &str,
+    pod: &str,
+    container: &str,
+    script: &str,
+) -> String {
     let pods: Api<Pod> = Api::namespaced(client.clone(), ns);
-    let params = AttachParams::default().container("launcher").stderr(false);
+    let params = AttachParams::default().container(container).stderr(false);
     let mut process = pods.exec(pod, ["sh", "-c", script], &params).await.unwrap();
     let mut out = String::new();
     tokio::io::AsyncReadExt::read_to_string(&mut process.stdout().unwrap(), &mut out)
@@ -1365,20 +1374,32 @@ async fn sh_pod(client: &Client, ns: &str, pod: &str, script: &str) -> String {
     out
 }
 
-/// Like [`sh_pod`], but includes stderr and fails with the command's output when the
-/// shell command fails. Kubernetes exec does not otherwise expose the shell's status
-/// through kube-rs's joined process.
-async fn sh_pod_ok(client: &Client, ns: &str, pod: &str, script: &str) -> String {
+/// `sh -c script` in the node agent on `node`; its stdout. The agent owns the
+/// node-local state directory, which deliberately is not readable by VM pods.
+async fn sh_node_ok(client: &Client, node: &str, script: &str) -> String {
     const MARKER: &str = "__SAVESTATE_E2E_STATUS=";
+    let pods: Api<Pod> = Api::namespaced(client.clone(), "savestate-system");
+    let params = ListParams::default()
+        .labels("app.kubernetes.io/name=savestate,app.kubernetes.io/component=node")
+        .fields(&format!("spec.nodeName={node}"));
+    let pod = pods
+        .list(&params)
+        .await
+        .unwrap()
+        .items
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| panic!("no savestate node agent on {node}"));
+    let pod = pod.name_any();
     let checked = format!("{{ {script}; }} 2>&1\nstatus=$?\nprintf '\\n{MARKER}%s\\n' \"$status\"");
-    let output = sh_pod(client, ns, pod, &checked).await;
+    let output = sh_container(client, "savestate-system", &pod, "node", &checked).await;
     let (stdout, status) = output
         .rsplit_once(MARKER)
         .unwrap_or_else(|| panic!("command did not report its status: {script:?}: {output:?}"));
     assert_eq!(
         status.trim(),
         "0",
-        "command failed in pod {pod}: {script:?}: {}",
+        "command failed in node-agent pod {pod}: {script:?}: {}",
         stdout.trim()
     );
     stdout.strip_suffix('\n').unwrap_or(stdout).to_owned()

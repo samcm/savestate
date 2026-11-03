@@ -104,7 +104,8 @@ tokio-vsock = "0.7"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
+# Default codegen units and no cross-crate LTO: with lto = "thin" and
+# codegen-units = 1 the savestate crate took about 5 minutes to build on 4 CPUs, on
+# every CI run's critical path, for a binary about 14% smaller.
 [profile.release]
-lto = "thin"
-codegen-units = 1
 strip = "debuginfo"

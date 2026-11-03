@@ -51,7 +51,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - run: rustup toolchain install
+      # rust-cache keys on every installed toolchain. Removing the runner image's own
+      # stable keeps the key to rust-toolchain.toml, so an image update does not miss
+      # main's cache.
+      - run: rustup toolchain install && rustup toolchain uninstall stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -64,7 +67,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - run: rustup toolchain install
+      - run: rustup toolchain install && rustup toolchain uninstall stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -93,7 +96,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - run: rustup toolchain install
+      - run: rustup toolchain install && rustup toolchain uninstall stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: api
@@ -137,7 +140,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - run: rustup toolchain install
+      - run: rustup toolchain install && rustup toolchain uninstall stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: objstore
@@ -241,7 +244,7 @@ jobs:
 
       # Static musl test binaries run in the image whatever its libc.
       - run: |
-          rustup toolchain install
+          rustup toolchain install && rustup toolchain uninstall stable
           sudo apt-get update -qq && sudo apt-get install -y -qq musl-tools
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
@@ -290,7 +293,7 @@ jobs:
           pattern: "{image-amd64,guest-rootfs}"
           path: artifacts
       - run: zstd -dc artifacts/image-amd64/image-amd64.tar.zst | docker load
-      - run: rustup toolchain install
+      - run: rustup toolchain install && rustup toolchain uninstall stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: e2e

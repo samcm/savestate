@@ -27,7 +27,9 @@ jobs:
         with:
           persist-credentials: false
       # rust-toolchain.toml pins the version, components and both musl targets.
-      - run: rustup toolchain install
+      # rust-cache keys on every installed toolchain: drop the runner image's stable
+      # so an image update does not miss main's cache.
+      - run: rustup toolchain install && rustup toolchain uninstall stable
       # Zig is the C cross toolchain for any C code in dependencies.
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
@@ -41,17 +43,18 @@ jobs:
           key: ${{ matrix.target }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo zigbuild --locked --release -p savestate --target ${{ matrix.target }}
+      # binfmt_misc runs the arm64 binary under QEMU user emulation, without apt (whose
+      # mirror sometimes took minutes here).
+      - if: matrix.target == 'aarch64-unknown-linux-musl'
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+        with:
+          platforms: arm64
       - name: Check binary is static and runs
         run: |
           bin=target/${{ matrix.target }}/release/savestate
           file "$bin"
           file "$bin" | grep -Eq 'statically linked|static-pie linked'
-          if [ "${{ matrix.target }}" = aarch64-unknown-linux-musl ]; then
-            sudo apt-get update -qq && sudo apt-get install -y -qq qemu-user-static
-            qemu-aarch64-static "$bin" --version
-          else
-            "$bin" --version
-          fi
+          "$bin" --version
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: savestate-${{ matrix.target }}

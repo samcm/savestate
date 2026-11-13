@@ -12,7 +12,7 @@
 #            (`--build-context rootfs=docker-image://...`, see guest/README.md).
 #   disk     the qcow2 (`rootfs.qcow2`), for `--output`.
 
-FROM debian:13-slim@sha256:62bd423aeee912639ca8ee681c2b762cb3e25137e0a92b20be455898a9f034ad AS base
+FROM debian:13-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2 AS base
 SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
 # No NTP client: savestate owns guest time (frozen or stepped clocks after a restore).
 RUN apt-get update \
@@ -30,7 +30,7 @@ RUN systemctl enable savestate-guest.service \
 
 FROM base AS rootfs
 
-FROM debian:13-slim@sha256:62bd423aeee912639ca8ee681c2b762cb3e25137e0a92b20be455898a9f034ad AS convert
+FROM debian:13-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2 AS convert
 SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
 RUN apt-get update \
     && apt-get install -y --no-install-recommends e2fsprogs qemu-utils \

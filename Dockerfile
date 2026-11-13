@@ -15,7 +15,7 @@
 # Temporary: trixie-backports carries 11.1 but its amd64 build currently fails, so the
 # amd64 archive still has 11.0. Once it publishes 11.1 for amd64, install
 # `-t trixie-backports qemu-system-x86 qemu-utils` instead and drop this stage.
-FROM debian:13-slim@sha256:62bd423aeee912639ca8ee681c2b762cb3e25137e0a92b20be455898a9f034ad AS qemu
+FROM debian:13-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2 AS qemu
 SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
 ARG QEMU_VERSION=11.1.2
 ARG QEMU_SHA256=731b5681e4bb18be313231579b8efd0296c5b015fa36dc533874b639ba838016
@@ -34,7 +34,7 @@ RUN cd "/tmp/qemu-$QEMU_VERSION" \
     && make -j"$(nproc)" \
     && make install DESTDIR=/out
 
-FROM debian:13-slim@sha256:62bd423aeee912639ca8ee681c2b762cb3e25137e0a92b20be455898a9f034ad AS base
+FROM debian:13-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2 AS base
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates tini \
     && rm -rf /var/lib/apt/lists/* \
